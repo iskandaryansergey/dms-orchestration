@@ -1,0 +1,74 @@
+{
+  "definition": "post.asl.json",
+  "state": "StartResume",
+  "variables": {
+    "runId": "run-1",
+    "req": {
+      "project": "ledger",
+      "taskKey": "core",
+      "operation": "migrate",
+      "dryRun": false
+    },
+    "ctx": {
+      "project": "ledger",
+      "taskKey": "core",
+      "environment": "dev",
+      "taskArn": "arn:aws:dms:eu-west-2:111122223333:task:CORE1",
+      "runTimeoutSeconds": 604800,
+      "jobs": {
+        "pre": [],
+        "reset": [],
+        "post": [],
+        "on_failure": []
+      }
+    },
+    "inspect": {
+      "state": "fresh",
+      "completionSpec": {
+        "mode": "task-stopped",
+        "migrationType": "full-load",
+        "failOnTableErrors": true,
+        "expectStop": false
+      }
+    },
+    "jobCtx": {
+      "taskArn": "arn:aws:dms:eu-west-2:111122223333:task:CORE1",
+      "startType": "start-replication",
+      "attempt": 1
+    },
+    "attempt": 1,
+    "startedAt": "2026-10-28T10:00:00Z",
+    "preflight": null,
+    "dmsOutcome": {
+      "outcome": "COMPLETED",
+      "cause": "full load finished",
+      "dms": {}
+    },
+    "failure": null,
+    "classification": null,
+    "nextRunId": "run-1-r2",
+    "baseline": null,
+    "report": null,
+    "finalStatus": "FAILED"
+  },
+  "context": {
+    "Execution": {
+      "Id": "arn:aws:states:eu-west-2:111122223333:execution:dms-orch-dev-post:run-1-post",
+      "Name": "run-1-post",
+      "StartTime": "2026-10-28T10:00:00Z"
+    }
+  },
+  "mock": {
+    "errorOutput": {
+      "error": "StepFunctions.ExecutionAlreadyExistsException",
+      "cause": "Execution already exists"
+    }
+  },
+  "expect": {
+    "status": "CAUGHT_ERROR",
+    "nextState": "WriteReport",
+    "variables": {
+      "finalStatus": "RESUMED"
+    }
+  }
+}

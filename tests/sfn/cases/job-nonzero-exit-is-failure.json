@@ -1,0 +1,24 @@
+{
+  "definition": "job-runner.asl.json",
+  "state": "NormalizeFargateResult",
+  "variables": {
+    "input": {},
+    "attempt": 1,
+    "spec": {},
+    "result": {
+      "status": "ok"
+    },
+    "exitCode": 2,
+    "ecsError": null
+  },
+  "expect": {
+    "status": "SUCCEEDED",
+    "nextState": "RecordJob",
+    "variables": {
+      "result": {
+        "status": "fail",
+        "message": "container exit code 2"
+      }
+    }
+  }
+}

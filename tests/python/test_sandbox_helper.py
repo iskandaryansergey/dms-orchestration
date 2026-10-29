@@ -1,0 +1,276 @@
+"""examples/sandbox/scripts/sandbox.py: the sandbox-only workaround for MaxFileSize = 0."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parents[2] / "examples" / "sandbox" / "scripts" / "sandbox.py"
+spec = importlib.util.spec_from_file_location("sandbox_helper", SCRIPT)
+sandbox = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sandbox)
+
+
+class FakeDms:
+    def __init__(self, endpoints):
+        self.endpoints = endpoints
+        self.modified = []
+
+    def describe_endpoints(self, Filters):
+        arn = Filters[0]["Values"][0]
+        return {"Endpoints": [e for e in self.endpoints if e["EndpointArn"] == arn]}
+
+    def modify_endpoint(self, EndpointArn, PostgreSQLSettings):
+        self.modified.append((EndpointArn, PostgreSQLSettings))
+        return {}
+
+
+def ep(arn, kind, engine="aurora-postgresql", max_file_size=0):
+    settings = {} if max_file_size is None else {"MaxFileSize": max_file_size}
+    return {"EndpointArn": arn, "EndpointType": kind, "EngineName": engine, "PostgreSQLSettings": settings}
+
+
+def test_target_postgres_with_zero_max_file_size_is_raised_to_the_default():
+    # Seen live: the provider sends max_file_size = 0 in postgres_settings (the upstream
+    # dms module), and DMS 3.5.4 then loads 0 rows into a PostgreSQL target and never ends.
+    dms = FakeDms([ep("src", "SOURCE"), ep("tgt", "TARGET"), ep("ok", "TARGET", max_file_size=32768)])
+    fixed = sandbox.fix_target_max_file_size(dms, ["src", "tgt", "ok"])
+    assert fixed == ["tgt"]
+    assert dms.modified == [("tgt", {"MaxFileSize": 32768})]
+
+
+def test_other_engines_and_unset_size_are_left_alone():
+    dms = FakeDms([ep("my", "TARGET", engine="mysql"), ep("unset", "TARGET", max_file_size=None)])
+    assert sandbox.fix_target_max_file_size(dms, ["my", "unset"]) == []
+    assert dms.modified == []
+
+
+def test_connection_test_already_running_is_not_an_error():
+    # Seen live: ModifyEndpoint (the MaxFileSize fix) starts a connection test by itself.
+    from botocore.exceptions import ClientError
+
+    class Busy:
+        def test_connection(self, **kw):
+            raise ClientError(
+                {"Error": {"Code": "InvalidResourceStateFault", "Message": "Connection is already being tested"}},
+                "TestConnection",
+            )
+
+    assert sandbox.start_connection_test(Busy(), "ri", "ep") is False
+
+
+def test_image_scan_blocks_on_high_and_critical_only():
+    assert sandbox.scan_blocks({"MEDIUM": 3, "LOW": 9, "INFORMATIONAL": 1}) == []
+    assert sandbox.scan_blocks({"HIGH": 1, "MEDIUM": 3}) == ["HIGH"]
+    assert sandbox.scan_blocks({"CRITICAL": 2, "HIGH": 1}) == ["CRITICAL", "HIGH"]
+
+
+def _zip(files: dict[str, bytes]) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_build_sources_older_than_the_tree_are_listed(tmp_path):
+    # Seen live: CodeBuild builds from the zip that the last terraform apply uploaded; a build
+    # right after a commit pushed the old code under the new, immutable tag.
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "same.py").write_bytes(b"same\n")
+    (tmp_path / "src" / "changed.py").write_bytes(b"new\n")
+    archive = _zip(
+        {
+            "src/same.py": b"same\n",
+            "src/changed.py": b"old\n",
+            "src/gone.py": b"x\n",
+            "buildspec.yml": b"version: 0.2\n",
+        }
+    )
+    assert sandbox.stale_build_sources(archive, tmp_path) == ["src/changed.py", "src/gone.py"]
+    assert sandbox.stale_build_sources(_zip({"src/same.py": b"same\n"}), tmp_path) == []
+
+
+def test_build_image_refuses_stale_sources_before_starting_a_build(tmp_path, monkeypatch, capsys):
+    import io
+
+    started = []
+
+    class S3:
+        def get_object(self, Bucket, Key):
+            assert (Bucket, Key) == ("bkt", sandbox.BUILD_SOURCE_KEY)
+            return {"Body": io.BytesIO(_zip({"src/changed.py": b"old\n"}))}
+
+    class CodeBuild:
+        def start_build(self, **kw):
+            started.append(kw)
+            raise AssertionError("must not build")
+
+    class Session:
+        def client(self, name):
+            return {"s3": S3(), "codebuild": CodeBuild(), "ecr": object()}[name]
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "changed.py").write_bytes(b"new\n")
+    monkeypatch.setattr(sandbox, "session", lambda out: Session())
+    monkeypatch.setattr(sandbox, "REPO", tmp_path)
+    out = {"artifacts_bucket": "bkt", "sql_runner_codebuild_project": "p", "sql_runner_repository": "r"}
+    assert sandbox.cmd_build_image(out, "abc1234") != 0
+    assert started == []
+    assert "terraform apply" in capsys.readouterr().out
+
+
+# --- S16: SQS fan-out with a filter policy -------------------------------
+
+SANDBOX = SCRIPT.parents[1]
+E2E = SANDBOX / "scripts" / "e2e.py"
+
+
+def _attributes(status: str) -> dict[str, dict[str, str]]:
+    from lambdas.write_report.handler import SEVERITY, message_attributes
+
+    return message_attributes(
+        environment="sandbox",
+        project="ledger",
+        taskKey="core",
+        status=status,
+        phase="done",
+        severity=SEVERITY.get(status, "low"),
+    )
+
+
+@pytest.mark.parametrize(
+    "status,delivered",
+    [("FAILED", True), ("MANUAL", True), ("ABORTED", True), ("SUCCEEDED", False), ("REJECTED", False)],
+)
+def test_the_fanout_filter_policy_lets_through_only_high_severity(status, delivered):
+    policy = json.loads((SANDBOX / "fanout-filter-policy.json").read_text())
+    assert policy == {"severity": ["high"]}
+    assert sandbox.filter_matches(policy, _attributes(status)) is delivered
+
+
+def test_filter_matches_needs_every_key_of_the_policy():
+    assert sandbox.filter_matches({"severity": ["high"], "project": ["x"]}, _attributes("FAILED")) is False
+    assert sandbox.filter_matches({"severity": ["high"]}, {}) is False
+
+
+def _envelope(run_id: str, status: str, severity: str) -> dict[str, str]:
+    body = {
+        "Type": "Notification",
+        "Message": json.dumps({"runId": run_id, "status": status, "severity": severity}),
+        "MessageAttributes": {"severity": {"Type": "String", "Value": severity}},
+    }
+    return {"Body": json.dumps(body), "ReceiptHandle": f"rh-{run_id}"}
+
+
+class FakeSqs:
+    def __init__(self, batches):
+        self.batches = list(batches)
+        self.deleted = []
+        self.calls = []
+
+    def receive_message(self, **kw):
+        self.calls.append(kw)
+        return {"Messages": self.batches.pop(0)} if self.batches else {}
+
+    def delete_message(self, QueueUrl, ReceiptHandle):  # noqa: N803
+        self.deleted.append(ReceiptHandle)
+
+
+def test_drain_reads_sns_envelopes_and_deletes_them():
+    sqs = FakeSqs([[_envelope("r1", "FAILED", "high")], [_envelope("r2", "MANUAL", "high")]])
+    got = sandbox.drain_queue(sqs, "https://q", wait_seconds=1, empty_polls=1)
+    assert got == [
+        {"runId": "r1", "status": "FAILED", "severity": "high", "attributes": {"severity": "high"}},
+        {"runId": "r2", "status": "MANUAL", "severity": "high", "attributes": {"severity": "high"}},
+    ]
+    assert sqs.deleted == ["rh-r1", "rh-r2"]
+    assert sqs.calls[0]["QueueUrl"] == "https://q" and sqs.calls[0]["WaitTimeSeconds"] == 1
+
+
+def test_fanout_verdict_wants_failed_and_manual_but_not_succeeded():
+    runs = {"SUCCEEDED": "ok-run", "FAILED": "bad-run", "MANUAL": "stop-run"}
+    got = [
+        {"runId": "bad-run", "status": "FAILED", "severity": "high", "attributes": {"severity": "high"}},
+        {"runId": "stop-run", "status": "MANUAL", "severity": "high", "attributes": {"severity": "high"}},
+    ]
+    checks = sandbox.fanout_checks(runs, got)
+    assert all(checks.values()), checks
+    leaked = [*got, {"runId": "ok-run", "status": "SUCCEEDED", "severity": "low", "attributes": {}}]
+    assert sandbox.fanout_checks(runs, leaked)["SUCCEEDED not delivered"] is False
+    assert sandbox.fanout_checks(runs, got[:1])["MANUAL delivered"] is False
+
+
+def test_e2e_has_s16_by_name_only():
+    text = E2E.read_text(encoding="utf-8")
+    assert "e2e.py s16" in text and 'scenarios["s16"] = s16' in text
+    assert '"s16": s16' not in text  # not in the default list: needs sqs_fanout = true
+
+
+def test_e2e_has_the_live_checks_of_the_run6_fixes_by_name_only():
+    text = E2E.read_text(encoding="utf-8")
+    for name in ("guard", "postdie"):
+        assert f"e2e.py {name}" in text and f'scenarios["{name}"] = {name}' in text
+        assert f'"{name}": {name},' not in text  # they plant DynamoDB items: never in the default list
+    assert '"refusal leaves the target untouched"' in text  # S14
+    assert '"baseline from the restore"' in text  # S10
+    assert 'pf.get("error") == "RestoredTarget"' in text  # S10: a plan after the restore never resumes
+
+
+def test_the_sandbox_wires_the_queue_only_behind_the_variable():
+    tf = re.sub(r"[ ]+", " ", (SANDBOX / "fanout.tf").read_text(encoding="utf-8"))
+    assert 'file("${path.module}/fanout-filter-policy.json")' in tf
+    assert tf.count("count = var.sqs_fanout ? 1 : 0") == 3
+    assert 'filter_policy_scope = "MessageAttributes"' in tf and "sqs_managed_sse_enabled = true" in tf
+    assert 'protocol = "sqs"' in tf and '"aws:SourceArn" = module.dms_orchestration.sns_topic_arn' in tf
+    variables = (SANDBOX / "variables.tf").read_text(encoding="utf-8")
+    block = variables[variables.index('variable "sqs_fanout"') :]
+    assert "default     = false" in block.split("}")[0]
+
+
+# --- idem-sfn reads the post history for the real ExecutionAlreadyExists ----
+
+
+def _hist(*steps):
+    """Step Functions history events: ("enter", state) | ("fail", error) | ("exec_failed",)."""
+    out = []
+    for i, step in enumerate(steps, 1):
+        if step[0] == "enter":
+            out.append({"id": i, "type": "TaskStateEntered", "stateEnteredEventDetails": {"name": step[1]}})
+        elif step[0] == "fail":
+            out.append({"id": i, "type": "TaskFailed", "taskFailedEventDetails": {"error": step[1], "cause": "x"}})
+        else:
+            out.append({"id": i, "type": "ExecutionFailed", "executionFailedEventDetails": {"error": "x"}})
+    return out
+
+
+ALREADY = "StepFunctions.ExecutionAlreadyExistsException"
+
+
+def test_resume_collision_is_caught_as_already_started():
+    events = _hist(("enter", "HandOverLock"), ("enter", "StartResume"), ("fail", ALREADY), ("enter", "WriteReport"))
+    checks = sandbox.resume_collision_checks(events)
+    assert checks and all(checks.values()), checks
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        # AWS named the error differently: the Catch would not match and the post would give the lock back.
+        _hist(("enter", "StartResume"), ("fail", "StepFunctions.ExecutionAlreadyExists"), ("enter", "GiveLockBack")),
+        # StartResume was not reached (classification did not auto-resume).
+        _hist(("enter", "ClassifyFailure"), ("enter", "OnFailureJobs"), ("enter", "WriteReport")),
+        # The start went through: the decoy did not collide.
+        _hist(("enter", "StartResume"), ("enter", "WriteReport")),
+        _hist(("enter", "StartResume"), ("fail", ALREADY), ("enter", "WriteReport"), ("exec_failed",)),
+    ],
+)
+def test_resume_collision_checks_fail_on_anything_else(events):
+    assert not all(sandbox.resume_collision_checks(events).values())

@@ -1,0 +1,80 @@
+{
+  "definition": "migrate.asl.json",
+  "state": "StartReplicationTask",
+  "variables": {
+    "runId": "run-1",
+    "req": {
+      "project": "ledger",
+      "taskKey": "core",
+      "operation": "migrate",
+      "dryRun": false
+    },
+    "ctx": {
+      "project": "ledger",
+      "taskKey": "core",
+      "environment": "dev",
+      "taskArn": "arn:aws:dms:eu-west-2:111122223333:task:CORE1",
+      "runTimeoutSeconds": 604800,
+      "jobs": {
+        "pre": [],
+        "reset": [],
+        "post": [],
+        "on_failure": []
+      }
+    },
+    "attempt": 1,
+    "startedAt": "2026-10-28T10:00:00Z",
+    "waitOnly": false,
+    "inspect": {
+      "state": "fresh",
+      "completionSpec": {
+        "mode": "task-stopped",
+        "migrationType": "full-load",
+        "failOnTableErrors": true,
+        "expectStop": false
+      }
+    },
+    "decision": {
+      "action": "start",
+      "startType": "start-replication",
+      "reset": false
+    },
+    "jobCtx": {},
+    "verify": null,
+    "preflight": {
+      "verdict": "ready",
+      "reason": "first run",
+      "error": null,
+      "diff": {},
+      "warnings": []
+    },
+    "iteration": 0,
+    "preDone": false,
+    "assessment": null,
+    "assessmentArn": null,
+    "assessmentPolls": 0,
+    "migration": null,
+    "failure": null,
+    "classification": null,
+    "report": null,
+    "finalStatus": "FAILED"
+  },
+  "context": {
+    "Execution": {
+      "Id": "arn:aws:states:eu-west-2:111122223333:execution:dms-orch-dev-migrate:run-1",
+      "Name": "run-1",
+      "StartTime": "2026-10-28T10:00:00Z"
+    }
+  },
+  "mock": {
+    "errorOutput": {
+      "error": "DatabaseMigration.AccessDeniedException",
+      "cause": "not authorized"
+    }
+  },
+  "retrierRetryCount": 4,
+  "expect": {
+    "status": "CAUGHT_ERROR",
+    "nextState": "Disarm"
+  }
+}

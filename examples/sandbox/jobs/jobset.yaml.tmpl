@@ -1,0 +1,48 @@
+# Sandbox job set: built-in Lambda jobs (DMS APIs and the Aurora Data API) + the sandbox
+# SQL Lambda (pg8000) for the reset. The sql-runner image is not built here.
+# scripts/sandbox.py sync-jobs replaces __SQL_LAMBDA_ARN__ and uploads it as version "e2e".
+schemaVersion: 1
+description: Sandbox e2e - connection and grant checks before the load, truncate on reset, row counts after
+
+defaults:
+  runtime: lambda
+  timeoutSeconds: 600
+  retry: { maxAttempts: 1, backoffSeconds: 30 }
+  idempotent: true
+  onError: fail
+
+phases:
+  pre:
+    - name: check-connections
+      handler: builtin:checks/connections
+      onError: warn
+    # Data API on the source cluster as the DMS user; the first call after an idle
+    # period wakes the cluster from auto-pause.
+    - name: source-grants
+      handler: builtin:checks/postgresql_source_grants
+      with: { connection: dms_source, schemas: [app], require: [SELECT] }
+
+  reset:
+    - name: truncate-tables
+      function: __SQL_LAMBDA_ARN__
+      with: { action: truncate }
+      retry: { maxAttempts: 2, backoffSeconds: 30 }
+
+  post:
+    - name: row-counts
+      description: row counts must match between source and target (pg8000)
+      function: __SQL_LAMBDA_ARN__
+      with: { action: row_counts, tables: [app.customers, app.accounts, app.transactions, app.audit_notes] }
+    - name: row-counts-data-api
+      description: the same check through the Data API built-in
+      handler: builtin:checks/row_counts
+      with: { source: source, target: target, tables: [app.customers, app.accounts, app.transactions, app.audit_notes] }
+    - name: drop-control-tables
+      handler: builtin:cleanup/drop_control_tables
+      with: { connection: target, schema: dms_control, keepValidationFailures: true }
+      onError: warn
+
+  on_failure:
+    - name: collect-diagnostics
+      handler: builtin:diagnostics/dms_dump
+      onError: continue

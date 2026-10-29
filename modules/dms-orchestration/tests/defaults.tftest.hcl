@@ -1,0 +1,339 @@
+# Plan/apply under a mocked AWS provider: no credentials, nothing created.
+# Mocked computed attributes are random, so the tests check the module's own logic
+# (ASL, policies, SSM payloads, names, wiring), not provider behaviour.
+
+mock_provider "aws" {
+  source = "./tests/mocks"
+}
+
+variables {
+  environment = "sandbox"
+  vpc_id      = "vpc-0123456789abcdef0"
+  subnet_ids  = ["subnet-aaaa1111", "subnet-bbbb2222"]
+  dms = {
+    replication_instance_arn = "arn:aws:dms:eu-west-2:111122223333:rep:RI1"
+    replication_instance_id  = "dms-sandbox-ri"
+    task_arns                = { core = "arn:aws:dms:eu-west-2:111122223333:task:CORE1" }
+    task_resource_ids        = { core = "CORE1" }
+    endpoint_arns            = { source = "arn:aws:dms:eu-west-2:111122223333:endpoint:SRC", target = "arn:aws:dms:eu-west-2:111122223333:endpoint:TGT" }
+    log_group_name           = "dms-tasks-dms-sandbox-ri"
+  }
+  job_secret_arns = ["arn:aws:secretsmanager:eu-west-2:111122223333:secret:dms/ledger/source/runner-AbCdEf"]
+  projects = {
+    ledger = {
+      tasks = {
+        core = {
+          connections = {
+            source = {
+              engine     = "postgresql"
+              secret_arn = "arn:aws:secretsmanager:eu-west-2:111122223333:secret:dms/ledger/source/runner-AbCdEf"
+              host       = "source.cluster-xyz.eu-west-2.rds.amazonaws.com"
+              port       = 5432
+              database   = "ledger"
+            }
+          }
+          jobs = { default_version = "v1" }
+        }
+      }
+    }
+  }
+  fargate = {
+    images = { sql-runner = "111122223333.dkr.ecr.eu-west-2.amazonaws.com/dms-orch/sql-runner:0.1.0" }
+  }
+  database_ports       = [5432]
+  database_cidr_blocks = ["10.0.16.0/20"]
+  acknowledged_checks  = ["no_cmk", "include_execution_data", "lambda_reserved_concurrency"]
+}
+
+run "state_machines" {
+  command = apply
+
+  # ADR 0005: three machines, two entry points.
+  assert {
+    condition     = toset(keys(aws_sfn_state_machine.run)) == toset(["migrate", "post"])
+    error_message = "run machines are migrate and post"
+  }
+
+  assert {
+    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner]) : m.type == "STANDARD"])
+    error_message = "state machines must be STANDARD (ADR 0001)"
+  }
+
+  # Review finding 9: state input/output (table names, job summaries, DMS messages)
+  # stays out of CloudWatch Logs unless the caller opts in.
+  assert {
+    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner]) : !m.logging_configuration[0].include_execution_data])
+    error_message = "execution data must not be logged by default"
+  }
+
+  assert {
+    condition     = alltrue([for m in values(aws_sfn_state_machine.run) : jsondecode(m.definition).QueryLanguage == "JSONata"])
+    error_message = "run machines must use JSONata (ADR 0003)"
+  }
+
+  assert {
+    condition = alltrue([for s in ["ResolveContext", "AcquireLock", "InspectTask", "TargetVerify", "Preflight", "CheckVerdict", "PreJobs", "ResetJobs", "SaveContext", "Arm", "StartReplicationTask", "ReportStarted", "ClassifyFailure", "OnFailureJobs", "WriteReport", "ReleaseLock"] :
+    contains(keys(jsondecode(aws_sfn_state_machine.run["migrate"].definition).States), s)])
+    error_message = "migrate is missing a required state"
+  }
+
+  assert {
+    condition = alltrue([for s in ["LoadRun", "TakeOverLock", "DeleteMigration", "PostJobs", "ClassifyFailure", "ResumeBaseline", "RecordResumeBaseline", "HandOverLock", "StartResume", "OnFailureJobs", "BaselineVerify", "WriteReport", "ReleaseLock"] :
+    contains(keys(jsondecode(aws_sfn_state_machine.run["post"].definition).States), s)])
+    error_message = "post is missing a required state"
+  }
+
+  assert {
+    condition     = jsondecode(aws_sfn_state_machine.run["migrate"].definition).States.AcquireLock.Arguments.TableName == aws_dynamodb_table.this[0].name
+    error_message = "the lock must live in the module table"
+  }
+
+  assert {
+    condition     = jsondecode(aws_sfn_state_machine.run["migrate"].definition).States.StartPostDryRun.Arguments.StateMachineArn == "arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run["post"].name}"
+    error_message = "migrate hands a dry run to the post machine of this module"
+  }
+
+  assert {
+    condition     = jsondecode(aws_sfn_state_machine.run["post"].definition).States.StartResume.Arguments.StateMachineArn == "arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run["migrate"].name}"
+    error_message = "post chains auto-resume to the migrate machine of this module"
+  }
+
+  assert {
+    condition     = jsondecode(aws_sfn_state_machine.run["migrate"].definition).States.SaveContext.Arguments.Bucket == aws_s3_bucket.artifacts[0].bucket
+    error_message = "migrate saves the run context in the module bucket"
+  }
+
+  assert {
+    condition     = alltrue([for m in values(aws_sfn_state_machine.run) : jsondecode(m.definition).TimeoutSeconds == 604800])
+    error_message = "migrate and post never wait for DMS: one week for their jobs"
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_rule.execution_status.event_pattern == jsonencode({ source = ["aws.states"], "detail-type" = ["Step Functions Execution Status Change"], detail = { status = ["FAILED", "TIMED_OUT", "ABORTED"], stateMachineArn = [for m in ["migrate", "post"] : "arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run[m].name}"] } })
+    error_message = "release_lock listens to both run machines"
+  }
+
+  assert {
+    condition     = aws_lambda_function.this["dms_event_handler"].environment[0].variables.POST_STATE_MACHINE_ARN == "arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run["post"].name}" && aws_lambda_function.this["watchdog"].environment[0].variables.POST_STATE_MACHINE_ARN == "arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run["post"].name}"
+    error_message = "the handoff Lambdas start the post machine of this module"
+  }
+
+  assert {
+    condition     = !contains(keys(aws_lambda_function.this), "register_waiter")
+    error_message = "register_waiter is gone with the callback wait (ADR 0005)"
+  }
+
+  assert {
+    condition     = jsonencode(jsondecode(aws_sfn_state_machine.job_runner.definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.Subnets) == jsonencode(var.subnet_ids)
+    error_message = "Fargate jobs must run in the module subnets"
+  }
+
+  assert {
+    condition     = jsondecode(aws_sfn_state_machine.job_runner.definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp == "DISABLED"
+    error_message = "Fargate jobs get no public IP by default"
+  }
+
+  assert {
+    condition     = aws_sfn_state_machine.run["migrate"].logging_configuration[0].level == "ALL" && startswith(aws_cloudwatch_log_group.sfn.name, "/aws/vendedlogs/states/")
+    error_message = "state machine logs go to a /aws/vendedlogs/ group"
+  }
+
+  assert {
+    condition     = length(aws_sfn_state_machine.run["post"].encryption_configuration) == 0
+    error_message = "no CMK configured, so no customer managed encryption block"
+  }
+}
+
+run "storage_and_registration" {
+  command = apply
+
+  assert {
+    condition     = aws_dynamodb_table.this[0].hash_key == "pk" && aws_dynamodb_table.this[0].range_key == "sk"
+    error_message = "single-table keys pk/sk"
+  }
+
+  assert {
+    condition     = aws_dynamodb_table.this[0].point_in_time_recovery[0].enabled && aws_dynamodb_table.this[0].server_side_encryption[0].enabled
+    error_message = "PITR and encryption must be on"
+  }
+
+  assert {
+    condition     = toset([for g in aws_dynamodb_table.this[0].global_secondary_index : g.name]) == toset(["gsi1", "gsi2"])
+    error_message = "gsi1 (history) and gsi2 (active waiters/locks) are required by the Lambdas"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.task["ledger/core"].name == "/dms-orch/sandbox/ledger/core" && aws_ssm_parameter.task["ledger/core"].type == "String"
+    error_message = "registration parameter name/type"
+  }
+
+  # Tables in error fail the run unless the task opts out.
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).defaults.failOnTableErrors == true
+    error_message = "fail_on_table_errors defaults to true"
+  }
+
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).taskArn == var.dms.task_arns.core
+    error_message = "registration must carry the task ARN from the DMS module"
+  }
+
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).connections.source.secretArn == var.job_secret_arns[0]
+    error_message = "connections carry the secret ARN"
+  }
+
+  assert {
+    condition     = length(regexall("(?i)password|secretstring", aws_ssm_parameter.task["ledger/core"].value)) == 0
+    error_message = "the registration must not contain secret values"
+  }
+
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).jobs.s3Prefix == "jobs/ledger"
+    error_message = "default job set prefix is jobs/<project>"
+  }
+
+  assert {
+    condition     = aws_s3_bucket_public_access_block.artifacts[0].block_public_acls && aws_s3_bucket_public_access_block.artifacts[0].restrict_public_buckets
+    error_message = "artifacts bucket must block public access"
+  }
+
+  assert {
+    condition     = length(aws_sns_topic.this) == 1 && length(aws_s3_bucket.artifacts) == 1
+    error_message = "topic and bucket are created by default"
+  }
+
+  # Review finding 5: CloudWatch alarms cannot publish to a topic encrypted with the
+  # AWS managed key alias/aws/sns (its key policy cannot be changed).
+  assert {
+    condition     = aws_sns_topic.this[0].kms_master_key_id == null
+    error_message = "without a CMK the topic must not use alias/aws/sns, or alarms never arrive"
+  }
+}
+
+run "lambda_and_events" {
+  command = apply
+
+  assert {
+    condition     = length(aws_lambda_function.this) == 9
+    error_message = "9 Lambda functions expected (register_waiter is gone)"
+  }
+
+  assert {
+    condition     = alltrue([for f in aws_lambda_function.this : f.runtime == "python3.13" && length(f.vpc_config[0].subnet_ids) == 2])
+    error_message = "all Lambda functions run python3.13 inside the VPC"
+  }
+
+  assert {
+    condition     = aws_lambda_function.this["resolve_context"].environment[0].variables.SSM_PREFIX == "/dms-orch/sandbox"
+    error_message = "resolve_context reads registrations under /<name>/<environment>"
+  }
+
+  assert {
+    condition     = jsondecode(aws_cloudwatch_event_rule.dms_task_state.event_pattern).source == ["aws.dms"]
+    error_message = "DMS rule listens to aws.dms"
+  }
+
+  assert {
+    condition     = jsondecode(aws_cloudwatch_event_rule.execution_status.event_pattern).detail.status == ["FAILED", "TIMED_OUT", "ABORTED"]
+    error_message = "lock safety net on FAILED/TIMED_OUT/ABORTED"
+  }
+
+  assert {
+    condition     = aws_scheduler_schedule.watchdog.schedule_expression == "rate(5 minutes)"
+    error_message = "watchdog every 5 minutes by default"
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_target.dms_task_state.dead_letter_config[0].arn == aws_sqs_queue.dlq.arn
+    error_message = "undeliverable DMS events go to the DLQ"
+  }
+
+  assert {
+    condition     = length(aws_vpc_security_group_egress_rule.db_cidr) == 1 && aws_vpc_security_group_egress_rule.https_cidr["10.20.0.0/16"].from_port == 443
+    error_message = "jobs SG egress: 443 + database port per CIDR"
+  }
+
+  assert {
+    condition     = keys(aws_vpc_security_group_egress_rule.https_cidr) == ["10.20.0.0/16"] && length(aws_vpc_security_group_egress_rule.https_prefix_list) == 2
+    error_message = "jobs SG 443 egress defaults to the VPC CIDR (interface endpoints) and the S3/DynamoDB gateway prefix lists, never 0.0.0.0/0"
+  }
+
+  assert {
+    condition     = alltrue([for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c.readonlyRootFilesystem == true])
+    error_message = "Fargate job containers use a read-only root file system"
+  }
+
+  # The pre-check checks/connections runs TestConnection itself,
+  # only on this replication instance and the registered endpoints.
+  assert {
+    condition = toset(flatten([one([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Resource if st.Sid == "TestEndpointConnections"])])) == toset([
+      "arn:aws:dms:eu-west-2:111122223333:rep:RI1",
+      "arn:aws:dms:eu-west-2:111122223333:endpoint:SRC",
+      "arn:aws:dms:eu-west-2:111122223333:endpoint:TGT",
+    ]) && one([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Action if st.Sid == "TestEndpointConnections"]) == ["dms:TestConnection"]
+    error_message = "built-in jobs may run TestConnection on the registered endpoints only"
+  }
+
+  # Fargate mounts task volumes empty, root:root 0755, without the image content (seen live, S1f):
+  # a short root init container opens them to uid 10001 before the job container starts.
+  assert {
+    condition = (
+      [for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c.name] == ["init-volumes", "job"]
+      && one([for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c if c.name == "init-volumes"]).user == "0"
+      && one([for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c if c.name == "init-volumes"]).essential == false
+      && one([for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c if c.name == "init-volumes"]).image == var.fargate.images["sql-runner"]
+    )
+    error_message = "an init container of the same image runs as root, non-essential"
+  }
+
+  assert {
+    condition = (
+      jsonencode(one([for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c if c.name == "job"]).dependsOn) == jsonencode([{ containerName = "init-volumes", condition = "SUCCESS" }])
+      && one([for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c if c.name == "job"]).user == "10001"
+    )
+    error_message = "the job container runs as 10001 and starts only after the init container succeeded"
+  }
+
+  assert {
+    condition = (
+      jsonencode(one([for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c if c.name == "init-volumes"]).mountPoints)
+      == jsonencode(one([for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c if c.name == "job"]).mountPoints)
+      && strcontains(one([for c in jsondecode(aws_ecs_task_definition.job["sql-runner"].container_definitions) : c if c.name == "init-volumes"]).command[0], "chown 10001:10001 /work /out")
+    )
+    error_message = "the init container opens the same volumes to uid 10001"
+  }
+
+  assert {
+    condition     = jsondecode(aws_lambda_function.this["prepare_job"].environment[0].variables.TASK_DEFINITIONS)["sql-runner"] == aws_ecs_task_definition.job["sql-runner"].arn
+    error_message = "prepare_job resolves image keys to task definitions"
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.lambda_errors) == 3 && length(aws_cloudwatch_metric_alarm.sfn) == 6 && aws_cloudwatch_metric_alarm.watchdog_silent[0].treat_missing_data == "breaching"
+    error_message = "alarms: Lambda errors and a breaching 'watchdog not running'"
+  }
+}
+
+run "container_insights_off_by_default" {
+  command = apply
+
+  assert {
+    condition     = one([for s in aws_ecs_cluster.this[0].setting : s.value if s.name == "containerInsights"]) == "disabled"
+    error_message = "Container Insights is off by default (its log group outlives destroy)"
+  }
+}
+
+run "dumps_are_kms_only_and_expire" {
+  command = apply
+
+  assert {
+    condition     = one([for r in aws_s3_bucket_lifecycle_configuration.artifacts[0].rule : r.expiration[0].days if r.id == "target-dumps"]) == 14
+    error_message = "dumps/ expire after dump_retention_days (14)"
+  }
+
+  assert {
+    condition     = strcontains(aws_s3_bucket_policy.artifacts[0].policy, "DenyDumpsWithoutKms")
+    error_message = "dumps/ accept only SSE-KMS"
+  }
+}

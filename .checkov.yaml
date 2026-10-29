@@ -1,0 +1,22 @@
+# checkov baseline. Every skip needs a reason; review the list when the module changes.
+skip-check:
+  # Lambda functions are invoked by Step Functions / EventBridge / Scheduler, not by users;
+  # a per-function DLQ adds nothing: async failures go to the shared DLQ via event invoke config.
+  - CKV_AWS_116
+  # Code signing for Lambda is a landing-zone decision (signing profile owned by the platform team).
+  - CKV_AWS_272
+  # CMK is optional (sandbox); the module warns through check "no_cmk" when kms_key_arn is null.
+  - CKV_AWS_158
+  - CKV_AWS_173
+  - CKV_AWS_119
+  - CKV_AWS_145
+  - CKV_AWS_26
+  - CKV_AWS_27
+  - CKV_AWS_338
+  # S3 access logging and cross-region replication are bucket-policy decisions of the landing zone.
+  - CKV_AWS_18
+  - CKV_AWS_144
+  - CKV2_AWS_62
+  # dms:Describe*, states:SendTask*, ec2 ENI and log delivery actions do not support resource-level permissions.
+  - CKV_AWS_290
+  - CKV_AWS_355

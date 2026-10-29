@@ -1,0 +1,24 @@
+# Sandbox job set without pre-checks: S3 lets DMS itself hit the revoked grant (the
+# default set's source-grants check would stop the run before DMS starts).
+# scripts/sandbox.py sync-jobs uploads it as version "e2e-dms-only".
+schemaVersion: 1
+description: Sandbox e2e - reset only, so DMS meets the source as it is
+
+defaults:
+  runtime: lambda
+  timeoutSeconds: 600
+  retry: { maxAttempts: 1, backoffSeconds: 30 }
+  idempotent: true
+  onError: fail
+
+phases:
+  reset:
+    - name: truncate-tables
+      function: __SQL_LAMBDA_ARN__
+      with: { action: truncate }
+      retry: { maxAttempts: 2, backoffSeconds: 30 }
+
+  on_failure:
+    - name: collect-diagnostics
+      handler: builtin:diagnostics/dms_dump
+      onError: continue

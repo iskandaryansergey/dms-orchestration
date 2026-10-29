@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="140" viewBox="0 0 600 140" role="img" aria-labelledby="t">
+  <title id="t">dms-orchestration</title>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff9a3c"/>
+      <stop offset="1" stop-color="#e8590c"/>
+    </linearGradient>
+    <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8a94a6"/>
+    </marker>
+  </defs>
+  <!-- sources -->
+  <g fill="#3b82f6">
+    <g transform="translate(14 16)"><ellipse cx="14" cy="4" rx="14" ry="4"/><rect y="4" width="28" height="18"/><ellipse cx="14" cy="22" rx="14" ry="4"/></g>
+    <g transform="translate(14 58)"><ellipse cx="14" cy="4" rx="14" ry="4"/><rect y="4" width="28" height="18"/><ellipse cx="14" cy="22" rx="14" ry="4"/></g>
+    <g transform="translate(14 100)"><ellipse cx="14" cy="4" rx="14" ry="4"/><rect y="4" width="28" height="18"/><ellipse cx="14" cy="22" rx="14" ry="4"/></g>
+  </g>
+  <g fill="#93c5fd"><ellipse cx="28" cy="20" rx="14" ry="4"/><ellipse cx="28" cy="62" rx="14" ry="4"/><ellipse cx="28" cy="104" rx="14" ry="4"/></g>
+  <!-- flows into the state machine -->
+  <g stroke="#8a94a6" stroke-width="2.5" fill="none" marker-end="url(#a)">
+    <path d="M46 31 C62 31 62 62 74 66"/>
+    <path d="M46 73 L74 72"/>
+    <path d="M46 115 C62 115 62 82 74 78"/>
+  </g>
+  <!-- state machine: three steps -->
+  <rect x="78" y="58" width="22" height="26" rx="5" fill="url(#g)"/>
+  <rect x="108" y="58" width="22" height="26" rx="5" fill="url(#g)"/>
+  <rect x="138" y="58" width="22" height="26" rx="5" fill="url(#g)"/>
+  <g stroke="#ffffff" stroke-width="2.5" stroke-linecap="round"><path d="M100 71 h8"/><path d="M130 71 h8"/></g>
+  <path d="M84 71 l4 4 l7 -8" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M164 71 L176 71" stroke="#8a94a6" stroke-width="2.5" marker-end="url(#a)"/>
+  <!-- target -->
+  <g transform="translate(182 50)" fill="#10b981"><ellipse cx="17" cy="5" rx="17" ry="5"/><rect y="5" width="34" height="32"/><ellipse cx="17" cy="37" rx="17" ry="5"/></g>
+  <ellipse cx="199" cy="55" rx="17" ry="5" fill="#6ee7b7"/>
+  <!-- wordmark -->
+  <text x="240" y="70" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="34" font-weight="700" fill="#8a94a6">dms<tspan fill="url(#g)">-orchestration</tspan></text>
+  <text x="242" y="96" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" fill="#8a94a6">AWS DMS runs on Step Functions, outside Terraform</text>
+</svg>

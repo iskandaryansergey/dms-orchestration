@@ -1,0 +1,42 @@
+# Sandbox job set for IAM database authentication (scenario s1iam, variable iam_auth): the post
+# job logs in to the target as orch_iam with an IAM token (connection target_iam, no secret)
+# over TLS. scripts/sandbox.py sync-jobs-iam uploads it as version "e2e-iam".
+schemaVersion: 1
+description: Sandbox e2e with an IAM token login from Fargate
+
+defaults:
+  runtime: fargate
+  image: sql-runner
+  timeoutSeconds: 900
+  retry: { maxAttempts: 1, backoffSeconds: 30 }
+  idempotent: true
+  onError: fail
+
+phases:
+  pre:
+    - name: check-connections
+      handler: builtin:checks/connections
+      onError: warn
+
+  reset:
+    - name: truncate-tables
+      command: [psql-run, --connection, target, --truncate, "{{ ctx.resetTables }}"]
+      retry: { maxAttempts: 2, backoffSeconds: 30 }
+
+  post:
+    - name: iam-target
+      description: the job's session is the IAM user, over TLS, without a password from a secret
+      command:
+        - psql-run
+        - --connection
+        - target_iam
+        - --sql
+        - "DO $$ BEGIN IF current_user <> 'orch_iam' THEN RAISE EXCEPTION 'not the IAM user'; END IF; IF NOT (SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()) THEN RAISE EXCEPTION 'session is not TLS'; END IF; END $$"
+    - name: row-counts-data-api
+      handler: builtin:checks/row_counts
+      with: { source: source, target: target, tables: [app.customers, app.accounts, app.transactions, app.audit_notes] }
+
+  on_failure:
+    - name: collect-diagnostics
+      handler: builtin:diagnostics/dms_dump
+      onError: continue

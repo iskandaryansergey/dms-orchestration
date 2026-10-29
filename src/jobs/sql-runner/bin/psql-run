@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""psql-run: see /opt/orch/orch_sql.py."""
+import sys
+
+sys.path.insert(0, "/opt/orch")
+from orch_sql import main  # noqa: E402
+
+sys.exit(main())

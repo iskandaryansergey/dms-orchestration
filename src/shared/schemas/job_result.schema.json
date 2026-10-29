@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job_result.schema.json",
+  "title": "Result of one pre/reset/post/on_failure job",
+  "description": "Returned by Lambda jobs; written by Fargate jobs to /out/result.json and uploaded to s3://<artifacts>/runs/<runId>/jobs/<phase>/<nn>-<name>/result.json.",
+  "type": "object",
+  "required": ["status"],
+  "additionalProperties": false,
+  "properties": {
+    "status": { "type": "string", "enum": ["ok", "warn", "fail", "skipped"] },
+    "summary": { "type": "object" },
+    "message": { "type": "string", "maxLength": 4096 },
+    "artifacts": { "type": "array", "items": { "type": "string", "pattern": "^s3://" } },
+    "durationSeconds": { "type": "number", "minimum": 0 }
+  }
+}

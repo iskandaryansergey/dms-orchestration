@@ -1,0 +1,518 @@
+{
+  "Comment": "DMS orchestration, machine 2 of 2 (ADR 0005): started once by the DMS event (or the watchdog) after migrate started DMS. Post-jobs or the failure branch, auto-resume as a new migrate, report, notify, unlock.",
+  "QueryLanguage": "JSONata",
+  "TimeoutSeconds": ${state_machine_timeout_seconds},
+  "StartAt": "LoadRun",
+  "States": {
+    "LoadRun": {
+      "Type": "Task",
+      "Comment": "The run migrate saved (runs/<runId>/context.json) plus the DMS outcome from the handoff.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${resolve_context_arn}",
+        "Payload": {
+          "mode": "post",
+          "input": "{% $states.input %}",
+          "execution": {
+            "arn": "{% $states.context.Execution.Id %}",
+            "name": "{% $states.context.Execution.Name %}",
+            "startTime": "{% $states.context.Execution.StartTime %}"
+          }
+        }
+      },
+      "TimeoutSeconds": 90,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "Comment": "Without the run there is nothing to report; release_lock (execution FAILED) frees the lock.",
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FailLoad",
+          "Assign": { "failure": "{% $states.errorOutput %}" }
+        }
+      ],
+      "Assign": {
+        "runId": "{% $states.result.Payload.runId %}",
+        "req": "{% $states.result.Payload.request %}",
+        "ctx": "{% $states.result.Payload.ctx %}",
+        "inspect": "{% $states.result.Payload.inspect %}",
+        "jobCtx": "{% $states.result.Payload.jobCtx %}",
+        "attempt": "{% $states.result.Payload.attempt %}",
+        "startedAt": "{% $states.result.Payload.startedAt %}",
+        "preflight": "{% $exists($states.result.Payload.preflight) ? $states.result.Payload.preflight : null %}",
+        "dmsOutcome": "{% $states.result.Payload.dmsOutcome %}",
+        "failure": "{% $states.result.Payload.failure %}",
+        "classification": null,
+        "nextRunId": null,
+        "baseline": null,
+        "report": null,
+        "finalStatus": "FAILED"
+      },
+      "Next": "TakeOverLock"
+    },
+    "FailLoad": {
+      "Type": "Fail",
+      "Error": "{% $exists($failure.Error) ? $failure.Error : 'PostLoadFailed' %}",
+      "Cause": "{% $exists($failure.Cause) ? $failure.Cause : 'run context could not be loaded' %}"
+    },
+    "TakeOverLock": {
+      "Type": "Task",
+      "Comment": "The lock now names this execution, so release_lock and the watchdog treat a dead post like a dead migrate.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
+        "UpdateExpression": "SET executionArn = :e, gsi2sk = :e, #p = :p",
+        "ConditionExpression": "runId = :r",
+        "ExpressionAttributeNames": { "#p": "phase" },
+        "ExpressionAttributeValues": {
+          ":e": { "S": "{% $states.context.Execution.Id %}" },
+          ":p": { "S": "post" },
+          ":r": { "S": "{% $runId %}" }
+        }
+      },
+      "TimeoutSeconds": 10,
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDb.ProvisionedThroughputExceededException", "DynamoDb.InternalServerErrorException", "DynamoDb.RequestLimitExceededException", "DynamoDb.ThrottlingException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [{ "Comment": "Best effort: the run goes on and reports.", "ErrorEquals": ["States.ALL"], "Next": "DeleteMigration" }],
+      "Next": "DeleteMigration"
+    },
+    "DeleteMigration": {
+      "Type": "Task",
+      "Comment": "post owns the run now; a duplicate event finds nothing to hand over.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": { "pk": { "S": "{% 'MIGRATION#' & $ctx.taskArn %}" }, "sk": { "S": "ACTIVE" } },
+        "ConditionExpression": "runId = :r",
+        "ExpressionAttributeValues": { ":r": { "S": "{% $runId %}" } }
+      },
+      "TimeoutSeconds": 10,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "CheckOutcome" }],
+      "Next": "CheckOutcome"
+    },
+    "CheckOutcome": {
+      "Type": "Choice",
+      "Choices": [{ "Condition": "{% $exists($failure) and $failure != null %}", "Next": "ClassifyFailure" }],
+      "Default": "PostJobs"
+    },
+    "PostJobs": {
+      "Type": "Map",
+      "Comment": "Post-jobs after a successful load (indexes, FK, row counts, cleanup).",
+      "Items": "{% $ctx.jobs.post %}",
+      "MaxConcurrency": 1,
+      "ItemSelector": {
+        "job": "{% $states.context.Map.Item.Value %}",
+        "phase": "post",
+        "runId": "{% $runId %}",
+        "dryRun": "{% $req.dryRun %}",
+        "ctx": "{% $merge([$jobCtx, {'outcome': $dmsOutcome.outcome}]) %}",
+        "failure": null
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "RunPostJob",
+        "States": {
+          "RunPostJob": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "Arguments": {
+              "StateMachineArn": "${job_runner_arn}",
+              "Input": "{% $merge([$states.input, {'AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID': $states.context.Execution.Id}]) %}"
+            },
+            "Output": "{% $states.result.Output %}",
+            "End": true
+          }
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ClassifyFailure",
+          "Assign": { "failure": { "Error": "JobFailed", "Cause": "{% $string($states.errorOutput.Cause) %}", "phase": "post" } }
+        }
+      ],
+      "Assign": { "finalStatus": "SUCCEEDED" },
+      "Next": "BaselineVerify"
+    },
+    "ClassifyFailure": {
+      "Type": "Task",
+      "Comment": "Category, retryable, auto-resume decision, diagnostics (task log, tables in error).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${classify_failure_arn}",
+        "Payload": {
+          "runId": "{% $runId %}",
+          "request": "{% $req %}",
+          "ctx": "{% $ctx %}",
+          "attempt": "{% $attempt %}",
+          "started": true,
+          "failure": "{% $failure %}",
+          "completion": "{% $exists($inspect.completionSpec) ? $inspect.completionSpec : null %}",
+          "startedAt": "{% $startedAt %}"
+        }
+      },
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "OnFailureJobs",
+          "Assign": {
+            "classification": { "category": "UNKNOWN", "retryable": false, "autoResume": false, "reason": "{% 'classification failed: ' & $string($states.errorOutput.Cause) %}" }
+          }
+        }
+      ],
+      "Assign": { "classification": "{% $states.result.Payload %}" },
+      "Next": "CheckAutoResume"
+    },
+    "CheckAutoResume": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $classification.autoResume = true %}",
+          "Next": "ResumeBaseline",
+          "Assign": { "nextRunId": "{% $substring($replace($runId, /-r[0-9]+$/, ''), 0, 70) & '-r' & $string($attempt + 1) %}" }
+        }
+      ],
+      "Default": "OnFailureJobs"
+    },
+    "ResumeBaseline": {
+      "Type": "Map",
+      "Comment": "Before the chained migrate starts: its pre-flight compares the target with this baseline (ADR 0006).",
+      "Items": "{% $not($exists($ctx.jobs.preflight)) ? [] : $ctx.jobs.preflight %}",
+      "MaxConcurrency": 1,
+      "ItemSelector": {
+        "job": "{% $states.context.Map.Item.Value %}",
+        "phase": "baseline",
+        "runId": "{% $runId %}",
+        "dryRun": false,
+        "ctx": "{% $jobCtx %}",
+        "failure": null
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "RunResumeBaselineJob",
+        "States": {
+          "RunResumeBaselineJob": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "Arguments": {
+              "StateMachineArn": "${job_runner_arn}",
+              "Input": "{% $merge([$states.input, {'AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID': $states.context.Execution.Id}]) %}"
+            },
+            "Output": "{% $states.result.Output %}",
+            "End": true
+          }
+        }
+      },
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "RecordResumeBaseline" }],
+      "Assign": { "baseline": "{% $count($states.result) > 0 ? $states.result[0] : null %}" },
+      "Next": "RecordResumeBaseline"
+    },
+    "RecordResumeBaseline": {
+      "Type": "Task",
+      "Comment": "TARGET# baseline and TABLE# copy now, not in the final report: the chained migrate may already be checking.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${write_report_arn}",
+        "Payload": {
+          "mode": "baseline",
+          "runId": "{% $runId %}",
+          "status": "RESUMED",
+          "request": "{% $req %}",
+          "ctx": "{% $ctx %}",
+          "baseline": "{% $baseline %}",
+          "started": true
+        }
+      },
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "HandOverLock" }],
+      "Next": "HandOverLock"
+    },
+    "HandOverLock": {
+      "Type": "Task",
+      "Comment": "Auto-resume is a new migrate execution (ADR 0005). The lock moves to its run id first, so nothing else can take the task in between; its AcquireLock takes it over.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
+        "UpdateExpression": "SET runId = :n, executionArn = :e, gsi2sk = :e, handedOverFrom = :o, acquiredAt = :t",
+        "ConditionExpression": "runId = :o",
+        "ExpressionAttributeValues": {
+          ":n": { "S": "{% $nextRunId %}" },
+          ":e": { "S": "{% '${migrate_executions_prefix}' & $nextRunId %}" },
+          ":o": { "S": "{% $runId %}" },
+          ":t": { "S": "{% $now() %}" }
+        }
+      },
+      "TimeoutSeconds": 10,
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDb.ProvisionedThroughputExceededException", "DynamoDb.InternalServerErrorException", "DynamoDb.RequestLimitExceededException", "DynamoDb.ThrottlingException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OnFailureJobs" }],
+      "Next": "StartResume"
+    },
+    "StartResume": {
+      "Type": "Task",
+      "Comment": "Fire and forget (no .sync): the new migrate inspects the task and resumes it; this post ends as RESUMED.",
+      "Resource": "arn:aws:states:::states:startExecution",
+      "Arguments": {
+        "StateMachineArn": "${migrate_arn}",
+        "Name": "{% $nextRunId %}",
+        "Input": "{% $merge([$sift($req, function($v, $k) { $k in ['project', 'taskKey', 'jobSet', 'jobsVersion', 'completion', 'failOnTableErrors', 'targetReset', 'autoResume', 'notify', 'allowReset', 'requestedBy', 'changeRef'] and $v != null }), {'operation': 'resume', 'attempt': $attempt + 1, 'parentRunId': $runId, 'parentStartedAt': $startedAt}]) %}"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [{ "ErrorEquals": ["StepFunctions.ExecutionLimitExceeded", "States.Timeout"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [
+        { "ErrorEquals": ["StepFunctions.ExecutionAlreadyExistsException"], "Next": "WriteReport", "Assign": { "finalStatus": "RESUMED" } },
+        { "ErrorEquals": ["States.ALL"], "Next": "GiveLockBack" }
+      ],
+      "Assign": { "finalStatus": "RESUMED" },
+      "Next": "WriteReport"
+    },
+    "GiveLockBack": {
+      "Type": "Task",
+      "Comment": "The new migrate did not start: take the lock back so this run can finish and release it.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
+        "UpdateExpression": "SET runId = :o, executionArn = :e, gsi2sk = :e",
+        "ConditionExpression": "runId = :n",
+        "ExpressionAttributeValues": {
+          ":n": { "S": "{% $nextRunId %}" },
+          ":e": { "S": "{% $states.context.Execution.Id %}" },
+          ":o": { "S": "{% $runId %}" }
+        }
+      },
+      "TimeoutSeconds": 10,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OnFailureJobs" }],
+      "Next": "OnFailureJobs"
+    },
+    "OnFailureJobs": {
+      "Type": "Map",
+      "Comment": "Diagnostics / cleanup after a failure. A failing on_failure job does not hide the original failure.",
+      "Items": "{% $ctx.jobs.on_failure %}",
+      "MaxConcurrency": 1,
+      "ItemSelector": {
+        "job": "{% $states.context.Map.Item.Value %}",
+        "phase": "on_failure",
+        "runId": "{% $runId %}",
+        "dryRun": "{% $req.dryRun %}",
+        "ctx": "{% $jobCtx %}",
+        "failure": "{% $classification %}"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "RunOnFailureJob",
+        "States": {
+          "RunOnFailureJob": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "Arguments": {
+              "StateMachineArn": "${job_runner_arn}",
+              "Input": "{% $merge([$states.input, {'AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID': $states.context.Execution.Id}]) %}"
+            },
+            "Output": "{% $states.result.Output %}",
+            "End": true
+          }
+        }
+      },
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "BaselineVerify", "Assign": { "finalStatus": "FAILED" } }],
+      "Assign": { "finalStatus": "FAILED" },
+      "Next": "BaselineVerify"
+    },
+    "BaselineVerify": {
+      "Type": "Map",
+      "Comment": "The target fingerprint after this run becomes the baseline of the next pre-flight (ADR 0006); write_report stores it. Skipped for a dry run; a failed check never fails the run.",
+      "Items": "{% $req.dryRun = true or $not($exists($ctx.jobs.preflight)) ? [] : $ctx.jobs.preflight %}",
+      "MaxConcurrency": 1,
+      "ItemSelector": {
+        "job": "{% $states.context.Map.Item.Value %}",
+        "phase": "baseline",
+        "runId": "{% $runId %}",
+        "dryRun": false,
+        "ctx": "{% $jobCtx %}",
+        "failure": null
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "RunBaselineJob",
+        "States": {
+          "RunBaselineJob": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "Arguments": {
+              "StateMachineArn": "${job_runner_arn}",
+              "Input": "{% $merge([$states.input, {'AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID': $states.context.Execution.Id}]) %}"
+            },
+            "Output": "{% $states.result.Output %}",
+            "End": true
+          }
+        }
+      },
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "WriteReport" }],
+      "Assign": { "baseline": "{% $count($states.result) > 0 ? $states.result[0] : null %}" },
+      "Next": "WriteReport"
+    },
+    "WriteReport": {
+      "Type": "Task",
+      "Comment": "report.json + report.md in S3, RUN status in DynamoDB.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${write_report_arn}",
+        "Payload": {
+          "runId": "{% $runId %}",
+          "status": "{% $finalStatus %}",
+          "request": "{% $req %}",
+          "ctx": "{% $ctx %}",
+          "inspect": "{% $inspect %}",
+          "dmsOutcome": "{% $dmsOutcome %}",
+          "failure": "{% $failure %}",
+          "classification": "{% $classification %}",
+          "attempt": "{% $attempt %}",
+          "started": true,
+          "preflight": "{% $preflight %}",
+          "baseline": "{% $baseline %}",
+          "nextRunId": "{% $nextRunId %}"
+        }
+      },
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CheckNotify",
+          "Assign": {
+            "report": {
+              "reportS3Uri": null,
+              "notify": true,
+              "subject": "{% $substring('[dms-orch] ' & $finalStatus & ' (report failed): ' & $runId, 0, 100) %}",
+              "message": "{% $string({'runId': $runId, 'status': $finalStatus, 'reportError': $states.errorOutput.Cause}) %}",
+              "attributes": {
+                "status": { "DataType": "String", "StringValue": "{% $finalStatus %}" },
+                "severity": { "DataType": "String", "StringValue": "{% $finalStatus in ['FAILED', 'MANUAL'] ? 'high' : ($finalStatus = 'REJECTED' ? 'medium' : 'low') %}" }
+              }
+            }
+          }
+        }
+      ],
+      "Assign": { "report": "{% $states.result.Payload %}" },
+      "Next": "CheckNotify"
+    },
+    "CheckNotify": {
+      "Type": "Choice",
+      "Choices": [{ "Condition": "{% $report.notify = true %}", "Next": "Notify" }],
+      "Default": "ReleaseLock"
+    },
+    "Notify": {
+      "Type": "Task",
+      "Comment": "A failed notification never fails the run.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Arguments": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "{% $report.subject %}",
+        "MessageAttributes": "{% $exists($report.attributes) ? $report.attributes : {} %}",
+        "Message": "{% $report.message %}"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ReleaseLock" }],
+      "Next": "ReleaseLock"
+    },
+    "ReleaseLock": {
+      "Type": "Task",
+      "Comment": "Every terminal path passes here. After a hand-over the condition fails: the lock belongs to the next run.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
+        "ConditionExpression": "runId = :r",
+        "ExpressionAttributeValues": { ":r": { "S": "{% $runId %}" } }
+      },
+      "TimeoutSeconds": 10,
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDb.ProvisionedThroughputExceededException", "DynamoDb.InternalServerErrorException", "DynamoDb.RequestLimitExceededException", "DynamoDb.ThrottlingException", "States.Timeout"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Done" }],
+      "Next": "Done"
+    },
+    "Done": {
+      "Type": "Choice",
+      "Choices": [{ "Condition": "{% $finalStatus in ['SUCCEEDED', 'RESUMED'] %}", "Next": "Succeeded" }],
+      "Default": "Failed"
+    },
+    "Succeeded": {
+      "Type": "Succeed",
+      "Output": {
+        "runId": "{% $runId %}",
+        "status": "{% $finalStatus %}",
+        "outcome": "{% $exists($dmsOutcome.outcome) ? $dmsOutcome.outcome : null %}",
+        "dryRun": "{% $req.dryRun %}",
+        "taskArn": "{% $ctx.taskArn %}",
+        "attempt": "{% $attempt %}",
+        "nextRunId": "{% $nextRunId %}",
+        "reportS3Uri": "{% $exists($report.reportS3Uri) ? $report.reportS3Uri : null %}"
+      }
+    },
+    "Failed": {
+      "Type": "Fail",
+      "Error": "{% $exists($failure.Error) ? $string($failure.Error) : 'RunFailed' %}",
+      "Cause": "{% $string({'runId': $runId, 'status': $finalStatus, 'category': $classification.category, 'reason': $exists($classification.reason) ? $classification.reason : $failure.Cause, 'reportS3Uri': $report.reportS3Uri}) %}"
+    }
+  }
+}

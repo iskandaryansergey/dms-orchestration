@@ -1,0 +1,22 @@
+{
+  "definition": "job-runner.asl.json",
+  "state": "CheckStatus",
+  "variables": {
+    "input": {},
+    "attempt": 1,
+    "spec": {
+      "maxAttempts": 1,
+      "idempotent": true,
+      "onError": "continue"
+    },
+    "result": {
+      "status": "fail"
+    },
+    "exitCode": 0,
+    "ecsError": null
+  },
+  "expect": {
+    "status": "SUCCEEDED",
+    "nextState": "JobContinued"
+  }
+}

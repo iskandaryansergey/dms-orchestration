@@ -1,0 +1,256 @@
+{
+  "Comment": "DMS orchestration: run one pre/reset/post/on_failure job (Lambda or Fargate) with retries and onError policy from the job set.",
+  "QueryLanguage": "JSONata",
+  "TimeoutSeconds": ${state_machine_timeout_seconds},
+  "StartAt": "Init",
+  "States": {
+    "Init": {
+      "Type": "Pass",
+      "Assign": {
+        "input": "{% $states.input %}",
+        "attempt": 1,
+        "spec": null,
+        "result": null,
+        "exitCode": 0,
+        "ecsError": null
+      },
+      "Next": "PrepareJob"
+    },
+    "PrepareJob": {
+      "Type": "Task",
+      "Comment": "Evaluate 'when', render templates, resolve runtime target, write spec.json to S3.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${prepare_job_arn}",
+        "Payload": {
+          "job": "{% $input.job %}",
+          "phase": "{% $input.phase %}",
+          "runId": "{% $input.runId %}",
+          "dryRun": "{% $input.dryRun %}",
+          "ctx": "{% $input.ctx %}",
+          "failure": "{% $input.failure %}"
+        }
+      },
+      "TimeoutSeconds": 90,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "JobFailed",
+          "Assign": { "result": { "status": "fail", "message": "{% 'prepare failed: ' & $string($states.errorOutput.Cause) %}" } }
+        }
+      ],
+      "Assign": { "spec": "{% $states.result.Payload.spec %}" },
+      "Next": "CheckSkip"
+    },
+    "CheckSkip": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $spec.skip = true %}",
+          "Next": "RecordJob",
+          "Assign": { "result": { "status": "skipped", "message": "{% $spec.skipReason %}" } }
+        }
+      ],
+      "Default": "CheckRuntime"
+    },
+    "CheckRuntime": {
+      "Type": "Choice",
+      "Choices": [{ "Condition": "{% $spec.runtime = 'lambda' %}", "Next": "InvokeLambdaJob" }],
+      "Default": "RunFargateJob"
+    },
+    "InvokeLambdaJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "{% $spec.functionArn %}",
+        "Payload": { "spec": "{% $spec %}", "attempt": "{% $attempt %}" }
+      },
+      "TimeoutSeconds": "{% $spec.timeoutSeconds + 30 %}",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RecordJob",
+          "Assign": {
+            "result": {
+              "status": "fail",
+              "message": "{% $string($states.errorOutput.Error) & ': ' & $string($states.errorOutput.Cause) %}",
+              "summary": {}
+            }
+          }
+        }
+      ],
+      "Assign": { "result": "{% $states.result.Payload %}" },
+      "Next": "RecordJob"
+    },
+    "RunFargateJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Arguments": {
+        "Cluster": "${ecs_cluster_arn}",
+        "TaskDefinition": "{% $spec.taskDefinitionArn %}",
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "${fargate_platform_version}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ${subnets_json},
+            "SecurityGroups": ${security_groups_json},
+            "AssignPublicIp": "${assign_public_ip}"
+          }
+        },
+        "Overrides": {
+          "TaskRoleArn": "{% $spec.jobRoleArn %}",
+          "ContainerOverrides": [
+            {
+              "Name": "job",
+              "Command": "{% $spec.command %}",
+              "Environment": [
+                { "Name": "ORCH_JOB_SPEC_S3", "Value": "{% $spec.specS3Uri %}" },
+                { "Name": "ORCH_RUN_ID", "Value": "{% $input.runId %}" },
+                { "Name": "ORCH_DRY_RUN", "Value": "{% $input.dryRun ? '1' : '0' %}" },
+                { "Name": "ORCH_ATTEMPT", "Value": "{% $string($attempt) %}" }
+              ]
+            }
+          ]
+        },
+        "PropagateTags": "TASK_DEFINITION",
+        "EnableExecuteCommand": false
+      },
+      "TimeoutSeconds": "{% $spec.timeoutSeconds %}",
+      "Retry": [
+        { "ErrorEquals": ["ECS.AmazonECSException", "ECS.ServerException", "ECS.LimitExceededException"], "IntervalSeconds": 30, "MaxAttempts": 3, "BackoffRate": 2 }
+      ],
+      "Catch": [
+        {
+          "Comment": "The container may still have written result.json; fetch it for the message.",
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FetchFargateResult",
+          "Assign": { "ecsError": "{% $states.errorOutput %}", "exitCode": -1 }
+        }
+      ],
+      "Assign": {
+        "exitCode": "{% $exists($states.result.Containers[Name = 'job'].ExitCode) ? $states.result.Containers[Name = 'job'].ExitCode : -1 %}",
+        "ecsError": null
+      },
+      "Next": "FetchFargateResult"
+    },
+    "FetchFargateResult": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Arguments": { "Bucket": "${artifacts_bucket}", "Key": "{% $spec.resultKey %}" },
+      "TimeoutSeconds": 30,
+      "Retry": [{ "ErrorEquals": ["S3.InternalError", "S3.SlowDown"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RecordJob",
+          "Assign": {
+            "result": {
+              "status": "fail",
+              "message": "{% 'no result.json from the container (exit code ' & $string($exitCode) & ')' & ($ecsError != null ? ': ' & $string($ecsError.Cause) : '') %}",
+              "summary": {}
+            }
+          }
+        }
+      ],
+      "Assign": { "result": "{% $parse($states.result.Body) %}" },
+      "Next": "NormalizeFargateResult"
+    },
+    "NormalizeFargateResult": {
+      "Type": "Pass",
+      "Comment": "A non-zero exit code or an ECS error is a failure whatever result.json says.",
+      "Assign": {
+        "result": "{% ($exitCode != 0 or $ecsError != null) and $result.status != 'fail' ? $merge([$result, {'status': 'fail', 'message': 'container exit code ' & $string($exitCode)}]) : $result %}"
+      },
+      "Next": "RecordJob"
+    },
+    "RecordJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Item": {
+          "pk": { "S": "{% 'RUN#' & $input.runId %}" },
+          "sk": { "S": "{% $spec.recordSk %}" },
+          "entity": { "S": "JOB" },
+          "phase": { "S": "{% $input.phase %}" },
+          "name": { "S": "{% $input.job.name %}" },
+          "status": { "S": "{% $result.status %}" },
+          "attempt": { "N": "{% $string($attempt) %}" },
+          "runtime": { "S": "{% $spec.runtime %}" },
+          "dryRun": { "Bool": "{% $input.dryRun = true %}" },
+          "summary": { "S": "{% $string($exists($result.summary) ? $result.summary : {}) %}" },
+          "message": { "S": "{% $exists($result.message) ? $substring($string($result.message), 0, 4000) : '' %}" },
+          "executionArn": { "S": "{% $states.context.Execution.Id %}" },
+          "finishedAt": { "S": "{% $now() %}" }
+        }
+      },
+      "TimeoutSeconds": 10,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "CheckStatus" }],
+      "Next": "CheckStatus"
+    },
+    "CheckStatus": {
+      "Type": "Choice",
+      "Choices": [
+        { "Condition": "{% $result.status in ['ok', 'warn', 'skipped'] %}", "Next": "JobSucceeded" },
+        {
+          "Condition": "{% $result.status = 'fail' and $attempt < $spec.maxAttempts and $spec.idempotent = true %}",
+          "Next": "WaitBeforeRetry"
+        },
+        { "Condition": "{% $result.status = 'fail' and $spec.onError in ['continue', 'warn'] %}", "Next": "JobContinued" }
+      ],
+      "Default": "JobFailed"
+    },
+    "WaitBeforeRetry": {
+      "Type": "Wait",
+      "Seconds": "{% $spec.backoffSeconds %}",
+      "Assign": { "attempt": "{% $attempt + 1 %}" },
+      "Next": "CheckRuntime"
+    },
+    "JobSucceeded": {
+      "Type": "Succeed",
+      "Output": {
+        "name": "{% $input.job.name %}",
+        "phase": "{% $input.phase %}",
+        "status": "{% $result.status %}",
+        "attempt": "{% $attempt %}",
+        "summary": "{% $exists($result.summary) ? $result.summary : {} %}"
+      }
+    },
+    "JobContinued": {
+      "Type": "Succeed",
+      "Comment": "onError: continue | warn — the run goes on, the report shows the failure.",
+      "Output": {
+        "name": "{% $input.job.name %}",
+        "phase": "{% $input.phase %}",
+        "status": "fail",
+        "continued": true,
+        "attempt": "{% $attempt %}",
+        "message": "{% $exists($result.message) ? $result.message : '' %}"
+      }
+    },
+    "JobFailed": {
+      "Type": "Fail",
+      "Error": "JobFailed",
+      "Cause": "{% $string({'job': $input.job.name, 'phase': $input.phase, 'attempt': $attempt, 'message': $exists($result.message) ? $result.message : '', 'summary': $exists($result.summary) ? $result.summary : {}}) %}"
+    }
+  }
+}

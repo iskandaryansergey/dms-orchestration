@@ -1,0 +1,235 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+
+jobs:
+  static:
+    name: static checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks (secrets)
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
+            git /repo --redact --verbose --exit-code 1
+
+      # Denied terms (the list is the DENYLIST_PATTERNS secret, never in the repository) in tracked
+      # files, paths, commit messages and authors. Output is path:line and pattern number only.
+      # Pull requests from forks do not get the secret, so this step fails there by design:
+      # a maintainer re-runs the change from a branch of this repository.
+      - name: denylist
+        env:
+          DENYLIST_PATTERNS: ${{ secrets.DENYLIST_PATTERNS }}
+        run: python3 scripts/check_denylist.py --history --all
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.55.0
+
+      - name: tflint
+        working-directory: modules/dms-orchestration
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+
+      - name: trivy config (IaC misconfiguration)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: modules
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          trivyignores: .trivyignore
+
+      - name: checkov
+        run: |
+          pipx run checkov==3.2.334 -d modules --framework terraform --quiet --compact \
+            --config-file .checkov.yaml
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.0"
+
+      - name: ruff
+        run: |
+          uv run --only-group dev ruff check src tests scripts examples
+          uv run --only-group dev ruff format --check src tests scripts examples
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh src/jobs/sql-runner/bin/orch-job
+
+      - name: hadolint
+        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < src/jobs/sql-runner/Dockerfile
+
+      - name: terraform-docs (docs/configuration.md is up to date)
+        env:
+          TFDOCS_VERSION: v0.19.0
+          TFDOCS_SHA256: dd741a0ece81059a478684b414d95d72b8b74fa58f50ac4036b4e8b56130d64b
+        run: |
+          curl -fsSL -o /tmp/terraform-docs.tar.gz \
+            "https://github.com/terraform-docs/terraform-docs/releases/download/${TFDOCS_VERSION}/terraform-docs-${TFDOCS_VERSION}-linux-amd64.tar.gz"
+          echo "${TFDOCS_SHA256}  /tmp/terraform-docs.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/terraform-docs && tar -xzf /tmp/terraform-docs.tar.gz -C /tmp/terraform-docs terraform-docs
+          make docs-check TFDOCS=/tmp/terraform-docs/terraform-docs
+
+      - name: job set examples
+        run: |
+          uv run python scripts/jobset_tool.py validate examples/jobs/postgres-basic
+          uv run python scripts/jobset_tool.py validate examples/jobs/minimal
+
+  python:
+    name: python tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.0"
+      - run: uv sync --frozen
+      - name: pytest (unit, lambdas, state machine paths, sql-runner)
+        run: |
+          uv run pytest --cov=src/shared --cov=src/lambdas --cov=src/jobs/sql-runner \
+            --cov-report=term --cov-report=xml --cov-fail-under=85 --junitxml=pytest.xml
+      - name: shared library coverage >= 85%
+        run: uv run coverage report --include='src/shared/*' --fail-under=85
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-test-results
+          path: |
+            pytest.xml
+            coverage.xml
+
+  terraform-test:
+    name: terraform test (${{ matrix.terraform }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform: ["1.9.8", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+      - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+      - name: init + validate
+        working-directory: modules/dms-orchestration
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+      - name: terraform test (mock provider, no AWS)
+        working-directory: modules/dms-orchestration
+        run: terraform test
+
+  # The sandbox needs the upstream aurora/dms modules; the repository names none. With the
+  # repository variables UPSTREAM_MODULES_GIT and UPSTREAM_MODULES_REF set, fetch them at the
+  # pinned commit and validate the sandbox; without them the job is skipped.
+  sandbox-validate:
+    name: sandbox validate (upstream modules)
+    if: vars.UPSTREAM_MODULES_GIT != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.0"
+      - run: uv sync --frozen
+      - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+      - name: fetch-upstream, init, validate
+        env:
+          UPSTREAM_MODULES_GIT: ${{ vars.UPSTREAM_MODULES_GIT }}
+          UPSTREAM_MODULES_REF: ${{ vars.UPSTREAM_MODULES_REF }}
+        run: make sandbox-validate
+
+  state-machines:
+    name: state machine definitions
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.0"
+      - run: uv sync --frozen
+      - name: TestState requests build
+        run: uv run python tests/sfn/run_teststate.py --dry
+      # Real TestState and ValidateStateMachineDefinition calls need the sandbox OIDC role
+      # (repository variable AWS_TESTSTATE_ROLE_ARN; policy: states:TestState, states:ValidateStateMachineDefinition).
+      - name: AWS credentials (sandbox, read-only)
+        if: vars.AWS_TESTSTATE_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TESTSTATE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-2' }}
+      - name: validate-state-machine-definition
+        if: vars.AWS_TESTSTATE_ROLE_ARN != ''
+        run: |
+          uv run python - <<'EOF'
+          import json, sys, boto3
+          sys.path.insert(0, "tests/python")
+          from asl_runner import render
+          sfn = boto3.client("stepfunctions")
+          bad = 0
+          for name in ("migrate.asl.json", "post.asl.json", "job-runner.asl.json"):
+              resp = sfn.validate_state_machine_definition(definition=json.dumps(render(name)), type="STANDARD")
+              print(name, resp["result"], [d["message"] for d in resp.get("diagnostics", [])])
+              bad += resp["result"] != "OK"
+          sys.exit(bad)
+          EOF
+      - name: TestState cases
+        if: vars.AWS_TESTSTATE_ROLE_ARN != ''
+        run: uv run python tests/sfn/run_teststate.py
+
+  image:
+    name: sql-runner image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: docker build -f src/jobs/sql-runner/Dockerfile -t sql-runner:ci .
+      - name: smoke test
+        run: |
+          docker run --rm --entrypoint psql sql-runner:ci --version
+          docker run --rm --entrypoint mysql sql-runner:ci --version
+          docker run --rm --entrypoint pwsh sql-runner:ci -NoLogo -Command '$PSVersionTable.PSVersion.ToString()'
+          docker run --rm --entrypoint psql-run sql-runner:ci --help
+      - name: trivy image (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: sql-runner:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

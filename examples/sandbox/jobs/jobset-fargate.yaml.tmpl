@@ -1,0 +1,46 @@
+# Sandbox job set for the Fargate sql-runner image (sql_runner.tf): the
+# reset and the post checks run in the image with psql over TLS (verify-full, RDS CA bundle).
+# scripts/sandbox.py sync-jobs-fargate uploads it as version "e2e-fargate".
+schemaVersion: 1
+description: Sandbox e2e on Fargate - truncate on reset, TLS and row counts after the load
+
+defaults:
+  runtime: fargate
+  image: sql-runner
+  timeoutSeconds: 900
+  retry: { maxAttempts: 1, backoffSeconds: 30 }
+  idempotent: true
+  onError: fail
+
+phases:
+  pre:
+    - name: check-connections
+      handler: builtin:checks/connections
+      onError: warn
+
+  reset:
+    - name: truncate-tables
+      command: [psql-run, --connection, target, --truncate, "{{ ctx.resetTables }}"]
+      retry: { maxAttempts: 2, backoffSeconds: 30 }
+
+  post:
+    - name: tls-target
+      description: the job's own session to the target is encrypted
+      command:
+        - psql-run
+        - --connection
+        - target
+        - --sql
+        - "DO $$ BEGIN IF NOT (SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()) THEN RAISE EXCEPTION 'session is not TLS'; END IF; END $$"
+    - name: row-counts-data-api
+      handler: builtin:checks/row_counts
+      with: { source: source, target: target, tables: [app.customers, app.accounts, app.transactions, app.audit_notes] }
+    - name: drop-control-tables
+      handler: builtin:cleanup/drop_control_tables
+      with: { connection: target, schema: dms_control, keepValidationFailures: true }
+      onError: warn
+
+  on_failure:
+    - name: collect-diagnostics
+      handler: builtin:diagnostics/dms_dump
+      onError: continue

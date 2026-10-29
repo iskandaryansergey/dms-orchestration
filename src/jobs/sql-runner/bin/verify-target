@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""verify-target: see /opt/orch/orch_verify.py."""
+import sys
+
+sys.path.insert(0, "/opt/orch")
+from orch_verify import verify_main  # noqa: E402
+
+sys.exit(verify_main(sys.argv[1:]))

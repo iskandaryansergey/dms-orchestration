@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+.terraform.tfstate.lock.info
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.build/
+
+# Local
+.env
+.env.*
+*.pem
+.idea/
+.vscode/
+
+# Lock files belong to root configurations, not to the reusable module
+modules/**/.terraform.lock.hcl
+tfplan*
+
+# Upstream aurora/dms modules: fetched by `sandbox.py fetch-upstream`, configured locally
+examples/sandbox/upstream/
+examples/sandbox/upstream.env
+
+# Local fixes to third-party upstream modules stay local.
+examples/sandbox/upstream-patches/*.patch

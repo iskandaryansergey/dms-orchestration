@@ -1,0 +1,3 @@
+#!/bin/sh
+# Entrypoint: run the job command through the orchestration wrapper.
+exec python3 /opt/orch/orch_job.py "$@"

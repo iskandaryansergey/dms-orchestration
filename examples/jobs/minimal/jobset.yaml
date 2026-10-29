@@ -1,0 +1,37 @@
+# A first job set: check the DMS connections, empty partly loaded tables before a resume,
+# build the indexes after the load and compare row counts.
+#
+# Connections (registered in Terraform, projects.<p>.tasks.<t>.connections): source and
+# target, both with data_api_cluster_arn (the row counts run through the Data API).
+#
+# Validate: uv run python scripts/jobset_tool.py validate examples/jobs/minimal
+# Upload:   scripts/sync-jobs.sh <project> <version> examples/jobs/minimal
+schemaVersion: 1
+description: connection check, reset of partial tables, indexes after the load, row counts
+
+defaults:
+  runtime: fargate            # jobs with a command run in the sql-runner image
+  image: sql-runner           # key in the module variable fargate.images
+  timeoutSeconds: 1800
+
+phases:
+  pre:
+    - name: check-connections
+      handler: builtin:checks/connections   # a built-in Lambda job: TestConnection where needed
+
+  reset:
+    - name: truncate-tables
+      command: [psql-run, --connection, target, --truncate, "{{ ctx.resetTables }}"]
+
+  post:
+    - name: indexes
+      command: [psql-run, --connection, target, --file, sql/indexes.sql]
+
+    - name: row-counts
+      handler: builtin:checks/row_counts
+      with: { source: source, target: target }
+
+  on_failure:
+    - name: collect-diagnostics
+      handler: builtin:diagnostics/dms_dump
+      onError: continue

@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""pg-restore-s3: see /opt/orch/orch_dump.py."""
+import sys
+
+sys.path.insert(0, "/opt/orch")
+from orch_dump import restore_main  # noqa: E402
+
+sys.exit(restore_main())

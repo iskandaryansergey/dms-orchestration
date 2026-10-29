@@ -1,0 +1,38 @@
+# terraform-docs configuration for modules/dms-orchestration.
+# Generate: make docs. Check in CI: make docs-check (terraform-docs --output-check).
+# Paths are relative to the module directory.
+version: ">= 0.19.0, < 1.0.0"
+
+formatter: "markdown table"
+
+sections:
+  show:
+    - requirements
+    - providers
+    - inputs
+    - outputs
+
+output:
+  file: "../../docs/configuration.md"
+  mode: inject
+  template: |-
+    <!-- BEGIN_TF_DOCS -->
+    {{ .Content }}
+    <!-- END_TF_DOCS -->
+
+sort:
+  enabled: true
+  by: required
+
+settings:
+  anchor: true
+  default: true
+  description: true
+  escape: true
+  hide-empty: true
+  html: true
+  indent: 3
+  lockfile: false
+  required: true
+  sensitive: true
+  type: true
