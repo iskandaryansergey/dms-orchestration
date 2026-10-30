@@ -21,6 +21,11 @@ Pre-flight mode (ADR 0006), after the built-in job ``checks/target_verify``::
         "decision", "warnings", "fingerprint": {"uri", "hash"} | null, "baseline": {...} | null}
 
 It never changes anything in DMS; ``plan`` and ``dryRun`` rely on that.
+
+``decision`` always carries ``resetTablesCount`` and ``resetTablesUri``. Above
+``MAX_TABLES_IN_PAYLOAD`` tables the list goes to ``<run prefix>/inspect/reset-tables.json``
+(``resetTablesUri``) and ``resetTables`` is empty in the payload; ``prepare_job`` expands it
+into the job's ``spec.json`` only.
 """
 
 from __future__ import annotations
@@ -34,6 +39,40 @@ from shared.store import Store, registration_key
 
 LOGGER = log.get_logger("inspect_task")
 MAX_TABLES_IN_PAYLOAD = 500
+RESET_TABLES_FILE = "inspect/reset-tables.json"
+
+
+def run_prefix(ctx: dict[str, Any], run_id: str) -> str:
+    """S3 prefix of the run's artifacts (``ctx`` for a per-project layout)."""
+    return f"runs/{run_id}"
+
+
+def reset_tables_key(prefix: str) -> str:
+    """Key of the full reset list under a run prefix (``runs/<runId>`` or ``runs/<project>/<runId>``)."""
+    return f"{prefix.rstrip('/')}/{RESET_TABLES_FILE}"
+
+
+def offload_reset_tables(decision: dict[str, Any], ctx: dict[str, Any], run_id: str) -> dict[str, Any]:
+    """Add ``resetTablesCount``/``resetTablesUri``; a list above the payload cap goes to S3."""
+    out = dict(decision)
+    if out.get("resetTablesUri"):
+        return out  # already in S3 (the decision of InspectTask passed through the pre-flight)
+    tables = list(out.get("resetTables") or [])
+    out["resetTablesCount"] = len(tables)
+    out["resetTablesUri"] = None
+    if len(tables) <= MAX_TABLES_IN_PAYLOAD:
+        return out
+    bucket = aws.env("ARTIFACTS_BUCKET")
+    key = reset_tables_key(run_prefix(ctx, run_id))
+    aws.client("s3").put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps({"resetTables": tables, "count": len(tables)}).encode(),
+        ContentType="application/json",
+    )
+    out["resetTables"] = []
+    out["resetTablesUri"] = f"s3://{bucket}/{key}"
+    return out
 
 
 def describe_with_settings(dms: Any, task_arn: str) -> dict[str, Any]:
@@ -157,9 +196,11 @@ def inspect(event: dict[str, Any], dms: Any) -> dict[str, Any]:
     if problems and req.get("operation") != "plan":
         raise TaskConfigInvalid("; ".join(problems))
 
-    decision_dict = decision.to_dict()
-    if len(decision_dict["resetTables"]) > MAX_TABLES_IN_PAYLOAD:
-        warnings.append(f"{len(decision_dict['resetTables'])} tables to reset; list truncated in payload")
+    decision_dict = offload_reset_tables(decision.to_dict(), ctx, event.get("runId") or "")
+    if decision_dict["resetTablesUri"]:
+        warnings.append(
+            f"{decision_dict['resetTablesCount']} tables to reset; list at {decision_dict['resetTablesUri']}"
+        )
     return {
         "configProblems": problems,
         "selectionRules": rules,
@@ -218,12 +259,14 @@ def run_preflight(event: dict[str, Any], store: Store) -> dict[str, Any]:
         reset_configured=bool(jobs.get("reset")),
         iteration=int(event.get("iteration") or 0),
         max_iterations=int((req.get("preflight") or {}).get("maxIterations") or 3),
-        scope_tables=[t["table"] for t in inspected.get("tables") or []],
+        selection_rules=inspected.get("selectionRules") or None,
+        allow_no_fingerprint=bool((req.get("preflight") or {}).get("allowNoFingerprint")),
         previous_missing=_missing_count(event.get("previous")),
         restored_from=base_item.get("runId") if base_item and base_item.get("source") == "restore" else None,
         table_stats=inspected.get("tables") or [],
     )
     out = v.to_dict()
+    out["decision"] = offload_reset_tables(out["decision"] or {}, ctx, event.get("runId") or "")
     if verify and verify.get("status") not in (None, "ok"):
         out["warnings"].append(f"target check {verify.get('status')}: {verify.get('message')}")
     if base_item and baseline is None:

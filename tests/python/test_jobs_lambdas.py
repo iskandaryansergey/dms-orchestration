@@ -85,6 +85,56 @@ def test_prepare_fargate_job_renders_command_and_writes_spec(jobs_env):
     assert stored["jobsS3Prefix"] == CTX["jobsS3Prefix"]
 
 
+LONG = [f"app.t{i:04d}" for i in range(600)]
+LONG_KEY = "runs/run-1/inspect/reset-tables.json"
+
+
+def _long_ctx(jobs_env, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    jobs_env.put_object(Bucket=BUCKET, Key=LONG_KEY, Body=json.dumps(body or {"resetTables": LONG, "count": 600}))
+    return {**CTX, "resetTables": [], "resetTablesCount": 600, "resetTablesUri": f"s3://{BUCKET}/{LONG_KEY}"}
+
+
+@pytest.mark.parametrize("runtime", ["fargate", "lambda"])
+def test_prepare_expands_a_long_reset_list_into_spec_json_only(jobs_env, runtime):
+    from lambdas.prepare_job.handler import handler
+
+    cmd = ["psql-run", "--connection", "target", "--truncate-scope"]
+    j = (
+        job(runtime="lambda", handler="builtin:checks/connections", command=[])
+        if runtime == "lambda"
+        else job(command=cmd)
+    )
+    spec = handler(event(j, ctx=_long_ctx(jobs_env)))["spec"]
+    stored = json.loads(
+        jobs_env.get_object(Bucket=BUCKET, Key="runs/run-1/jobs/reset/01-reset-target/spec.json")["Body"].read()
+    )
+    assert stored["ctx"]["resetTables"] == LONG and stored["ctx"]["resetTablesCount"] == 600
+    assert "app.t0599" not in json.dumps(spec)  # the payload stays small
+    if runtime == "lambda":
+        assert spec["ctx"]["resetTables"] == [] and spec["ctx"]["resetTablesCount"] == 600
+
+
+def test_prepare_refuses_a_reset_list_template_when_the_list_is_in_s3(jobs_env):
+    from lambdas.prepare_job.handler import handler
+    from shared.errors import InvalidJobSet
+
+    with pytest.raises(InvalidJobSet, match="--truncate-scope"):
+        handler(event(job(), ctx=_long_ctx(jobs_env)))
+
+
+def test_prepare_refuses_a_reset_list_that_does_not_match_its_count(jobs_env):
+    from lambdas.prepare_job.handler import handler
+    from shared.errors import JobFailed
+
+    with pytest.raises(JobFailed, match="600"):
+        handler(
+            event(job(command=["psql-run", "--truncate-scope"]), ctx=_long_ctx(jobs_env, {"resetTables": LONG[:3]}))
+        )
+    other = {**CTX, "resetTables": [], "resetTablesCount": 600, "resetTablesUri": "s3://elsewhere/x.json"}
+    with pytest.raises(JobFailed, match="artifacts bucket"):
+        handler(event(job(command=["psql-run", "--truncate-scope"]), ctx=other))
+
+
 def test_prepare_builtin_lambda_job(jobs_env):
     from lambdas.prepare_job.handler import handler
 

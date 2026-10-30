@@ -113,6 +113,56 @@ def test_psql_run_files_and_truncate(sql_env):
     assert result["status"] == "ok" and len(result["summary"]["steps"]) == 2
 
 
+def _scope_spec(sql_env, tables: list[str], count: int | None) -> None:
+    spec = json.loads((sql_env / "spec.json").read_text())
+    spec["ctx"] = {"resetTables": tables, **({} if count is None else {"resetTablesCount": count})}
+    (sql_env / "spec.json").write_text(json.dumps(spec))
+
+
+def test_psql_run_truncate_scope_reads_the_full_list_from_the_spec(sql_env):
+    """Above the payload cap only spec.json has the list; the step label carries the full count."""
+    tables = [f"app.t{i:04d}" for i in range(600)]
+    _scope_spec(sql_env, tables, 600)
+    runner = Runner()
+    assert orch_sql.main(["--connection", "target", "--truncate-scope", "--cascade"], runner=runner) == 0
+    argv, _ = runner.calls[0]
+    sql = Path(argv[-1]).read_text()
+    assert sql.startswith('TRUNCATE TABLE "app"."t0000", ') and sql.endswith('"app"."t0599" CASCADE;\n')
+    result = json.loads((sql_env / "out" / "result.json").read_text())
+    assert result["summary"]["steps"] == ["truncate 600 table(s)"]
+
+
+def test_psql_run_truncate_scope_small_list_and_empty_scope(sql_env):
+    _scope_spec(sql_env, ["public.a"], None)
+    runner = Runner()
+    assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 0
+    assert Path(runner.calls[0][0][-1]).read_text() == 'TRUNCATE TABLE "public"."a";\n'
+    _scope_spec(sql_env, [], 0)
+    runner = Runner()
+    assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 0
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "tables,count,message",
+    [
+        (["public.a"], 600, "1 table(s) in the spec, the decision says 600"),
+        (['public.a"; DROP TABLE x; --'], 1, "unsafe table name"),
+    ],
+)
+def test_psql_run_truncate_scope_refuses_a_short_or_unsafe_list(sql_env, tables, count, message):
+    _scope_spec(sql_env, tables, count)
+    runner = Runner()
+    assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 2
+    assert runner.calls == []
+    assert message in json.loads((sql_env / "out" / "result.json").read_text())["message"]
+
+
+def test_psql_run_truncate_scope_and_truncate_are_exclusive(sql_env):
+    with pytest.raises(SystemExit):
+        orch_sql.main(["--connection", "target", "--truncate-scope", "--truncate", "public.a"], runner=Runner())
+
+
 def test_psql_run_template_uses_spec_and_vars(sql_env):
     (sql_env / "t.sql").write_text(
         "SELECT {{ var.label }}, {{ pre.diff.summary.missing }} FROM {{ ident:ctx.schema }}.t;"

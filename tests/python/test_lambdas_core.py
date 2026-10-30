@@ -754,12 +754,66 @@ def test_preflight_fresh_task_with_table_history_is_manual(env, store):
     assert out["verdict"] == "manual" and "earlier runs" in out["reason"]
 
 
-def test_preflight_without_a_fingerprint_lets_the_dms_state_decide(env):
+def test_preflight_without_a_fingerprint_is_manual_unless_allowed(env):
     from lambdas.inspect_task.handler import handler
 
     start = {"action": "start", "startType": "start-replication", "reset": False, "resetTables": []}
-    out = _preflight(handler, state="fresh", decision=start, verify=None)
-    assert out["verdict"] == "ready" and out["fingerprint"] is None and out["warnings"]
+    out = _preflight(handler, state="fresh", decision=start, verify=None, request=_req(allowReset=True))
+    assert (out["verdict"], out["error"]) == ("manual", "NoFingerprint") and out["fingerprint"] is None
+    req = _req(allowReset=True, preflight={"allowNoFingerprint": True})
+    out = _preflight(handler, state="fresh", decision=start, verify=None, request=req)
+    assert out["verdict"] == "ready" and out["decision"]["reset"] is False and out["warnings"]
+
+
+def test_preflight_reset_scope_follows_the_selection_rules(env):
+    from lambdas.inspect_task.handler import handler
+
+    fp = _fingerprint(5)
+    fp["tables"]["app.tmp_x"] = fp["tables"]["app.a"]
+    uri = _put_fp(env, "runs/r2/d.json", fp)
+    rules = [
+        {"schema": "app", "table": "%", "action": "include"},
+        {"schema": "app", "table": "tmp_%", "action": "exclude"},
+    ]
+    start = {"action": "start", "startType": "start-replication", "reset": False, "resetTables": []}
+    event = {
+        "mode": "preflight",
+        "runId": "r2",
+        "request": _req(allowReset=True),
+        "ctx": _ctx(),
+        "inspect": {"state": "fresh", "decision": start, "tables": [{"table": "app.zz"}], "selectionRules": rules},
+        "verify": {"status": "ok", "summary": {"fingerprintUri": uri}},
+        "iteration": 0,
+    }
+    out = handler(event)
+    assert out["verdict"] == "reset" and out["decision"]["resetTables"] == ["app.a"]
+    assert out["decision"]["resetTablesCount"] == 1 and out["decision"]["resetTablesUri"] is None
+
+
+def test_preflight_puts_a_long_reset_list_in_s3_and_its_count_in_the_payload(env):
+    from lambdas.inspect_task.handler import MAX_TABLES_IN_PAYLOAD, handler
+
+    fp = _fingerprint(5)
+    one = fp["tables"].pop("app.a")
+    fp["tables"] = {f"app.t{i:04d}": one for i in range(600)}
+    fp["expected"] = sorted(fp["tables"])
+    uri = _put_fp(env, "runs/r2/e.json", fp)
+    start = {"action": "start", "startType": "start-replication", "reset": False, "resetTables": []}
+    verify = {"status": "ok", "summary": {"fingerprintUri": uri}}
+    out = _preflight(handler, state="fresh", decision=start, verify=verify, request=_req(allowReset=True))
+    dec = out["decision"]
+    assert out["verdict"] == "reset" and "truncate 600 table(s)" in out["reason"]
+    assert dec["resetTables"] == [] and dec["resetTablesCount"] == 600 > MAX_TABLES_IN_PAYLOAD
+    assert dec["resetTablesUri"] == f"s3://{BUCKET}/runs/r2/inspect/reset-tables.json"
+    stored = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/r2/inspect/reset-tables.json")["Body"].read())
+    assert stored == {"resetTables": sorted(fp["tables"]), "count": 600}
+
+
+def test_reset_tables_key_takes_the_run_prefix():
+    from lambdas.inspect_task.handler import reset_tables_key
+
+    assert reset_tables_key("runs/r2") == "runs/r2/inspect/reset-tables.json"
+    assert reset_tables_key("runs/ledger/r2/") == "runs/ledger/r2/inspect/reset-tables.json"
 
 
 def test_resolve_context_adds_the_target_check_when_the_target_has_the_data_api(env):
@@ -1381,3 +1435,32 @@ def test_verify_runtime_auto_without_the_data_api_uses_fargate_or_nothing(env, m
     monkeypatch.setenv("FARGATE_IMAGES", json.dumps(["sql-runner"]))
     assert _verify_jobs("r-v9")[0]["runtime"] == "fargate"
     assert _verify_jobs("r-v10", {"verifyRuntime": "lambda"}) == []
+
+
+def test_run_request_accepts_allow_no_fingerprint():
+    from shared import validation
+
+    validation.validate(
+        "run_request", {"project": "ledger", "taskKey": "core", "preflight": {"allowNoFingerprint": True}}
+    )
+
+
+def test_write_report_counts_a_reset_list_kept_in_s3(env, store):
+    from lambdas.write_report.handler import handler
+
+    store.put_run("run-1", {"project": "ledger", "status": "RUNNING"})
+    use(dms=FakeDms(FINISHED))
+    decision = {"action": "start", "resetScope": "all", "resetTables": [], "resetTablesCount": 600}
+    handler(
+        {
+            "runId": "run-1",
+            "status": "SUCCEEDED",
+            "request": {"project": "ledger", "taskKey": "core", "notify": {}},
+            "ctx": {"taskArn": TASK_ARN},
+            "inspect": {"state": "completed", "decision": decision},
+            "started": True,
+            "attempt": 1,
+        }
+    )
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-1/report.md")["Body"].read().decode()
+    assert "- Target reset: all (600 tables)" in md

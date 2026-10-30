@@ -74,6 +74,7 @@ A run against an auto-paused Aurora Serverless v2 cluster starts slower: §15.
 | `MANUAL` `TargetNotEmpty` | the DMS task never ran (or was recreated) but the target has rows or earlier table states | confirm the rows are not needed; `--allow-reset` |
 | `MANUAL` `AlreadyCompleted` | the task already loaded everything | `--allow-reset` to load again |
 | `MANUAL` `PreflightTablesMissing` | pre-jobs keep creating tables but some are still missing after `preflight.maxIterations` | check the DDL pre-jobs |
+| `MANUAL` `NoFingerprint` | no target check ran (no Data API connection `target`, no sql-runner image): `--allow-reset` or a first run would act on an unchecked target | give the target a check; for a first run only, `preflight.allowNoFingerprint: true` in the request (never resets), see `docs/preflight.md` |
 | `MANUAL` `ResetNotConfigured` | `--allow-reset` but the job set has no `reset` phase | add a reset job |
 | `FAILED` `RunAlreadyActive` | another run holds the lock | wait, or see §5 |
 | `FAILED` `TaskAlreadyRunning` / `TaskBusy` | DMS task running/modifying outside the orchestrator | find who started it; stop it or wait |

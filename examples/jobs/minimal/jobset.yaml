@@ -21,7 +21,7 @@ phases:
 
   reset:
     - name: truncate-tables
-      command: [psql-run, --connection, target, --truncate, "{{ ctx.resetTables }}"]
+      command: [psql-run, --connection, target, --truncate-scope]   # ctx.resetTables of the spec file, any size
 
   post:
     - name: indexes

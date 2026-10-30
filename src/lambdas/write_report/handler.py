@@ -192,6 +192,12 @@ def build_report(event: dict[str, Any], store: Store, dms: Any) -> dict[str, Any
     return report
 
 
+def _reset_count(decision: dict[str, Any]) -> int:
+    """Full count: above the payload cap the list is in S3 and only its count is in the decision."""
+    count = decision.get("resetTablesCount")
+    return int(count) if count is not None else len(decision.get("resetTables") or [])
+
+
 def to_markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# DMS orchestration run `{report['runId']}`",
@@ -223,7 +229,7 @@ def to_markdown(report: dict[str, Any]) -> str:
         "",
         f"- Task state before run: `{report.get('taskStateBefore')}`",
         f"- Action: `{decision.get('action')}`, start type: `{decision.get('startType')}`",
-        f"- Target reset: {decision.get('resetScope', 'none')} ({len(decision.get('resetTables') or [])} tables)",
+        f"- Target reset: {decision.get('resetScope', 'none')} ({_reset_count(decision)} tables)",
         f"- Reason: {decision.get('reason', '')}",
     ]
     if report.get("warnings"):
