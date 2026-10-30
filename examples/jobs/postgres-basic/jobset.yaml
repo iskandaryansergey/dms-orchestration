@@ -1,18 +1,22 @@
 # Example job set: one PostgreSQL source -> one Aurora PostgreSQL target, full load.
 #
-# Connections are registered in Terraform (projects.<p>.tasks.<t>.connections), by name:
+# Connections are registered in Terraform (projects.<p>.tasks.<t>.connections), by name, each
+# with host and secret_arn:
 #   source      migration_runner on the source (SELECT on schema app)
 #   target      migration_runner on the target (DDL on schema app, owner of the tables)
-#   dms_source  the DMS source endpoint user (for the grants check; Data API enabled on the source)
+#   dms_source  the DMS source endpoint user (for the grants check)
+#
+# Every job runs in Lambda (sql jobs and SQL built-ins through pg8000, TLS verify-full), up to
+# 840 s each; each SQL file is one transaction. Jobs that write are skipped in dry runs (the
+# session is read-only there). scripts/ holds the same checks as commands for a command
+# runtime (ssm or fargate), for targets too big for a Lambda.
 #
 # Upload: scripts/sync-jobs.sh ledger <git-sha> examples/jobs/postgres-basic
 schemaVersion: 1
-description: PostgreSQL full load with schema diff, table creation, indexes/FK after load and row-count check
+description: PostgreSQL full load with a schema check, table creation, indexes/FK after load and row counts
 
 defaults:
-  runtime: fargate
-  image: sql-runner
-  timeoutSeconds: 3600
+  timeoutSeconds: 840
   retry: { maxAttempts: 1, backoffSeconds: 60 }
   idempotent: true
   onError: fail
@@ -25,41 +29,52 @@ phases:
       onError: warn
 
     - name: check-source-grants
-      description: the DMS user can read schema app (Data API on the source cluster)
+      description: the DMS user can read schema app
       handler: builtin:checks/postgresql_source_grants
       with:
         connection: dms_source
         schemas: [app]
         require: [SELECT]
 
-    - name: schema-diff
-      description: compare tables and columns of schema app between source and target
-      command: [python3, scripts/diff_schema.py, --source, source, --target, target, --schema, app]
-      artifacts: { upload: [/out/diff.json] }
+    - name: schema-check
+      description: how many tables of schema app are missing on the target (read-only, also in dry runs)
+      sql:
+        connection: target
+        inline: >-
+          SELECT count(*)::int AS missing_tables
+          FROM unnest(ARRAY[{{ var.tables }}]::text[]) AS t(name)
+          WHERE to_regclass('app.' || quote_ident(t.name)) IS NULL
+        vars:
+          tables: [customers, accounts, transactions, audit_notes]
 
     - name: create-tables
       description: create missing tables (no secondary indexes or FK before the load)
-      command: [psql-run, --connection, target, --file, ddl/010_schema_and_tables.sql, --single-transaction]
-      when: "pre.schema-diff.summary.missingTables > 0"
+      sql: { connection: target, file: ddl/010_schema_and_tables.sql }
+      when: "pre.schema-check.summary.result.missing_tables > 0 and not run.dryRun"
 
   reset:
     - name: truncate-tables
       description: empty partially loaded tables (resume) or all tables (reload-target) to avoid duplicates
-      command: [psql-run, --connection, target, --truncate-scope]   # ctx.resetTables of the spec file, any size
+      sql: { connection: target, truncateScope: true }   # ctx.resetTables of the spec file, any size
       retry: { maxAttempts: 2, backoffSeconds: 30 }
 
   post:
     - name: indexes-and-foreign-keys
-      command: [psql-run, --connection, target, --file, ddl/020_indexes.sql, --file, ddl/030_foreign_keys.sql]
-      timeoutSeconds: 14400
+      description: secondary indexes and foreign keys in one transaction
+      sql:
+        connection: target
+        file: [ddl/020_indexes.sql, ddl/030_foreign_keys.sql]
+        singleTransaction: true
+      when: "not run.dryRun"
 
     - name: sync-sequences
-      command: [psql-run, --connection, target, --file, ddl/040_sync_sequences.sql]
+      sql: { connection: target, file: ddl/040_sync_sequences.sql }
+      when: "not run.dryRun"
 
     - name: row-counts
       description: row counts must match between source and target
-      command: [python3, scripts/row_counts.py, --source, source, --target, target, --schema, app]
-      artifacts: { upload: [/out/row_counts.json] }
+      handler: builtin:checks/row_counts
+      with: { source: source, target: target }
 
     - name: cleanup-control-tables
       description: DMS control tables are not needed after a full load
