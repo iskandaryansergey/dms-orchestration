@@ -9,7 +9,8 @@ in S3 only), then, with ``sql``:
   transaction); ``singleTransaction`` wraps all of them in ``BEGIN`` / ``COMMIT``;
 * ``inline``: the same, for one short statement list in the job set;
 * ``truncateScope``: ``TRUNCATE`` of the full ``ctx.resetTables`` in one statement
-  (``cascade``: ``CASCADE``); a dry run only counts.
+  (``cascade``: ``CASCADE``); tables missing on the target are skipped and named in the
+  message (``skippedMissing``); a dry run only counts.
 
 ``{{ expr }}`` in the SQL becomes a SQL literal and ``{{ ident:expr }}`` a quoted identifier,
 from ``ctx``, ``run``, ``failure``, ``var`` (``sql.vars``) and earlier results; nothing is spliced.
@@ -155,19 +156,33 @@ def timeout_seconds(spec: dict[str, Any]) -> int:
     return max(10, int(spec.get("timeoutSeconds") or 840) - TIMEOUT_MARGIN_SECONDS)
 
 
+MISSING_LISTED = 10
+MISSING_TABLES_SQL = "SELECT t AS missing FROM unnest(CAST(:names AS text[])) AS t WHERE to_regclass(t) IS NULL"
+
+
 def truncate(spec: dict[str, Any], sql: dict[str, Any], name: str, dry: bool) -> dict[str, Any]:
     tables = scope_tables(spec)
     base = {"connection": name, "dryRun": dry}
     if not tables:
         return result("ok", "nothing to truncate", **base, tables=0)
-    statement = (
-        "TRUNCATE TABLE " + ", ".join(quote_table(t) for t in tables) + (" CASCADE" if sql.get("cascade") else "")
-    )
+    quoted = {quote_table(t): t for t in tables}
     with sqlclient.connect(spec, name, read_only=dry, timeout_seconds=timeout_seconds(spec)) as db:
         if dry:
             return result("ok", f"dry run: would truncate {len(tables)} table(s)", **base, wouldTruncate=len(tables))
-        db.execute(statement)  # one statement: all tables or none
-    return result("ok", f"truncated {len(tables)} table(s)", **base, tables=len(tables))
+        # The reset list comes from DMS table statistics, which keep tables dropped since the
+        # last run: a missing table has no rows to reset, so it is skipped, not a failure.
+        gone = {row["missing"] for row in db.query(MISSING_TABLES_SQL, names=list(quoted))}
+        present = [q for q in quoted if q not in gone]
+        if present:
+            cascade = " CASCADE" if sql.get("cascade") else ""
+            db.execute("TRUNCATE TABLE " + ", ".join(present) + cascade)  # one statement: all tables or none
+    message = f"truncated {len(present)} table(s)" if present else "nothing to truncate"
+    if gone:
+        names = sorted(quoted[q] for q in gone)
+        more = len(names) - MISSING_LISTED
+        listed = ", ".join(names[:MISSING_LISTED]) + (f" and {more} more" if more > 0 else "")
+        message += f"; skipped {len(names)} table(s) missing on the target: {listed}"
+    return result("ok", message, **base, tables=len(present), **({"skippedMissing": len(gone)} if gone else {}))
 
 
 def run_sql(spec: dict[str, Any], sql: dict[str, Any], name: str, dry: bool) -> dict[str, Any]:

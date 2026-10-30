@@ -766,7 +766,8 @@ def test_truncate_scope_reads_the_full_list_and_truncates_in_one_statement(pg, e
     assert "app.t0599" not in json.dumps(spec)  # the payload stays small
     out = _run(spec)
     assert out["status"] == "ok" and out["summary"]["tables"] == 600, out
-    (call,) = pg.calls
+    check, call = pg.calls  # which tables exist, then one TRUNCATE
+    assert "to_regclass" in check["sql"] and len(check["params"]["names"]) == 600
     assert call["sql"].startswith('TRUNCATE TABLE "app"."t0000", ') and call["sql"].endswith('"app"."t0599" CASCADE')
     assert call["sql"].count('"app"."t') == 600
 
@@ -790,6 +791,34 @@ def test_truncate_scope_refuses_a_list_that_does_not_match_its_count_or_names(pg
     spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset", ctx=_ctx(resetTables=["a;b"]))
     assert "unsafe" in _run(spec)["message"]
     assert pg.calls == []
+
+
+def test_truncate_scope_skips_tables_missing_on_the_target(pg, env):
+    # Tables dropped after an interrupted run stay in the DMS statistics the reset list comes
+    # from; TRUNCATE of a missing table would fail the whole reset (live run, s4big).
+    pg.answers = {"to_regclass": [{"missing": '"app"."b"'}]}
+    ctx = _ctx(resetTables=["app.a", "app.b", "app.c"])
+    spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset", ctx=ctx)
+    out = _run(spec)
+    assert out["status"] == "ok", out
+    assert out["summary"]["tables"] == 2 and out["summary"]["skippedMissing"] == 1
+    assert "app.b" in out["message"] and "missing on the target" in out["message"]
+    check, trunc = pg.calls
+    assert check["params"]["names"] == ['"app"."a"', '"app"."b"', '"app"."c"']
+    assert trunc["sql"] == 'TRUNCATE TABLE "app"."a", "app"."c"'
+
+
+def test_truncate_scope_with_every_table_missing_truncates_nothing(pg, env):
+    pg.answers = {"to_regclass": [{"missing": '"app"."a"'}, {"missing": '"app"."b"'}]}
+    spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset")
+    out = _run(spec)
+    assert out["status"] == "ok" and out["summary"] == {
+        "connection": "target",
+        "dryRun": False,
+        "tables": 0,
+        "skippedMissing": 2,
+    }
+    assert len(pg.calls) == 1  # the check only, no TRUNCATE
 
 
 def test_single_transaction_wraps_every_file_and_rolls_back_on_error(pg, env):
