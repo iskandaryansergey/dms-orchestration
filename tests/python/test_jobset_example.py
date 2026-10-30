@@ -172,3 +172,68 @@ def test_job_contract_tutorial_shows_the_minimal_example_verbatim():
     assert (MINIMAL / "jobset.yaml").read_text(encoding="utf-8") in blocks
     for command in ("jobset_tool.py validate examples/jobs/minimal", "sync-jobs.sh", "--dry-run"):
         assert command in section, command
+
+
+# --- review finding 9: bundle.sha256, the hash Terraform pins --------------------
+
+
+def test_build_writes_bundle_sha256_over_every_file(tmp_path, capsys):
+    from shared import bundle
+
+    out = tmp_path / "bundle"
+    assert jobset_tool.build(EXAMPLE, out) == 0
+    files, total = bundle.parse((out / "bundle.sha256").read_text(encoding="utf-8"))
+    on_disk = sorted(p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file())
+    assert sorted(files) == [p for p in on_disk if p != "bundle.sha256"]
+    assert files["jobset.json"] == bundle.digest((out / "jobset.json").read_bytes())
+    assert f"sha256 {total}" in capsys.readouterr().out
+
+
+def test_hash_prints_the_total_of_a_bundle_and_of_its_build(tmp_path, capsys):
+    out = tmp_path / "bundle"
+    assert jobset_tool.build(EXAMPLE, out) == 0
+    total = (out / "bundle.sha256").read_text(encoding="utf-8").splitlines()[-1].removeprefix("total ")
+    capsys.readouterr()
+    assert jobset_tool.main(["hash", str(EXAMPLE)]) == 0
+    assert capsys.readouterr().out.strip() == total
+    assert jobset_tool.main(["hash", str(out)]) == 0  # a built bundle hashes the same
+    assert capsys.readouterr().out.strip() == total
+
+
+def test_hash_changes_with_one_byte(tmp_path, capsys):
+    import shutil
+
+    copy = tmp_path / "src"
+    shutil.copytree(EXAMPLE, copy)
+    assert jobset_tool.main(["hash", str(copy)]) == 0
+    before = capsys.readouterr().out.strip()
+    sql = copy / "ddl" / "020_indexes.sql"
+    sql.write_bytes(sql.read_bytes() + b"\n")
+    assert jobset_tool.main(["hash", str(copy)]) == 0
+    assert capsys.readouterr().out.strip() != before
+
+
+def test_a_stale_bundle_sha256_in_the_source_is_not_copied(tmp_path):
+    from shared import bundle
+
+    src = tmp_path / "src"
+    src.mkdir()
+    write_bundle(src, "schemaVersion: 1\nphases: {}\n")
+    (src / "bundle.sha256").write_text("total " + "0" * 64 + "\n")
+    out = tmp_path / "out"
+    assert jobset_tool.build(src, out) == 0
+    files, _ = bundle.parse((out / "bundle.sha256").read_text(encoding="utf-8"))
+    assert sorted(files) == ["jobset.json", "jobset.yaml"]
+
+
+def test_bundle_paths_are_relative_and_plain():
+    from shared import bundle
+    from shared.errors import JobSetTampered
+
+    for bad in ("../x.sql", "/abs.sql", "a//b", "a\\b", "bundle.sha256", "./a", "a\nb"):
+        with pytest.raises(JobSetTampered):
+            bundle.render({bad: "0" * 64})
+    good = bundle.render({"ddl/a.sql": "1" * 64, "jobset.json": "2" * 64})
+    assert bundle.parse(good)[0] == {"ddl/a.sql": "1" * 64, "jobset.json": "2" * 64}
+    with pytest.raises(JobSetTampered, match="total"):
+        bundle.parse(good.replace("1" * 64, "3" * 64, 1))
