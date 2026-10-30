@@ -154,7 +154,8 @@ class FakeConnection:
         for needle, err in self.server.errors.items():
             if needle in sql:
                 raise FakeDatabaseError(err)
-        for needle, rows in self.server.answers.items():
+        answers = self.server.by_host.get(self.kw.get("host"), self.server.answers)
+        for needle, rows in answers.items():
             if needle in sql:
                 cols = list(rows[0]) if rows else []
                 self.columns = [{"name": c} for c in cols]
@@ -175,6 +176,7 @@ class FakeServer:
 
     def __init__(self, answers: dict[str, list[dict[str, Any]]] | None = None, refuse: Exception | None = None):
         self.answers = answers or {}
+        self.by_host: dict[str, dict[str, list[dict[str, Any]]]] = {}
         self.errors: dict[str, dict[str, str]] = {}
         self.refuse = refuse
         self.calls: list[dict[str, Any]] = []
@@ -398,3 +400,116 @@ def test_the_vendored_driver_imports_without_the_network():
         assert {"Connection", "DatabaseError", "Error"} <= set(dir(mod))
     finally:
         sqlclient.set_driver(None)
+
+
+# --- built-in jobs on a connection with a host: pg8000 instead of the Data API --------------
+
+BUCKET = "dms-orch-artifacts-test"
+SOURCE_SECRET = "arn:aws:secretsmanager:eu-west-2:111122223333:secret:s"
+SOURCE = {**TARGET, "secretArn": SOURCE_SECRET, "host": "source.cluster-xyz.eu-west-2.rds.amazonaws.com"}
+BOTH_SECRETS = {**SECRET_VALUES, SOURCE_SECRET: {"username": "reader", "password": "pw-source"}}
+
+
+def _builtin(handler: str, conns: dict[str, Any], **kw: Any) -> dict[str, Any]:
+    from lambdas.builtin_jobs.handler import handler as run
+
+    spec = {
+        "name": "target-verify",
+        "runId": "run-1",
+        "handler": handler,
+        "connections": conns,
+        "ctx": {"project": "ledger", "taskKey": "core", "connections": conns, "selectionRules": RULES},
+        "dryRun": False,
+        "timeoutSeconds": 600,
+        "artifactsS3Prefix": f"s3://{BUCKET}/runs/ledger/run-1/jobs/preflight/00-target-verify/",
+        "jobRoleArn": ROLE,
+        **kw,
+    }
+    return run({"spec": spec, "attempt": 1})
+
+
+def _s3() -> Any:
+    import boto3
+
+    s3 = boto3.client("s3", region_name="eu-west-2")
+    s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
+    return s3
+
+
+from test_jobs_lambdas import RULES, SOURCE_ANSWERS, TARGET_ANSWERS, ByClusterRdsData  # noqa: E402
+
+
+def test_target_verify_through_pg8000_gives_the_data_api_fingerprint(pg):
+    """One fixture catalogue, two transports: the pg8000 check is equivalent to the Data API one."""
+    from shared import aws as shared_aws
+
+    s3 = _s3()
+    shared_aws.set_client("secretsmanager", FakeSecrets(BOTH_SECRETS))
+    target = {**TARGET_ANSWERS, "pg_database_size": [{"b": 4242}]}
+    data_api_conns = {
+        "target": {**TARGET, "host": None, "dataApiClusterArn": "arn:aws:rds:eu-west-2:111122223333:cluster:target"},
+        "source": {**SOURCE, "host": None, "dataApiClusterArn": "arn:aws:rds:eu-west-2:111122223333:cluster:source"},
+    }
+    shared_aws.set_client("rds-data", ByClusterRdsData({"target": target, "source": SOURCE_ANSWERS}))
+    via_api = _builtin("builtin:checks/target_verify", data_api_conns)
+    key = "runs/ledger/run-1/jobs/preflight/00-target-verify/target-fingerprint.json"
+    fp_api = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+
+    pg.by_host = {TARGET["host"]: target, SOURCE["host"]: SOURCE_ANSWERS}
+    via_pg = _builtin("builtin:checks/target_verify", {"target": TARGET, "source": SOURCE})
+    fp_pg = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+
+    assert via_pg["status"] == via_api["status"] == "ok", via_pg
+    assert via_pg["summary"] == via_api["summary"]  # fingerprintHash, tables, rows, expected, databaseBytes
+    assert fp_pg == fp_api
+    assert {c.kw["host"] for c in pg.connections} == {TARGET["host"], SOURCE["host"]}
+    assert all(c.read_only and c.closed for c in pg.connections)  # a check never writes
+    assert any(c["params"].get("schemas") == "app" for c in pg.calls)
+
+
+def test_row_counts_and_grants_run_through_pg8000_when_the_connection_has_a_host(pg):
+    from shared import aws as shared_aws
+
+    shared_aws.set_client("secretsmanager", FakeSecrets(BOTH_SECRETS))
+    pg.by_host = {
+        TARGET["host"]: {'"app"."a"': [{"n": 10}], '"app"."b"': [{"n": 4}]},
+        SOURCE["host"]: {'"app"."a"': [{"n": 10}], '"app"."b"': [{"n": 5}]},
+    }
+    conns = {"target": TARGET, "source": SOURCE}
+    out = _builtin("builtin:checks/row_counts", conns, **{"with": {"tables": ["app.a", "app.b"]}})
+    assert out["status"] == "fail" and out["summary"]["mismatched"] == ["app.b"]
+    assert all(c.read_only for c in pg.connections)
+
+    info = {"usr": "dms", "wal_level": "logical", "max_slots": 4, "used_slots": 1}
+    info |= {"replication": True, "superuser": False, "rds_replication": False}
+    pg.by_host = {SOURCE["host"]: {"current_setting('wal_level')": [info], "has_table_privilege": []}}
+    grants = _builtin("builtin:checks/postgresql_source_grants", conns, **{"with": {"connection": "source"}})
+    assert grants["status"] == "ok", grants
+
+
+def test_drop_control_tables_through_pg8000_writes_only_outside_dry_runs(pg):
+    pg.answers = {"information_schema.tables": [{"table_name": "awsdms_status"}]}
+    dry = _builtin("builtin:cleanup/drop_control_tables", {"target": TARGET}, dryRun=True)
+    assert dry["status"] == "ok" and dry["summary"]["wouldDrop"] == ["awsdms_status"]
+    assert pg.connections[-1].read_only
+    out = _builtin("builtin:cleanup/drop_control_tables", {"target": TARGET})
+    assert out["status"] == "ok" and out["summary"]["dropped"] == ["awsdms_status"]
+    assert not pg.connections[-1].read_only
+    assert any('DROP TABLE IF EXISTS "dms_control"."awsdms_status"' in c["sql"] for c in pg.calls)
+
+
+def test_a_database_error_in_a_built_in_job_is_a_job_failure(pg):
+    pg.errors = {"pg_stat_user_tables": {"C": "42501", "M": "permission denied for table pg_class"}}
+    out = _builtin("builtin:checks/target_verify", {"target": TARGET}, **{"with": {"source": None}})
+    assert out["status"] == "fail" and out["message"].startswith("InsufficientPrivilege: permission denied")
+    assert "pw-secret-value" not in json.dumps(out)
+
+
+def test_a_connection_without_host_or_data_api_fails_the_job(pg):
+    from shared import aws as shared_aws
+
+    shared_aws.set_client("secretsmanager", FakeSecrets(BOTH_SECRETS))
+    conns = {"target": {**TARGET, "host": None}, "source": SOURCE}
+    out = _builtin("builtin:checks/row_counts", conns, **{"with": {"tables": ["app.a"]}})
+    assert out["status"] == "fail" and "host" in out["message"] and "Data API" in out["message"]
+    assert [c.closed for c in pg.connections] == [True]  # the source session opened first is closed
