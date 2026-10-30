@@ -217,6 +217,8 @@ def job_env(aws, tmp_path, monkeypatch):
         monkeypatch.setenv(f"ORCH_{name.upper()}_DIR", str(tmp_path / name))
     monkeypatch.setenv("ORCH_JOB_SPEC_S3", f"s3://{BUCKET}/{BASE}/spec.json")
     monkeypatch.setenv("ORCH_ATTEMPT", "1")
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+    monkeypatch.delenv("ORCH_LOG_STREAM", raising=False)
 
     def put_spec(**kw: Any) -> dict[str, Any]:
         spec = {
@@ -270,7 +272,90 @@ def test_orch_job_non_zero_exit_is_failure(job_env):
     )
     assert code == 3
     result = result_of(job_env)
-    assert result["status"] == "fail" and result["message"].startswith("exit code 3") and "boom" in result["message"]
+    assert result["status"] == "fail"
+    # No output lines in the result: it reaches the execution Cause, readable by the operator.
+    assert result["message"] == "exit code 3 (see CloudWatch log stream unavailable)"
+    assert "boom" not in json.dumps(result)
+
+
+# --- review finding 2: no job output in results; the log stream instead -------------------
+
+
+def test_failed_job_points_at_the_log_stream_from_the_container_metadata(job_env, monkeypatch):
+    job_env.put_spec()
+    monkeypatch.setenv("ECS_CONTAINER_METADATA_URI_V4", "http://169.254.170.2/v4/abc")
+    seen: list[str] = []
+
+    def metadata(uri: str) -> dict[str, Any]:
+        seen.append(uri)
+        return {"LogDriver": "awslogs", "LogOptions": {"awslogs-stream": "core/job/0123abcd"}}
+
+    monkeypatch.setattr(orch_job, "_container_metadata", metadata)
+    script = (
+        "import json, os, pathlib; print('password=pw');"
+        "pathlib.Path(os.environ['ORCH_OUT_DIR'], 'result.json')"
+        ".write_text(json.dumps({'status': 'fail', 'message': 'counts differ'})); raise SystemExit(4)"
+    )
+    assert orch_job.main([sys.executable, "-c", script], s3=job_env.s3, secrets=job_env.sm) == 4
+    result = result_of(job_env)
+    assert seen == ["http://169.254.170.2/v4/abc"]
+    assert result["message"] == "exit code 4 (see CloudWatch log stream core/job/0123abcd): counts differ"
+    assert "password" not in json.dumps(result)
+
+
+def test_log_stream_name_falls_back_when_the_metadata_is_unreadable(monkeypatch):
+    monkeypatch.setenv("ECS_CONTAINER_METADATA_URI_V4", "http://169.254.170.2/v4/abc")
+
+    def broken(uri: str) -> dict[str, Any]:
+        raise OSError("no route")
+
+    monkeypatch.setattr(orch_job, "_container_metadata", broken)
+    assert orch_job.log_stream_name() == "unavailable"
+    monkeypatch.setenv("ORCH_LOG_STREAM", "runner/job-1")
+    assert orch_job.log_stream_name() == "runner/job-1"
+
+
+def test_timed_out_job_result_has_no_output_lines(tmp_path):
+    result = orch_job.build_result(124, tmp_path, "core/job/1")
+    assert result == {
+        "status": "fail",
+        "message": "exit code 124 (see CloudWatch log stream core/job/1)",
+        "summary": {},
+        "artifacts": [],
+    }
+
+
+# --- review finding 11: a dry run opens read-only sessions for libpq clients ---------------
+
+ENV_SCRIPT = (
+    "import json, os, pathlib; pathlib.Path(os.environ['ORCH_OUT_DIR'], 'result.json')"
+    ".write_text(json.dumps({'status': 'ok', 'summary': {'pgoptions': os.environ.get('PGOPTIONS')}}))"
+)
+
+
+def test_dry_run_job_gets_read_only_pgoptions(job_env, monkeypatch):
+    monkeypatch.delenv("PGOPTIONS", raising=False)
+    job_env.put_spec(dryRun=True)
+    assert orch_job.main([sys.executable, "-c", ENV_SCRIPT], s3=job_env.s3, secrets=job_env.sm) == 0
+    assert result_of(job_env)["summary"]["pgoptions"] == "-c default_transaction_read_only=on"
+
+
+def test_dry_run_keeps_existing_pgoptions(job_env, monkeypatch):
+    monkeypatch.setenv("PGOPTIONS", "-c statement_timeout=60000")
+    monkeypatch.setenv("ORCH_DRY_RUN", "1")
+    job_env.put_spec()
+    assert orch_job.main([sys.executable, "-c", ENV_SCRIPT], s3=job_env.s3, secrets=job_env.sm) == 0
+    assert (
+        result_of(job_env)["summary"]["pgoptions"] == "-c statement_timeout=60000 -c default_transaction_read_only=on"
+    )
+
+
+def test_real_run_does_not_set_read_only_pgoptions(job_env, monkeypatch):
+    monkeypatch.delenv("PGOPTIONS", raising=False)
+    monkeypatch.delenv("ORCH_DRY_RUN", raising=False)
+    job_env.put_spec()
+    assert orch_job.main([sys.executable, "-c", ENV_SCRIPT], s3=job_env.s3, secrets=job_env.sm) == 0
+    assert result_of(job_env)["summary"]["pgoptions"] is None
 
 
 def test_orch_job_result_fail_with_zero_exit_returns_one(job_env):

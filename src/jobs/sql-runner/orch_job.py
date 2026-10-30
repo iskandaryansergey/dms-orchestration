@@ -11,6 +11,10 @@ Steps: download the spec and the job bundle (``jobsS3Prefix``) into the work dir
 resolve connection secrets into a 0600 file (never into the environment or
 logs), run the command, then upload ``result.json`` (and declared artifacts).
 The container exit code is 0 only when the job status is ok or warn.
+
+The command's output goes to the container log only, never into the result: a failed job's
+message names the exit code and the CloudWatch log stream. In a dry run the command gets
+``PGOPTIONS=-c default_transaction_read_only=on`` (libpq clients open read-only sessions).
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +36,7 @@ import boto3
 
 OK_STATUSES = {"ok", "warn"}
 VALID_STATUSES = {"ok", "warn", "fail"}
+READ_ONLY_PGOPTIONS = "-c default_transaction_read_only=on"
 
 
 def split_s3(uri: str) -> tuple[str, str]:
@@ -166,7 +172,31 @@ def run_command(command: list[str], env: dict[str, str], cwd: Path, timeout: int
     return code, list(tail)
 
 
-def build_result(exit_code: int, tail: list[str], out_dir: Path) -> dict[str, Any]:
+def _container_metadata(uri: str) -> dict[str, Any]:
+    """Task metadata endpoint v4 of this container (link-local, no credentials)."""
+    if not uri.startswith("http://"):
+        raise ValueError(f"unexpected metadata uri: {uri}")
+    with urllib.request.urlopen(uri, timeout=2) as resp:  # noqa: S310 - ECS-provided http uri
+        return json.loads(resp.read())
+
+
+def log_stream_name() -> str:
+    """CloudWatch log stream of this job: ``ORCH_LOG_STREAM`` or the ECS container metadata."""
+    if os.environ.get("ORCH_LOG_STREAM"):
+        return os.environ["ORCH_LOG_STREAM"]
+    uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
+    if uri:
+        try:
+            stream = (_container_metadata(uri).get("LogOptions") or {}).get("awslogs-stream")
+        except (OSError, ValueError, AttributeError):
+            stream = None
+        if stream:
+            return str(stream)
+    return "unavailable"
+
+
+def build_result(exit_code: int, out_dir: Path, log_stream: str) -> dict[str, Any]:
+    """The job result. Never holds command output: it reaches the execution Cause and the report."""
     produced: dict[str, Any] = {}
     result_file = out_dir / "result.json"
     if result_file.exists():
@@ -178,7 +208,8 @@ def build_result(exit_code: int, tail: list[str], out_dir: Path) -> dict[str, An
     message = str(produced.get("message") or "")
     if exit_code != 0:
         status = "fail"
-        message = f"exit code {exit_code}: " + (message or "\n".join(tail[-10:]))
+        failed = f"exit code {exit_code} (see CloudWatch log stream {log_stream})"
+        message = f"{failed}: {message}" if message else failed
     return {
         "status": status,
         "message": message[:4000],
@@ -233,17 +264,21 @@ def main(argv: list[str] | None = None, s3: Any = None, secrets: Any = None) -> 
         "ORCH_PHASE": spec["phase"],
         "ORCH_JOB_NAME": spec["name"],
     }
+    if env["ORCH_DRY_RUN"] == "1":
+        env["PGOPTIONS"] = f"{env.get('PGOPTIONS', '')} {READ_ONLY_PGOPTIONS}".strip()
     (out_dir / "result.json").unlink(missing_ok=True)
     if not command:
-        exit_code, tail = 2, ["orch: no command given"]
+        exit_code = 2
+        print("orch: no command given")
     else:
         timeout = max(30, int(spec.get("timeoutSeconds", 3600)) - 30)
         try:
-            exit_code, tail = run_command(command, env, jobs_dir, timeout)
+            exit_code, _ = run_command(command, env, jobs_dir, timeout)
         except FileNotFoundError as err:
-            exit_code, tail = 127, [f"orch: command not found: {err}"]
+            exit_code = 127
+            print(f"orch: command not found: {err}")
 
-    result = build_result(exit_code, tail, out_dir)
+    result = build_result(exit_code, out_dir, log_stream_name() if exit_code else "")
     result["artifacts"] += upload_artifacts(s3, spec, out_dir)
     result["durationSeconds"] = round(time.monotonic() - started, 1)
     s3.put_object(
