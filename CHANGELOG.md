@@ -146,8 +146,9 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
   creates a VPC function or a `.sync` state before its policy (b33aa9f).
 - A timed-out `StartReplicationTask` is not retried: an explicit `States.Timeout` retrier with
   `MaxAttempts 0` comes before the `States.TaskFailed` one (5e0fcc4).
-- `truncateScope` skips tables missing on the target and names them (`skippedMissing`): a reset
-  list from the DMS statistics of an earlier run no longer fails on tables dropped since (941d281).
+- `truncateScope` and `psql-run --truncate-scope` (PostgreSQL) skip tables missing on the target
+  and name them (`skippedMissing`, a NOTICE): a reset list from the DMS statistics of an earlier
+  run no longer fails on tables dropped since (941d281, 5a8c2ed).
 - Sandbox: the SQL Lambda reaches S3 through the gateway endpoint (25af970); interface endpoint
   keys come from the sandbox variables, so `terraform validate` has no cycle (aa19e10); the task
   turned `fail_on_validation_errors` off for its table without a primary key (e53fcec), no longer
