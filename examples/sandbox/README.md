@@ -13,10 +13,10 @@ The upstream modules are not part of this repository. `sbx fetch-upstream` check
 in `UPSTREAM_MODULES_REF` (environment, or `upstream.env` copied from
 [`upstream.env.example`](upstream.env.example)) into `./upstream/`, which `main.tf` sources.
 `upstream.env` and `./upstream/` are gitignored. Patches in `upstream-patches/*.patch`, if
-you add any, are applied after the checkout (none ship with the repository). The contract
-lists two known defects of one dms module implementation (2.3, stable `for_each` keys for
-secret endpoints, and 2.6, `postgres.max_file_size`); the workarounds below stay harmless
-with a module that has them. The
+you add any, are applied after the checkout (none ship with the repository). Pin a commit at
+or after 08def61 of the implementation in `upstream.env.example`: from there its dms module
+has stable `for_each` keys for secret endpoints and sends `postgres.max_file_size` (contract
+2.3 and 2.6), and the sandbox no longer works around either. The
 aurora module must support IAM database users (`create_iam_database_users`) for `s1iam`. Any
 implementation that satisfies [the contract](../../docs/upstream-modules-contract.md) works;
 why the modules are not vendored: [ADR 0010](../../docs/adr/0010-upstream-modules-dependency.md).
@@ -67,7 +67,9 @@ uv run python ../../scripts/verify_destroyed.py --match dms-orch-sbx --profile $
 export TF_VAR_operator_cidr=$(curl -s https://checkip.amazonaws.com)/32
 export TF_VAR_sql_runner=true TF_VAR_assessment=true TF_VAR_snapshot_dumps=true TF_VAR_iam_auth=true TF_VAR_sqs_fanout=true
 terraform init
-terraform apply -target=aws_secretsmanager_secret.db   # secrets first (contract 2.3; harmless with the patch)
+# Not needed from upstream 08def61 (contract 2.3); removed after the next sandbox run
+# proves a single apply and a clean destroy.
+terraform apply -target=aws_secretsmanager_secret.db   # secrets first
 terraform apply                                         # if it fails on IAM eventual consistency, run it again
 sbx build-image $(git rev-parse --short HEAD)           # CodeBuild + trivy gate, prints the tag
 export TF_VAR_sql_runner_image_tag=$(git rev-parse --short HEAD)
@@ -75,7 +77,7 @@ terraform apply                                         # task definition + ECR 
 
 # 2. data and job sets
 sbx seed              # source: schema + 235k rows + the dms_source password; target: schema + dms_control
-sbx test-connections  # target MaxFileSize 0 -> 32768 if the dms module left it at 0, TestConnection of both endpoints
+sbx test-connections  # TestConnection of both endpoints
 sbx sync-jobs         # job sets "e2e", "e2e-dms-only", "e2e-postfail"
 sbx sync-jobs-fargate # job set "e2e-fargate"
 sbx sync-jobs-iam     # job set "e2e-iam"
@@ -142,9 +144,11 @@ lists it.
 
 If a second `terraform destroy` (after a partial one) fails with `Invalid for_each argument` in
 the upstream `dms` module (`endpoints_with_secret` cannot be planned once the secrets are gone,
-contract 2.3, without the patch), destroy what is left by address:
+contract 2.3, a commit before 08def61), destroy what is left by address:
 
 ```bash
+# Not needed from upstream 08def61 (contract 2.3); removed after the next sandbox run
+# proves a single apply and a clean destroy.
 terraform state list | while read -r a; do
   terraform destroy -auto-approve -target="$a"
 done
@@ -163,8 +167,6 @@ Observed behaviour behind these steps: [`docs/dms-observations.md`](../../docs/d
   `drop-control-tables`), plus `lambda/sandbox_sql.py` (pg8000, in the VPC) for the
   reset; the Fargate `sql-runner` image only with `sql_runner = true` (built by CodeBuild
   here, by the platform's image pipeline there).
-* `sbx test-connections` raises `MaxFileSize` 0 -> 32768 on the target when the dms module left
-  it at 0 (contract 2.6); the orchestrator's pre-check then tests connections.
 * The DMS source user is a real non-master user (`dms_source`), so a revoked grant
   (scenario S3) fails inside DMS; jobs use the master user of each database.
 * `create_account_service_roles = true` (the account has no `dms-vpc-role`); on the target

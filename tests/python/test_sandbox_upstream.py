@@ -167,6 +167,41 @@ def test_upstream_checkout_and_local_env_are_ignored_and_the_example_is_a_placeh
     assert "UPSTREAM_MODULES_REF=<commit-sha>" in example
 
 
+MIN_UPSTREAM = "08def61"
+
+
+def test_the_example_states_the_minimum_upstream_commit():
+    example = (SANDBOX / "upstream.env.example").read_text(encoding="utf-8")
+    assert f"at or after {MIN_UPSTREAM}" in example
+
+
+def test_the_contract_marks_2_3_and_2_6_fixed_upstream():
+    text = (ROOT / "docs" / "upstream-modules-contract.md").read_text(encoding="utf-8")
+    for section in ("### 2.3", "### 2.6"):
+        body = re.split(r"\n#{2,3} ", text[text.index(section) :])[0]
+        flat = re.sub(r"\s+", " ", body)
+        assert f"Fixed upstream from {MIN_UPSTREAM}" in flat, section
+        assert "the orchestrator no longer works around it" in flat, section
+    assert "sbx test-connections` sets 32768" not in text
+
+
+def test_troubleshooting_names_no_sandbox_workaround():
+    text = (ROOT / "docs" / "troubleshooting.md").read_text(encoding="utf-8")
+    assert "fix_target_max_file_size" not in text
+    assert MIN_UPSTREAM in text
+
+
+def test_the_targeted_apply_and_destroy_are_marked_for_removal():
+    readme = (SANDBOX / "README.md").read_text(encoding="utf-8")
+    assert "MaxFileSize" not in readme
+    lines = readme.splitlines()
+    targeted = [i for i, ln in enumerate(lines) if re.search(r"terraform (apply|destroy).*-target", ln)]
+    assert len(targeted) == 2, targeted
+    for i in targeted:
+        near = " ".join(lines[max(0, i - 6) : i + 1])
+        assert "removed after the next sandbox run" in near, lines[i]
+
+
 def test_upstream_patches_stay_local():
     # Patches carry fragments of third-party module code: they are never shipped.
     ignored = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
