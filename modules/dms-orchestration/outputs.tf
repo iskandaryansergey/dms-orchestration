@@ -85,13 +85,46 @@ output "kms_key_policy_requirements" {
   ]) : "[]"
 }
 
+output "bucket_requirements" {
+  description = "JSON list of the controls the artifacts bucket must have when artifacts_bucket_name is set (the module does not manage a brought bucket): versioning, SSE-KMS default encryption, TLS only, DenyDumpsWithoutKms, lifecycle of runs/, jobs/ and dumps/. modules/artifacts-bucket creates a bucket that has them."
+  value = jsonencode([
+    {
+      Control = "Versioning"
+      Status  = "Enabled"
+      Why     = "post loads context.json by the version id migrate recorded; job sets are published create-only"
+    },
+    {
+      Control          = "DefaultEncryption"
+      SSEAlgorithm     = "aws:kms"
+      KMSMasterKeyID   = var.kms_key_arn # null: the AWS managed key aws/s3
+      BucketKeyEnabled = true
+    },
+    {
+      Control   = "DenyInsecureTransport"
+      Statement = local.bucket_policy_statements.DenyInsecureTransport
+    },
+    {
+      Control   = "DenyDumpsWithoutKms"
+      Statement = local.bucket_policy_statements.DenyDumpsWithoutKms
+    },
+    {
+      Control = "Lifecycle"
+      Rules   = local.bucket_lifecycle_rules
+    },
+  ])
+}
+
 output "network_contract" {
   description = "What the network must provide. The module creates no VPC endpoints (owned by the landing zone)."
   value = {
-    subnets                  = var.subnet_ids
-    jobs_security_group_id   = var.create_security_group ? aws_security_group.jobs[0].id : null
-    egress                   = "443 to the VPC CIDR (interface endpoints) and the S3/DynamoDB prefix lists, or https_egress_*; database_ports to the databases"
-    required_vpc_endpoints   = ["states", "dms", "secretsmanager", "kms", "logs", "ecr.api", "ecr.dkr", "s3 (gateway)", "dynamodb (gateway)", "ssm", "sns", "sqs", "sts"]
+    subnets                = var.subnet_ids
+    jobs_security_group_id = var.create_security_group ? aws_security_group.jobs[0].id : null
+    egress                 = "443 to the VPC CIDR (interface endpoints) and the S3/DynamoDB prefix lists, or https_egress_*; database_ports to the databases"
+    # rds: dump.method = snapshot calls the RDS API from the jobs (defaults.snapshot_dumps).
+    required_vpc_endpoints = concat(
+      ["states", "dms", "secretsmanager", "kms", "logs", "ecr.api", "ecr.dkr", "s3 (gateway)", "dynamodb (gateway)", "ssm", "sns", "sqs", "sts"],
+      anytrue([for t in values(local.tasks) : t.defaults.snapshot_dumps]) ? ["rds"] : [],
+    )
     optional_vpc_endpoints   = ["rds-data (Data API jobs)", "monitoring", "xray (enable_xray)"]
     not_needed_vpc_endpoints = ["lambda", "events", "ecs", "ecs-agent", "ecs-telemetry"]
   }

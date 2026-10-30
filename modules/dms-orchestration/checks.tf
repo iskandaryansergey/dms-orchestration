@@ -50,7 +50,7 @@ check "own_sns_topic_outside_sandbox" {
 check "state_in_the_dms_workspace" {
   assert {
     condition     = var.environment == "sandbox" || (var.table_name != "" && var.artifacts_bucket_name != "") || contains(var.acknowledged_checks, "state_in_the_dms_workspace")
-    error_message = "table_name / artifacts_bucket_name are empty outside the sandbox: destroying the DMS workspace would take locks, runs, baselines and dumps with it. Bring them from a long-lived workspace or acknowledge 'state_in_the_dms_workspace'."
+    error_message = "table_name / artifacts_bucket_name are empty outside the sandbox: destroying the DMS workspace would take locks, runs, baselines and dumps with it. Bring them from a long-lived workspace (the bucket with the controls of the bucket_requirements output, e.g. modules/artifacts-bucket) or acknowledge 'state_in_the_dms_workspace'."
   }
 }
 
