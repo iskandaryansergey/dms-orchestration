@@ -4,8 +4,8 @@
 # Tools: psql (PostgreSQL 17 client), mysql client, Python 3.13 + boto3, bash; PowerShell 7
 # with --build-arg INSTALL_POWERSHELL=true.
 #
-# Build from the repository root (the image needs src/shared/expr.py):
-#   docker build -f src/jobs/sql-runner/Dockerfile -t sql-runner:<git-sha> .
+# Build from the repository root (the image needs modules/dms-orchestration/src/shared/expr.py):
+#   docker build -f modules/dms-orchestration/src/jobs/sql-runner/Dockerfile -t sql-runner:<git-sha> .
 # Every source is a build arg, so a platform without internet access builds from its mirrors:
 #   --build-arg BASE_IMAGE=<registry mirror>/python:<tag>@sha256:<digest>
 #   --build-arg PGDG_APT_URL=... PGDG_KEY_URL=... PIP_INDEX_URL=... RDS_CA_URL=... POWERSHELL_DEB_URL=...
@@ -22,7 +22,7 @@ ARG PG_MAJOR=17
 ARG PGDG_APT_URL=https://apt.postgresql.org/pub/repos/apt
 ARG PGDG_KEY_URL=https://www.postgresql.org/media/keys/ACCC4CF8.asc
 ARG PGDG_KEY_FINGERPRINT=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
-# The bundle the Lambda SQL runtime pins too (src/shared/sqlclient.py CA_BUNDLE_SHA256).
+# The bundle the Lambda SQL runtime pins too (modules/dms-orchestration/src/shared/sqlclient.py CA_BUNDLE_SHA256).
 ARG RDS_CA_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 ARG RDS_CA_SHA256=90a6f1a7978a1b1b096dca6c57511ca48d3b8cf052f8e704baf358f34ea2f21b
 ARG PIP_INDEX_URL=https://pypi.org/simple
@@ -59,16 +59,16 @@ RUN apt-get update \
  && apt-get purge -y --auto-remove gnupg lsb-release \
  && rm -rf /var/lib/apt/lists/*
 
-COPY src/jobs/sql-runner/requirements.txt /opt/orch/requirements.txt
+COPY modules/dms-orchestration/src/jobs/sql-runner/requirements.txt /opt/orch/requirements.txt
 # Wheels by hash only. pip is not needed at runtime: remove it with its vendored certifi,
 # msgpack, urllib3 and setuptools (pkg_resources), which trivy reads from pip's SBOM.
 RUN pip install --no-cache-dir --require-hashes --only-binary=:all: --index-url "${PIP_INDEX_URL}" -r /opt/orch/requirements.txt \
  && pip uninstall -y pip
 
-COPY src/shared/__init__.py src/shared/expr.py src/shared/preflight.py src/shared/fingerprint.py src/shared/bundle.py src/shared/errors.py /opt/orch/shared/
-COPY src/jobs/sql-runner/orch_job.py src/jobs/sql-runner/orch_sql.py src/jobs/sql-runner/orch_dump.py \
-     src/jobs/sql-runner/orch_verify.py /opt/orch/
-COPY src/jobs/sql-runner/bin/ /usr/local/bin/
+COPY modules/dms-orchestration/src/shared/__init__.py modules/dms-orchestration/src/shared/expr.py modules/dms-orchestration/src/shared/preflight.py modules/dms-orchestration/src/shared/fingerprint.py modules/dms-orchestration/src/shared/bundle.py modules/dms-orchestration/src/shared/errors.py /opt/orch/shared/
+COPY modules/dms-orchestration/src/jobs/sql-runner/orch_job.py modules/dms-orchestration/src/jobs/sql-runner/orch_sql.py modules/dms-orchestration/src/jobs/sql-runner/orch_dump.py \
+     modules/dms-orchestration/src/jobs/sql-runner/orch_verify.py /opt/orch/
+COPY modules/dms-orchestration/src/jobs/sql-runner/bin/ /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/psql-run /usr/local/bin/mysql-run /usr/local/bin/orch-job \
       /usr/local/bin/pg-dump-s3 /usr/local/bin/pg-restore-s3 /usr/local/bin/verify-target \
  && useradd --uid 10001 --create-home --shell /usr/sbin/nologin orch

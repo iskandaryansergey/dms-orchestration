@@ -110,7 +110,7 @@ def task() -> dict[str, Any]:
 
 def load_type() -> str:
     """start-replication for a task that never ran (the orchestrator rejects anything else
-    then, src/shared/dms_outcome.py), reload-target afterwards."""
+    then, modules/dms-orchestration/src/shared/dms_outcome.py), reload-target afterwards."""
     stats = task().get("ReplicationTaskStats") or {}
     return "reload-target" if stats.get("StartDate") or stats.get("FreshStartDate") else "start-replication"
 

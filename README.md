@@ -102,7 +102,7 @@ python scripts/orch.py report <runId>
 python scripts/orch.py gate <runId>                                                   # exit 0: may be promoted
 ```
 
-Run request fields: [`run_request.schema.json`](src/shared/schemas/run_request.schema.json).
+Run request fields: [`run_request.schema.json`](modules/dms-orchestration/src/shared/schemas/run_request.schema.json).
 Job sets (pre, reset, post and on-failure jobs, versioned in S3): [docs/job-contract.md](docs/job-contract.md),
 examples [minimal](examples/jobs/minimal) and [postgres-basic](examples/jobs/postgres-basic).
 
@@ -110,9 +110,10 @@ examples [minimal](examples/jobs/minimal) and [postgres-basic](examples/jobs/pos
 
 ```
 modules/dms-orchestration/   Terraform module (+ asl/ state machines, tests/ terraform test)
-src/shared/                  decision logic, pre-flight, handoff (migrate -> post), DynamoDB store, schemas
-src/lambdas/                 one directory per Lambda handler
-src/jobs/sql-runner/         SSM runtime zip and optional Fargate image: orch_job.py, psql-run, dumps, verify-target
+  src/shared/                decision logic, pre-flight, handoff (migrate -> post), DynamoDB store, schemas
+  src/lambdas/               one directory per Lambda handler (packaged by the module)
+  src/jobs/sql-runner/       SSM runtime zip and optional Fargate image: orch_job.py, psql-run, dumps, verify-target
+modules/artifacts-bucket/    optional long-lived artifacts bucket with the controls of bucket_requirements
 examples/jobs/               example job sets
 examples/sandbox/            throw-away stack and the e2e scenarios
 scripts/                     orch.py (CLI), sync-jobs.sh, jobset_tool.py, verify_destroyed.py, check_denylist.py

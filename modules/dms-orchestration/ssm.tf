@@ -21,13 +21,13 @@ locals {
   # Runtime zip: src/jobs/sql-runner without the Dockerfile, plus the shared modules the image
   # copies (tests/python/test_sql_runner.py keeps both lists equal). Code for the AMI's python3.
   ssm_runtime_shared = ["__init__.py", "expr.py", "preflight.py", "fingerprint.py", "bundle.py", "errors.py"]
-  ssm_runtime_dir    = "${path.module}/../../src/jobs/sql-runner"
+  ssm_runtime_dir    = "${path.module}/src/jobs/sql-runner"
   ssm_runtime_files = merge(
     {
       for f in fileset(local.ssm_runtime_dir, "**") : f => "${local.ssm_runtime_dir}/${f}"
       if f != "Dockerfile" && !strcontains(f, "__pycache__") && !endswith(f, ".pyc")
     },
-    { for f in local.ssm_runtime_shared : "shared/${f}" => "${path.module}/../../src/shared/${f}" },
+    { for f in local.ssm_runtime_shared : "shared/${f}" => "${path.module}/src/shared/${f}" },
   )
   ssm_runtime_sha256 = local.ssm_enabled ? data.archive_file.ssm_runtime[0].output_sha256 : ""
   ssm_runtime_key    = "runtime/${local.ssm_runtime_sha256}/sql-runner.zip"

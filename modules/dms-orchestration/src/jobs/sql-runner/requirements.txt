@@ -1,7 +1,7 @@
 boto3==1.43.119 \
     --hash=sha256:d1718edae48c3241d289c0ece8a515399a7242c406e35328b9685c4d24039186 \
     --hash=sha256:e12c3b1d81713e14bd6947b7412d9d0ea49b320642d795ded1d64d6483ca6f49
-    # via -r src/jobs/sql-runner/requirements.in
+    # via -r modules/dms-orchestration/src/jobs/sql-runner/requirements.in
 botocore==1.43.122 \
     --hash=sha256:2fc53b68b35314b1738cad46e6170d0556496863913451428fc3afccb8c7fa95 \
     --hash=sha256:668e608edf8847fc4c3c6b38688e183c3bcf19b8a1f7f58d33c03a6f3039bd49
@@ -30,5 +30,5 @@ urllib3==2.8.0 \
     --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3 \
     --hash=sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63
     # via
-    #   -r src/jobs/sql-runner/requirements.in
+    #   -r modules/dms-orchestration/src/jobs/sql-runner/requirements.in
     #   botocore

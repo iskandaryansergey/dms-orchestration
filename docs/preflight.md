@@ -1,7 +1,7 @@
 # Pre-flight
 
 Before `migrate` starts DMS it checks the target and gives a verdict. Why and the full table:
-[ADR 0006](adr/0006-preflight-verdicts.md). Code: `src/shared/preflight.py` (pure),
+[ADR 0006](adr/0006-preflight-verdicts.md). Code: `modules/dms-orchestration/src/shared/preflight.py` (pure),
 built-in job `checks/target_verify`, `inspect_task` in `preflight` mode.
 
 ## What runs
@@ -15,7 +15,7 @@ InspectTask ─► TargetVerify (job-runner, builtin checks/target_verify) ─�
 * Runtime (`preflight.verifyRuntime`, ADR 0008): `lambda` runs `checks/target_verify` through
   the Data API (connection `target` with `data_api_cluster_arn`); `fargate` runs `verify-target`
   in the sql-runner image through psql, with the same SQL and the same fingerprint JSON and
-  summary (`src/shared/fingerprint.py`); `auto` (default) takes Fargate when the last baseline
+  summary (`modules/dms-orchestration/src/shared/fingerprint.py`); `auto` (default) takes Fargate when the last baseline
   had more than `fargateAboveTables` (500) tables or a database above `fargateAboveBytes`
   (50 GiB), or the target has no Data API, provided the image exists, else the Lambda. With
   neither the Data API nor the image no check runs and there is no fingerprint: see
@@ -92,5 +92,5 @@ whose baseline was overwritten by a later run exits 2 with the reasons.
 ## Runtimes of the check
 
 The psql variant (`verify-target` in the sql-runner image) and the Data API variant share
-`src/shared/fingerprint.py`; `preflight.verifyRuntime` picks one (see "What runs" and ADR 0008).
+`modules/dms-orchestration/src/shared/fingerprint.py`; `preflight.verifyRuntime` picks one (see "What runs" and ADR 0008).
 Table mapping and task settings are checked by `inspect_task` before the start.

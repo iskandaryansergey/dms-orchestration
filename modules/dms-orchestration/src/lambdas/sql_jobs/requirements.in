@@ -1,5 +1,5 @@
 # Lambda SQL runtime: pure-Python PostgreSQL driver, vendored into vendor/ (make vendor).
 # Compile with hashes after a change:
-#   uv pip compile src/lambdas/sql_jobs/requirements.in --generate-hashes --python-version 3.13 \
-#     --no-header --output-file src/lambdas/sql_jobs/requirements.txt
+#   uv pip compile modules/dms-orchestration/src/lambdas/sql_jobs/requirements.in --generate-hashes --python-version 3.13 \
+#     --no-header --output-file modules/dms-orchestration/src/lambdas/sql_jobs/requirements.txt
 pg8000==1.31.6

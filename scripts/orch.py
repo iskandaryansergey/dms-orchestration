@@ -99,7 +99,7 @@ def run_id_of(ref: str) -> str:
 
 
 def post_execution_name(run_id: str) -> str:
-    """Same rule as src/shared/handoff.py (the name is the idempotency key of the handoff)."""
+    """Same rule as modules/dms-orchestration/src/shared/handoff.py (the name is the idempotency key of the handoff)."""
     name = f"{run_id}-post"
     if len(name) <= 80:
         return name

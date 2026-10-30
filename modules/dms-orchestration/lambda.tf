@@ -7,7 +7,7 @@
 data "archive_file" "lambda" {
   count       = local.create && var.lambda.artifact_s3_bucket == "" ? 1 : 0
   type        = "zip"
-  source_dir  = "${path.module}/../../src"
+  source_dir  = "${path.module}/src"
   output_path = "${path.module}/.build/lambda-${local.prefix}.zip"
   excludes = [
     "jobs",

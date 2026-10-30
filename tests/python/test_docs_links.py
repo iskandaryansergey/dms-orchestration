@@ -89,8 +89,8 @@ def test_agents_md_names_only_existing_make_targets_and_paths():
     for required in ("lint", "test", "teststate-dry", "denylist", "sandbox-validate", "docs-check"):
         assert required in {t for cmd in named for t in cmd.split()}, required
     for contract in (
-        "src/shared/schemas/run_request.schema.json",
-        "src/shared/schemas/jobset.schema.json",
+        "modules/dms-orchestration/src/shared/schemas/run_request.schema.json",
+        "modules/dms-orchestration/src/shared/schemas/jobset.schema.json",
         "modules/dms-orchestration/asl/",
     ):
         assert contract in agents and (ROOT / contract).exists(), contract
@@ -272,8 +272,9 @@ def test_state_machine_doc_names_only_real_states():
     names = set(re.findall(r"\b[A-Z][a-z]+(?:[A-Z][a-z0-9]*)+\b", diagrams))
     states = _asl_states()
     assert {"ResolveContext", "TargetVerify", "ArmGuard", "StartResume", "WriteReport"} <= names & states
-    code = "".join(p.read_text(encoding="utf-8") for p in [*(ROOT / "modules/dms-orchestration/asl").glob("*.json"),
-                                                          *(ROOT / "src").rglob("*.py")])  # fmt: skip
+    module = ROOT / "modules/dms-orchestration"
+    sources = [*(module / "asl").glob("*.json"), *(module / "src").rglob("*.py")]
+    code = "".join(p.read_text(encoding="utf-8") for p in sources)
     unknown = sorted(n for n in names - states if n not in code)
     assert not unknown, f"docs/state-machine.md names states that do not exist: {unknown}"
 
@@ -287,7 +288,7 @@ def test_state_machine_and_preflight_docs_are_current(doc):
 
 def test_preflight_doc_lists_every_manual_reason_and_verdict():
     text = read("docs/preflight.md")
-    preflight = (ROOT / "src/shared/preflight.py").read_text(encoding="utf-8")
+    preflight = (ROOT / "modules/dms-orchestration/src/shared/preflight.py").read_text(encoding="utf-8")
     # manual("<Reason>", ...) calls, plus the two reasons Verdict("manual", ...) spells out.
     reasons = set(re.findall(r'manual\("([A-Za-z]+)"', preflight)) | {"PreflightTablesMissing", "ResetNotConfigured"}
     assert {"RestoredTarget", "TargetChanged", "TargetNotEmpty", "AlreadyCompleted"} <= reasons

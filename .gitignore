@@ -29,7 +29,7 @@ override.tf.json
 .env.*
 *.pem
 # The public Amazon RDS CA bundle of the Lambda SQL runtime, pinned by sha256 (make vendor-check).
-!src/lambdas/sql_jobs/rds-global-bundle.pem
+!modules/dms-orchestration/src/lambdas/sql_jobs/rds-global-bundle.pem
 .idea/
 .vscode/
 

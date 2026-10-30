@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Vendor the PostgreSQL driver of the Lambda SQL runtime and check the vendored tree.
 
-    vendor_sql_jobs.py build    # reinstall src/lambdas/sql_jobs/vendor from requirements.txt
+    vendor_sql_jobs.py build    # reinstall modules/dms-orchestration/src/lambdas/sql_jobs/vendor from requirements.txt
     vendor_sql_jobs.py check    # rebuild into a temporary directory and compare every file (CI)
 
 The Lambda zip carries everything it runs: nothing is downloaded at run time. ``build`` installs
@@ -25,11 +25,11 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "modules" / "dms-orchestration" / "src"))
 
 from shared import sqlclient  # noqa: E402
 
-SQL_JOBS = ROOT / "src" / "lambdas" / "sql_jobs"
+SQL_JOBS = ROOT / "modules" / "dms-orchestration" / "src" / "lambdas" / "sql_jobs"
 VENDOR = SQL_JOBS / "vendor"
 REQUIREMENTS = SQL_JOBS / "requirements.txt"
 PYTHON_VERSION = "3.13"

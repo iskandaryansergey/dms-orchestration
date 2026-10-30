@@ -45,7 +45,7 @@ rules × source catalogue), and the request flags `allowReset`, `targetReset.pol
 - Promotion guard: `orch.py gate <runId>` exits non-zero unless the run `SUCCEEDED` and the
   baseline it recorded is still the latest (no run touched the target since; a fresh
   fingerprint is compared by the next pre-flight); pipelines call it before staging/prod.
-- Decisions are pure functions in `src/shared/preflight.py` with a test per table row.
+- Decisions are pure functions in `modules/dms-orchestration/src/shared/preflight.py` with a test per table row.
 - `TARGET#` and `TABLE#` are keyed by the registration (`<project>/<taskKey>`), not by the
   task ARN as the plan first said: Terraform gives a recreated task a new ARN, and row 3
   exists precisely for that case.

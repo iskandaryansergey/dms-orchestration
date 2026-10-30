@@ -78,11 +78,11 @@ jobs:
 
       - name: ruff
         run: |
-          uv run --only-group dev ruff check src tests scripts examples
-          uv run --only-group dev ruff format --check src tests scripts examples
+          uv run --only-group dev ruff check modules/dms-orchestration/src tests scripts examples
+          uv run --only-group dev ruff format --check modules/dms-orchestration/src tests scripts examples
 
       - name: shellcheck
-        run: shellcheck scripts/*.sh src/jobs/sql-runner/bin/orch-job
+        run: shellcheck scripts/*.sh modules/dms-orchestration/src/jobs/sql-runner/bin/orch-job
 
       - name: terraform-docs (docs/configuration.md is up to date)
         env:
@@ -115,10 +115,10 @@ jobs:
         run: make vendor-check
       - name: pytest (unit, lambdas, state machine paths, sql-runner)
         run: |
-          uv run pytest --cov=src/shared --cov=src/lambdas --cov=src/jobs/sql-runner \
+          uv run pytest --cov=modules/dms-orchestration/src/shared --cov=modules/dms-orchestration/src/lambdas --cov=modules/dms-orchestration/src/jobs/sql-runner \
             --cov-report=term --cov-report=xml --cov-fail-under=85 --junitxml=pytest.xml
       - name: shared library coverage >= 85%
-        run: uv run coverage report --include='src/shared/*' --fail-under=85
+        run: uv run coverage report --include='modules/dms-orchestration/src/shared/*' --fail-under=85
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -226,10 +226,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: hadolint
-        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < src/jobs/sql-runner/Dockerfile
+        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < modules/dms-orchestration/src/jobs/sql-runner/Dockerfile
       - name: build
         # PowerShell is off by default; the smoke test covers the image with it.
-        run: docker build -f src/jobs/sql-runner/Dockerfile --build-arg INSTALL_POWERSHELL=true -t sql-runner:ci .
+        run: docker build -f modules/dms-orchestration/src/jobs/sql-runner/Dockerfile --build-arg INSTALL_POWERSHELL=true -t sql-runner:ci .
       - name: smoke test
         run: |
           docker run --rm --entrypoint psql sql-runner:ci --version

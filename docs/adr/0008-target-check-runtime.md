@@ -13,7 +13,7 @@ database with psql over TLS.
 
 ## Decision
 
-* The fingerprint SQL and its assembly live in `src/shared/fingerprint.py`; a transport is a
+* The fingerprint SQL and its assembly live in `modules/dms-orchestration/src/shared/fingerprint.py`; a transport is a
   function `query(sql, **params) -> rows`. The Lambda job binds parameters through the Data API;
   `verify-target` (sql-runner) runs each query as `SELECT json_agg(...)` through `psql -X -A -t`
   with the SQL on stdin and the parameters as psql variables (`:'name'`, quoted by psql).

@@ -108,9 +108,9 @@ def test_sha256_helper_matches_hashlib(tmp_path):
 
 def test_vendor_dir_is_excluded_from_lint_and_coverage():
     text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert "src/lambdas/sql_jobs/vendor" in text
+    assert "modules/dms-orchestration/src/lambdas/sql_jobs/vendor" in text
     attrs = (ROOT / ".gitattributes").read_text(encoding="utf-8")
-    assert "src/lambdas/sql_jobs/vendor/** -text" in attrs
+    assert "modules/dms-orchestration/src/lambdas/sql_jobs/vendor/** -text" in attrs
 
 
 @pytest.mark.parametrize("target", ["vendor-check", "vendor"])
@@ -562,7 +562,8 @@ def test_bad_sql_jobs_are_rejected(job, fragment):
 
 
 def test_runtime_enum_is_lambda_ssm_fargate():
-    schema = json.loads((ROOT / "src" / "shared" / "schemas" / "jobset.schema.json").read_text(encoding="utf-8"))
+    schema_file = ROOT / "modules/dms-orchestration/src/shared/schemas/jobset.schema.json"
+    schema = json.loads(schema_file.read_text(encoding="utf-8"))
     assert schema["$defs"]["runtime"]["enum"] == ["lambda", "ssm", "fargate"]
     for where in (schema["$defs"]["job"], schema["$defs"]["jobDefaults"]):
         assert where["properties"]["runtime"] == {"$ref": "#/$defs/runtime"}
