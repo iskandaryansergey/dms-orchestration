@@ -1386,7 +1386,11 @@ def s18_recheck() -> bool:
     """The DMS task is started by hand while the run waits in a pre job: RecheckTask sees it and
     the run stops with TaskStateChanged before the target is reset."""
     run = start(
-        operation="migrate", startType="reload-target", targetReset={"policy": "always"}, jobsVersion="e2e-recheck"
+        operation="migrate",
+        startType="reload-target",
+        targetReset={"policy": "always"},
+        allowReset=True,  # whatever ran before, the pre-flight lets the run reach RecheckTask
+        jobsVersion="e2e-recheck",
     )
     deadline = time.monotonic() + 600
 
@@ -1428,7 +1432,8 @@ def s18_recheck() -> bool:
 def s19_chain_dump() -> bool:
     """A chained resume that resets after an attempt that did not dump takes the dump first
     (review finding 5): attempt 1 has dump enabled but no reset, is stopped from outside
-    (EXTERNAL_STOP, allowed for auto-resume in this request), attempt 2 resets."""
+    (EXTERNAL_STOP, allowed for auto-resume in this request), attempt 2 resets. Needs a completed
+    last run: after an interrupted one attempt 1 already resets and dumps (seen live)."""
     run = start(
         operation="migrate",
         startType="reload-target",
