@@ -27,13 +27,20 @@ The architecture stays on one page ([`architecture.md`](architecture.md)); the s
 * Lambda and Fargate run in private subnets with a security group without ingress;
   databases allow it by security group reference. Its egress is 443 to the VPC CIDR (interface
   endpoints) and the S3/DynamoDB prefix lists (gateway endpoints) — never `0.0.0.0/0`
-  (`https_egress_cidr_blocks` / `https_egress_prefix_list_ids` override; a job that needs the
+  (`https_egress_vpc_cidr` / `https_egress_gateway_endpoints` switch them off,
+  `https_egress_cidr_blocks` / `https_egress_prefix_list_ids` add ranges; a job that needs the
   internet gets an extra group through `security_group_ids`) — plus `database_ports` to the databases.
 * Optional customer managed KMS key for DynamoDB, S3, SNS, SQS, logs, Lambda environment,
-  Step Functions and the scheduler; `kms_key_policy_requirements` lists what the key policy must allow.
+  Step Functions and the scheduler. The module does not manage the key policy; it publishes what
+  the policy must allow in two shapes built from one list: `kms_key_policy_requirements` (KMS key
+  policy contract v2: per item the service principals, the module and job role ARNs, the
+  symbolic roles `deployer` and `module`, actions, conditions such as `aws:SourceAccount`, and
+  the purpose) and `kms_key_policy_statements` (the same as v1 key policy statements, concrete
+  principals only). The service items are limited to this account by `aws:SourceAccount`; the
+  deployer item by `kms:CallerAccount`.
   Without a CMK the SNS topic is unencrypted on purpose: the AWS managed key `alias/aws/sns`
   cannot allow CloudWatch alarms to publish, so alarms would be lost. With a CMK the key policy
-  must allow `cloudwatch.amazonaws.com` (listed in `kms_key_policy_requirements`).
+  must allow `cloudwatch.amazonaws.com` (listed in both outputs).
 * Fargate job containers run as uid 10001 with a read-only root file system and three
   scratch volumes (`/tmp`, `/work`, `/out`). Fargate mounts those empty and root-owned, so a
   non-essential init container of the same image runs as root for about a second to
@@ -70,7 +77,7 @@ runs the `.tftest.hcl` files with a mock provider; the Python tests run with mot
 | Task tokens and secrets masked in logs | `test_shared_misc.py::test_log_masks_tokens` |
 | Registration in SSM carries secret ARNs, never values | `defaults.tftest.hcl::storage_and_registration` |
 | Jobs security group: no ingress; 443 egress only to the VPC CIDR and the gateway prefix lists | `defaults.tftest.hcl::lambda_and_events`, `validations.tftest.hcl::https_egress_to_the_internet`, `validations.tftest.hcl::https_egress_explicit_ranges` |
-| Customer managed KMS key on every store and the key policy requirements | `options.tftest.hcl::customer_managed_key` |
+| Customer managed KMS key on every store and the key policy requirements (contract v2 and v1 statements) | `options.tftest.hcl::customer_managed_key`, `conventions.tftest.hcl::kms_contract_v2_shape` |
 | Target dumps: SSE-KMS only, expire after `dump_retention_days` | `defaults.tftest.hcl::dumps_are_kms_only_and_expire` |
 | Job roles reach only `runs/<project>/*/jobs/*`; `ecs-job` and `lambda-jobs` no run artifacts | `iam.tftest.hcl::per_project_job_roles`, `test_jobs_lambdas.py::test_builtin_jobs_write_artifacts_as_the_project_job_role` |
 | post loads only the `context.json` version migrate recorded on `RUN#`, under the project on `RUN#` | `test_lambdas_core.py::test_post_loads_the_pinned_version_not_a_later_overwrite`, `test_lambdas_core.py::test_post_refuses_a_context_without_a_recorded_version`, `test_asl.py::test_migrate_without_a_context_version_stops_before_dms` |
