@@ -161,6 +161,17 @@ def test_endpoint_keys_do_not_read_the_orchestrator_module():
     assert check and "network_contract.required_vpc_endpoints" in check.group(1)
 
 
+def test_sandbox_task_does_not_fail_on_the_table_dms_cannot_validate():
+    # app.audit_notes has no primary key (tests/e2e/seed): DMS reports "No primary Key" and, with
+    # the module default fail_on_validation_errors = true, every load ends FAILED
+    # DmsValidationErrors (live sandbox run). The scenarios opt out; the default stays the module's.
+    seed = (ROOT / "tests" / "e2e" / "seed" / "010_source_schema.sql").read_text(encoding="utf-8")
+    notes = re.search(r"CREATE TABLE IF NOT EXISTS app\.audit_notes \((.*?)\);", seed, flags=re.DOTALL)
+    assert notes and "PRIMARY KEY" not in notes.group(1).upper()
+    tf = (SANDBOX / "main.tf").read_text(encoding="utf-8")
+    assert re.search(r"defaults\s*=\s*\{[^}]*fail_on_validation_errors\s*=\s*false", tf)
+
+
 def test_local_lint_does_not_reach_into_the_fetched_upstream_checkout():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(r'extend-exclude\s*=\s*\[[^\]]*"examples/sandbox/upstream"', pyproject)
