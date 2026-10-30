@@ -44,7 +44,7 @@ def test_the_committed_vendor_tree_is_pure_python_and_pinned():
         name, version = dist.name.removesuffix(".dist-info").rsplit("-", 1)
         assert f"{name.lower().replace('_', '-')}=={version}" in pinned.lower(), dist.name
     assert "--hash=sha256:" in pinned
-    assert not list(vendor.rglob("__pycache__")) and not (vendor / ".lock").exists()
+    assert not (vendor / ".lock").exists()
 
 
 def test_impure_wheels_are_reported(tmp_path):
@@ -101,6 +101,8 @@ def test_vendor_build_replaces_the_tree_without_lock_files(tmp_path):
 def test_sha256_helper_matches_hashlib(tmp_path):
     f = tmp_path / "f"
     f.write_bytes(b"abc")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "f.cpython-313.pyc").write_bytes(b"local import")
     assert vendor_sql_jobs.tree(tmp_path) == {"f": hashlib.sha256(b"abc").hexdigest()}
 
 

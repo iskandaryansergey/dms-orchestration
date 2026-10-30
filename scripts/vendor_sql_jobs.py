@@ -67,11 +67,12 @@ def install(target: Path, runner: Runner = subprocess.run) -> None:
 
 
 def tree(root: Path) -> dict[str, str]:
-    """{relative posix path: sha256} of every file under root."""
+    """{relative posix path: sha256} of every file under root; bytecode caches (written by local
+    imports, gitignored, excluded from the zip) do not count."""
     return {
         p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in sorted(root.rglob("*"))
-        if p.is_file()
+        if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"
     }
 
 
