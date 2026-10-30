@@ -332,3 +332,45 @@ def test_resume_collision_is_caught_as_already_started():
 )
 def test_resume_collision_checks_fail_on_anything_else(events):
     assert not all(sandbox.resume_collision_checks(events).values())
+
+
+def test_big_tables_are_one_statement_with_a_primary_key_and_one_row_on_the_source():
+    source = sandbox.big_tables_sql(600, rows=True)
+    target = sandbox.big_tables_sql(600, rows=False)
+    drop = sandbox.big_tables_sql(600, drop=True)
+    for sql in (source, target, drop):
+        assert sql.startswith("DO $$") and sql.rstrip().endswith("$$") and "1..600" in sql
+    assert "PRIMARY KEY" in source and "INSERT INTO" in source and "ON CONFLICT DO NOTHING" in source
+    assert "PRIMARY KEY" in target and "INSERT INTO" not in target
+    assert "DROP TABLE IF EXISTS" in drop and "CREATE" not in drop
+    assert sandbox.big_table_name(7) == "app.e2e_big_0007"
+    with pytest.raises(ValueError):
+        sandbox.big_tables_sql(10000, rows=True)
+
+
+def test_seed_tables_option_adds_only_the_big_tables(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sandbox, "outputs", lambda: {"region": "us-east-1"})
+    monkeypatch.setattr(sandbox, "data_api", lambda out, db, sql, secret=None: calls.append((db, sql)) or [])
+    monkeypatch.setattr(sandbox, "cmd_counts", lambda out: {})
+    assert sandbox.main(["seed", "--tables", "600"]) == 0
+    assert [db for db, _ in calls] == ["source", "target"]
+    assert all("e2e_big_" in sql for _, sql in calls)
+
+
+def test_sync_jobs_uploads_the_sql_and_recheck_job_sets():
+    helper = (SANDBOX / "scripts" / "sandbox.py").read_text(encoding="utf-8")
+    assert 'cmd_sync_jobs(out, "jobset-sql.yaml.tmpl", "e2e-sql")' in helper
+    assert 'cmd_sync_jobs(out, "jobset-recheck.yaml.tmpl", "e2e-recheck")' in helper
+    sql = (SANDBOX / "jobs" / "jobset-sql.yaml.tmpl").read_text(encoding="utf-8")
+    assert 'when: "run.dryRun"' in sql and "truncateScope: true" in sql
+
+
+PLANNED = ["dry-ro", "s4big", "s17-lock-lost", "s18-recheck", "s19-chain-dump", "s20-tampered-jobset", "s21-validation"]
+
+
+@pytest.mark.parametrize("name", PLANNED)
+def test_e2e_has_the_planned_scenarios_by_name_only(name):
+    text = E2E.read_text(encoding="utf-8")
+    assert f"e2e.py {name} " in text and f'scenarios["{name}"] = ' in text
+    assert f'"{name}": ' not in text.split("names = argv or list(scenarios)")[0].split("def main")[-1]

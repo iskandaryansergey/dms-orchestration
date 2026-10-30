@@ -1,0 +1,28 @@
+# Sandbox job set for e2e s18-recheck: a pre job holds the run for 90 s, the window in which
+# the scenario starts the DMS task by hand. scripts/sandbox.py sync-jobs uploads it as
+# version "e2e-recheck".
+schemaVersion: 1
+description: Sandbox e2e s18 - a pre job that waits, then the usual truncate on reset
+
+defaults:
+  runtime: lambda
+  timeoutSeconds: 600
+  retry: { maxAttempts: 1, backoffSeconds: 30 }
+  idempotent: true
+  onError: fail
+
+phases:
+  pre:
+    - name: hold
+      sql: { connection: target, inline: "SELECT pg_sleep(90) IS NULL AS waited" }
+
+  reset:
+    - name: truncate-tables
+      function: __SQL_LAMBDA_ARN__
+      with: { action: truncate }
+      retry: { maxAttempts: 2, backoffSeconds: 30 }
+
+  post:
+    - name: row-counts-data-api
+      handler: builtin:checks/row_counts
+      with: { source: source, target: target, tables: [app.customers, app.accounts, app.transactions, app.audit_notes] }

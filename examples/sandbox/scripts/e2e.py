@@ -25,6 +25,13 @@
     e2e.py guard   # an armed MIGRATION# of another run refuses before the reset: target untouched
     e2e.py postdie # a post that dies in LoadRun releases its run's lock in seconds (release_lock)
     e2e.py s16  # SQS fan-out: FAILED and MANUAL reach the filtered queue, SUCCEEDED does not (sqs_fanout)
+    e2e.py dry-ro # dry run on the Lambda SQL runtime: a read works, a write fails ReadOnlySqlTransaction
+    e2e.py s4big # 600 more tables: reset list in S3 above 500, truncateScope truncates all, full count in the report
+    e2e.py s17-lock-lost # post finds its lock taken: LockLost, MANUAL, no post jobs, the other lock untouched
+    e2e.py s18-recheck # the task started by hand during a pre job: TaskStateChanged, the target not reset
+    e2e.py s19-chain-dump # a chained resume that resets after an attempt without a dump dumps first (SSM)
+    e2e.py s20-tampered-jobset # a published job set file changed: JobSetTampered, no job runs
+    e2e.py s21-validation # a row differs after the load: DmsValidationErrors; flag off COMPLETED_WITH_VALIDATION_ERRORS
 
 A run is migrate, then post started by the DMS event (ADR 0005); wait() follows the chain.
 Needs the terraform outputs of examples/sandbox (sandbox.outputs()), AWS_PROFILE, pg8000.
@@ -368,33 +375,7 @@ def s7() -> bool:
 
 def s2() -> bool:
     run = start(operation="migrate", startType=load_type(), targetReset={"policy": "always"})
-    # Interrupt the load from outside. On Aurora the 235k rows load in ~12 s, faster than
-    # DMS starts accepting StopReplicationTask (seen live: the stop landed after the load
-    # finished). So once DMS starts, hold a SHARE lock on the biggest target table (its
-    # inserts wait), stop the task, and keep the lock until DMS gives the task up: that
-    # table is then certainly not loaded. StopReplicationTask itself is the probe of
-    # "really running" (Describe lags, docs/dms-observations.md).
-    while task()["Status"] not in ("starting", "running"):
-        time.sleep(2)
-    hold = sandbox.connect(OUT, "target")
-    try:
-        hold.run("BEGIN")
-        hold.run("LOCK TABLE app.transactions IN SHARE MODE")
-        print("locked app.transactions on the target at", datetime.now(UTC).isoformat())
-        while True:
-            try:
-                DMS.stop_replication_task(ReplicationTaskArn=OUT["task_arn"])
-                break
-            except DMS.exceptions.InvalidResourceStateFault:
-                time.sleep(2)
-        print("stopped the DMS task from outside at", datetime.now(UTC).isoformat())
-        deadline = time.monotonic() + 900
-        while task()["Status"] not in ("stopped", "failed") and time.monotonic() < deadline:
-            time.sleep(10)
-    finally:
-        hold.run("ROLLBACK")
-        hold.close()
-    print("released the lock at", datetime.now(UTC).isoformat())
+    interrupt_load()
     first = wait(run)
     t1 = task()
     tables_mid = DMS.describe_table_statistics(ReplicationTaskArn=OUT["task_arn"])["TableStatistics"]
@@ -425,6 +406,36 @@ def s2() -> bool:
         resumeDecision=[i.get("detail") for i in inspect],
         counts=c,
     )
+
+
+def interrupt_load() -> None:
+    """Interrupt the load from outside. On Aurora the 235k rows load in ~12 s, faster than
+    DMS starts accepting StopReplicationTask (seen live: the stop landed after the load
+    finished). So once DMS starts, hold a SHARE lock on the biggest target table (its
+    inserts wait), stop the task, and keep the lock until DMS gives the task up: that
+    table is then certainly not loaded. StopReplicationTask itself is the probe of
+    "really running" (Describe lags, docs/dms-observations.md)."""
+    while task()["Status"] not in ("starting", "running"):
+        time.sleep(2)
+    hold = sandbox.connect(OUT, "target")
+    try:
+        hold.run("BEGIN")
+        hold.run("LOCK TABLE app.transactions IN SHARE MODE")
+        print("locked app.transactions on the target at", datetime.now(UTC).isoformat())
+        while True:
+            try:
+                DMS.stop_replication_task(ReplicationTaskArn=OUT["task_arn"])
+                break
+            except DMS.exceptions.InvalidResourceStateFault:
+                time.sleep(2)
+        print("stopped the DMS task from outside at", datetime.now(UTC).isoformat())
+        deadline = time.monotonic() + 900
+        while task()["Status"] not in ("stopped", "failed") and time.monotonic() < deadline:
+            time.sleep(10)
+    finally:
+        hold.run("ROLLBACK")
+        hold.close()
+    print("released the lock at", datetime.now(UTC).isoformat())
 
 
 def s3() -> bool:
@@ -1222,6 +1233,308 @@ def s16() -> bool:
     return verdict("S16", checks, runs=runs, statuses=statuses, received=got, staleDrained=len(stale))
 
 
+# --- 0.2.0 scenarios (docs/testing.md) ------------------------------------------------
+
+
+def events_with(run_id: str, text: str) -> list[str]:
+    return [json.dumps(i, default=str) for i in timeline(run_id) if text in json.dumps(i, default=str)]
+
+
+def restore_baseline(why: str) -> dict[str, Any]:
+    """A plain reload with allowReset after a scenario that leaves the target off its baseline."""
+    run = start(operation="migrate", startType="reload-target", targetReset={"policy": "always"}, allowReset=True)
+    d = wait(run, timeout=1800)
+    c = counts()
+    print(f"baseline restored after {why}: {d['status']}, counts match {all(s == t for s, t in c.values())}")
+    return {"status": d["status"], "countsMatch": all(s == t for s, t in c.values())}
+
+
+def dry_ro() -> bool:
+    """A dry run's sql: jobs open read-only sessions: the read works, the write is refused."""
+    before = task()
+    run = start(
+        operation="migrate", startType=load_type(), targetReset={"policy": "always"}, dryRun=True, jobsVersion="e2e-sql"
+    )
+    d = wait(run)
+    after = task()
+    j = jobs(run["runId"])
+    read, write = j.get("read-probe") or {}, j.get("write-probe") or {}
+    probe = sandbox.data_api(OUT, "target", "SELECT to_regclass('app.e2e_dry_run_probe')::text AS t")
+    return verdict(
+        "DRY-RO",
+        {
+            "run succeeded": d["status"] == "SUCCEEDED",
+            "sql read ok": read.get("status") == "ok" and read.get("runtime") == "lambda",
+            "sql write refused with ReadOnlySqlTransaction": write.get("status") != "ok"
+            and "ReadOnlySqlTransaction" in str(write.get("message")),
+            "no table created": not (probe and probe[0].get("t")),
+            "DMS task not started": after.get("ReplicationTaskStartDate") == before.get("ReplicationTaskStartDate"),
+            "lock released": lock() is None,
+        },
+        jobs={k: {"status": v.get("status"), "message": str(v.get("message"))[:300]} for k, v in j.items()},
+    )
+
+
+def s4big(n: int = 600) -> bool:
+    """A reset above the 500-table payload cap: the list goes to inspect/reset-tables.json, the
+    Lambda SQL runtime truncates all of them (truncateScope), the report gives the full count."""
+    sandbox.cmd_seed_big(OUT, n)
+    try:
+        run = start(
+            operation="migrate",
+            startType="reload-target",
+            targetReset={"policy": "always"},
+            allowReset=True,
+            jobsVersion="e2e-sql",
+        )
+        d = wait(run, timeout=3600)
+        key = f"runs/ledger/{run['runId']}/inspect/reset-tables.json"
+        try:
+            listed = json.loads(
+                boto3.client("s3", region_name=OUT["region"])
+                .get_object(Bucket=OUT["artifacts_bucket"], Key=key)["Body"]
+                .read()
+            )
+        except Exception as err:  # noqa: BLE001
+            listed = {"error": str(err)}
+        tables = listed.get("tables", listed) if isinstance(listed, dict) else listed
+        rep = report(run["runId"])
+        loaded = sandbox.data_api(
+            OUT,
+            "target",
+            "SELECT count(*)::int AS n FROM information_schema.tables t WHERE t.table_schema = 'app' "
+            "AND t.table_name LIKE 'e2e\\_big\\_%' AND (xpath('/row/c/text()', query_to_xml("
+            "format('SELECT count(*) AS c FROM app.%I', t.table_name), false, true, '')))[1]::text::int = 1",
+        )
+        j = jobs(run["runId"])
+        ok = verdict(
+            "S4BIG",
+            {
+                "run succeeded": d["status"] == "SUCCEEDED",
+                f"reset list of {n + 4} tables in S3": isinstance(tables, list) and len(tables) == n + 4,
+                "truncate-tables (truncateScope) ok": (j.get("truncate-tables") or {}).get("status") == "ok",
+                "report gives the full count": f'"resetTablesCount": {n + 4}' in json.dumps(rep),
+                f"{n} big tables loaded": bool(loaded) and loaded[0].get("n") == n,
+                "lock released": lock() is None,
+            },
+            resetList={"key": key, "count": len(tables) if isinstance(tables, list) else tables},
+            truncate=j.get("truncate-tables"),
+            loaded=loaded,
+            seconds=(d["stopDate"] - d["startDate"]).total_seconds(),
+        )
+    finally:
+        sandbox.data_api(OUT, "source", sandbox.big_tables_sql(n, drop=True))
+        sandbox.data_api(OUT, "target", sandbox.big_tables_sql(n, drop=True))
+        print(f"dropped the {n} big tables on both sides")
+    return restore_baseline("s4big")["countsMatch"] and ok
+
+
+OTHER_OWNER = "e2e-other-owner"
+
+
+def s17_lock_lost() -> bool:
+    """Post finds its lock taken by another run: LockLost, MANUAL, no post jobs, the other
+    run's lock untouched (review finding 8)."""
+    run = start(operation="migrate", startType=load_type(), targetReset={"policy": "always"})
+    taken = False
+    deadline = time.monotonic() + 900
+    while time.monotonic() < deadline and not taken:
+        if task()["Status"] in ("starting", "running"):
+            TABLE.update_item(
+                Key={"pk": f"LOCK#{OUT['task_arn']}", "sk": "LOCK"},
+                UpdateExpression="SET runId = :o",
+                ConditionExpression="attribute_exists(pk)",
+                ExpressionAttributeValues={":o": OTHER_OWNER},
+            )
+            taken = True
+        else:
+            time.sleep(2)
+    d = wait(run, timeout=1800)
+    post = _describe(_execution(OUT["post_state_machine_arn"], f"{run['runId']}-post")) or {}
+    left = lock() or {}
+    j = jobs(run["runId"])
+    rep = report(run["runId"])
+    try:
+        return verdict(
+            "S17-LOCK-LOST",
+            {
+                "lock taken over while DMS loaded": taken,
+                "post failed": post.get("status") == "FAILED",
+                "LockLost": "LockLost" in json.dumps(rep) or "LockLost" in str(post.get("error")),
+                "report MANUAL": rep.get("status") == "MANUAL",
+                "no post jobs": not any(k in j for k in ("row-counts", "row-counts-data-api", "drop-control-tables")),
+                "the other run's lock untouched": left.get("runId") == OTHER_OWNER,
+            },
+            post={"status": post.get("status"), "error": post.get("error")},
+            report={k: rep.get(k) for k in ("status", "error", "cause", "outcome")},
+            runStatus=d["status"],
+        )
+    finally:
+        if left.get("runId") == OTHER_OWNER:
+            TABLE.delete_item(Key={"pk": f"LOCK#{OUT['task_arn']}", "sk": "LOCK"})
+            print("deleted the planted lock of the other owner")
+
+
+def s18_recheck() -> bool:
+    """The DMS task is started by hand while the run waits in a pre job: RecheckTask sees it and
+    the run stops with TaskStateChanged before the target is reset."""
+    run = start(
+        operation="migrate", startType="reload-target", targetReset={"policy": "always"}, jobsVersion="e2e-recheck"
+    )
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline and not events_with(run["runId"], '"hold"'):
+        time.sleep(3)
+    started_by_hand = False
+    while not started_by_hand and time.monotonic() < deadline:
+        try:
+            DMS.start_replication_task(ReplicationTaskArn=OUT["task_arn"], StartReplicationTaskType="reload-target")
+            started_by_hand = True
+            print("started the DMS task by hand at", datetime.now(UTC).isoformat())
+        except DMS.exceptions.InvalidResourceStateFault:
+            time.sleep(3)
+    d = wait(run, timeout=1200)
+    j = jobs(run["runId"])
+    text = json.dumps({"cause": cause(d), "report": report(run["runId"])}, default=str)
+    while task()["Status"] not in ("stopped", "failed", "ready"):
+        with contextlib.suppress(DMS.exceptions.InvalidResourceStateFault):
+            DMS.stop_replication_task(ReplicationTaskArn=OUT["task_arn"])
+        time.sleep(10)
+    ok = verdict(
+        "S18-RECHECK",
+        {
+            "task started by hand during the pre job": started_by_hand,
+            "run failed": d["status"] == "FAILED",
+            "TaskStateChanged": "TaskStateChanged" in text,
+            "target not reset": "truncate-tables" not in j,
+            "lock released": lock() is None,
+        },
+        jobs=sorted(j),
+        cause=cause(d),
+    )
+    return restore_baseline("s18-recheck")["countsMatch"] and ok
+
+
+def s19_chain_dump() -> bool:
+    """A chained resume that resets after an attempt that did not dump takes the dump first
+    (review finding 5): attempt 1 has dump enabled but no reset, is stopped from outside
+    (EXTERNAL_STOP, allowed for auto-resume in this request), attempt 2 resets."""
+    run = start(
+        operation="migrate",
+        startType="reload-target",
+        targetReset={"policy": "if-interrupted"},
+        jobsVersion="e2e-ssm",
+        dump={"enabled": True},
+        autoResume={"maxAttempts": 1, "categories": ["EXTERNAL_STOP"]},
+    )
+    interrupt_load()
+    d = wait(run, timeout=3600)
+    first, last = run["runId"], d["runId"]
+    j1, j2 = jobs(first), jobs(last)
+    c = counts()
+    return verdict(
+        "S19-CHAIN-DUMP",
+        {
+            "chained to a second attempt": last != first,
+            "attempt 1 did not dump or reset": "dump-target" not in j1 and "truncate-tables" not in j1,
+            "attempt 2 dumped before the reset": (j2.get("dump-target") or {}).get("status") == "ok"
+            and (j2.get("truncate-tables") or {}).get("status") == "ok",
+            "chain succeeded": d["status"] == "SUCCEEDED",
+            "counts match": all(s == t for s, t in c.values()),
+            "lock released": lock() is None,
+        },
+        attempts=[first, last],
+        jobs={"attempt1": sorted(j1), "attempt2": sorted(j2)},
+        cause=cause(d) if d["status"] != "SUCCEEDED" else None,
+        counts=c,
+    )
+
+
+def s20_tampered_jobset() -> bool:
+    """One file of a published job set changed after sync: JobSetTampered before any job runs."""
+    key = "jobs/ledger/e2e-dms-only/jobset.json"
+    s3 = boto3.client("s3", region_name=OUT["region"])
+    original = s3.get_object(Bucket=OUT["artifacts_bucket"], Key=key)["Body"].read()
+    s3.put_object(Bucket=OUT["artifacts_bucket"], Key=key, Body=original + b"\n")
+    before = task()
+    try:
+        run = start(
+            operation="migrate",
+            startType=load_type(),
+            targetReset={"policy": "always"},
+            dryRun=True,
+            jobsVersion="e2e-dms-only",
+        )
+        d = wait(run)
+    finally:
+        s3.put_object(Bucket=OUT["artifacts_bucket"], Key=key, Body=original)
+    text = json.dumps({"error": d.get("error"), "cause": cause(d), "output": d.get("output")}, default=str)
+    return verdict(
+        "S20-TAMPERED-JOBSET",
+        {
+            "run did not succeed": d["status"] != "SUCCEEDED",
+            "JobSetTampered": "JobSetTampered" in text,
+            "no job ran": not jobs(run["runId"]),
+            "DMS task not started": task().get("ReplicationTaskStartDate") == before.get("ReplicationTaskStartDate"),
+            "lock released": lock() is None,
+        },
+        status=d["status"],
+        error=d.get("error"),
+        cause=str(cause(d))[:500],
+    )
+
+
+MISMATCH_TRIGGER = [
+    "CREATE OR REPLACE FUNCTION app.e2e_mismatch() RETURNS trigger LANGUAGE plpgsql AS "
+    "$$ BEGIN IF NEW.account_id = 1 THEN NEW.balance := NEW.balance + 1; END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER e2e_mismatch BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.e2e_mismatch()",
+    "ALTER TABLE app.accounts ENABLE ALWAYS TRIGGER e2e_mismatch",
+]
+
+
+def s21_validation() -> bool:
+    """A row that differs after the load fails DMS validation: with failOnValidationErrors the
+    run is FAILED DmsValidationErrors; with the flag off COMPLETED_WITH_VALIDATION_ERRORS."""
+    for sql in MISMATCH_TRIGGER:
+        sandbox.data_api(OUT, "target", sql)
+    try:
+        on = start(
+            operation="migrate",
+            startType="reload-target",
+            targetReset={"policy": "always"},
+            allowReset=True,
+            failOnValidationErrors=True,
+        )
+        d_on = wait(on, timeout=1800)
+        off = start(
+            operation="migrate",
+            startType="reload-target",
+            targetReset={"policy": "always"},
+            allowReset=True,
+            failOnValidationErrors=False,
+        )
+        d_off = wait(off, timeout=1800)
+    finally:
+        sandbox.data_api(OUT, "target", "DROP TRIGGER IF EXISTS e2e_mismatch ON app.accounts")
+        sandbox.data_api(OUT, "target", "DROP FUNCTION IF EXISTS app.e2e_mismatch()")
+    on_events = events_with(on["runId"], "DmsValidationErrors")
+    off_events = events_with(off["runId"], "COMPLETED_WITH_VALIDATION_ERRORS")
+    ok = verdict(
+        "S21-VALIDATION",
+        {
+            "flag on: run failed": d_on["status"] == "FAILED",
+            "flag on: DmsValidationErrors names app.accounts": any(
+                "app.accounts" in e and "failed validation" in e for e in on_events
+            ),
+            "flag off: run succeeded": d_off["status"] == "SUCCEEDED",
+            "flag off: COMPLETED_WITH_VALIDATION_ERRORS": bool(off_events),
+            "lock released": lock() is None,
+        },
+        flagOn=[e[:500] for e in on_events],
+        flagOff=[e[:500] for e in off_events],
+    )
+    return restore_baseline("s21-validation")["countsMatch"] and ok
+
+
 def main(argv: list[str]) -> int:
     scenarios = {
         "s1": s1,
@@ -1250,6 +1563,13 @@ def main(argv: list[str]) -> int:
     scenarios["postdie"] = postdie  # only by name: plants task locks
     scenarios["idem-sfn"] = idem_sfn  # only by name: plants a lock and a decoy execution
     scenarios["s16"] = s16  # only by name: needs sqs_fanout = true (examples/sandbox/fanout.tf)
+    scenarios["dry-ro"] = dry_ro  # only by name: job set e2e-sql (sync-jobs)
+    scenarios["s4big"] = s4big  # only by name: seeds and drops 600 tables, reloads the target
+    scenarios["s17-lock-lost"] = s17_lock_lost  # only by name: plants another owner on the lock
+    scenarios["s18-recheck"] = s18_recheck  # only by name: starts the DMS task by hand, job set e2e-recheck
+    scenarios["s19-chain-dump"] = s19_chain_dump  # only by name: dump on SSM (ssm_runner), stops DMS
+    scenarios["s20-tampered-jobset"] = s20_tampered_jobset  # only by name: edits a published job set
+    scenarios["s21-validation"] = s21_validation  # only by name: a trigger on the target, two loads
     ok = True
     for name in names:
         ok = scenarios[name]() and ok

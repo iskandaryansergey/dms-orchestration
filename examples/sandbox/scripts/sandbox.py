@@ -2,8 +2,9 @@
 """Sandbox helper: seed data, upload the job set, look at DMS and run timelines.
 
     sandbox.py seed                       # schema + data on the source, dms_source password
+    sandbox.py seed --tables 600          # only app.e2e_big_0001…0600 (e2e s4big), one row each
     sandbox.py test-connections           # TestConnection of every endpoint
-    sandbox.py sync-jobs                  # jobs/jobset*.yaml.tmpl as jobs/ledger/e2e/, e2e-dms-only/
+    sandbox.py sync-jobs                  # jobs/jobset*.yaml.tmpl as jobs/ledger/e2e/ and the others
     sandbox.py build-image <git-sha>      # sandbox only (sql_runner=true): CodeBuild image -> ECR
     sandbox.py sync-jobs-fargate          # jobs/jobset-fargate.yaml.tmpl as jobs/ledger/e2e-fargate/
     sandbox.py sync-jobs-ssm              # jobs/jobset-ssm.yaml.tmpl as jobs/ledger/e2e-ssm/ (ssm_runner)
@@ -133,6 +134,34 @@ def cmd_seed(out: dict[str, Any]) -> None:
         data_api(out, "target", sql)
     print("target schema and dms_control created")
     cmd_counts(out)
+
+
+BIG_TABLES_MAX = 2000
+
+
+def big_table_name(i: int) -> str:
+    return f"app.e2e_big_{i:04d}"
+
+
+def big_tables_sql(n: int, rows: bool = False, drop: bool = False) -> str:
+    """One DO block for ``n`` small tables ``app.e2e_big_0001…`` (e2e s4big: a reset above the
+    500-table payload cap). ``rows``: one row each (the source); ``drop``: drop them again."""
+    if not 0 < n <= BIG_TABLES_MAX:
+        raise ValueError(f"--tables must be 1..{BIG_TABLES_MAX}, got {n}")
+    name = "format('app.e2e_big_%s', lpad(i::text, 4, '0'))"
+    if drop:
+        body = f"EXECUTE 'DROP TABLE IF EXISTS ' || {name};"
+    else:
+        body = f"EXECUTE 'CREATE TABLE IF NOT EXISTS ' || {name} || ' (id int PRIMARY KEY, v text NOT NULL)';"
+        if rows:
+            body += f" EXECUTE 'INSERT INTO ' || {name} || ' VALUES (1, ''x'') ON CONFLICT DO NOTHING';"  # noqa: S608 - no input
+    return f"DO $$ BEGIN FOR i IN 1..{n} LOOP {body} END LOOP; END $$"
+
+
+def cmd_seed_big(out: dict[str, Any], n: int) -> None:
+    data_api(out, "source", big_tables_sql(n, rows=True))
+    data_api(out, "target", big_tables_sql(n))
+    print(f"{n} table(s) {big_table_name(1)}…{big_table_name(n)}: one row each on the source, empty on the target")
 
 
 def cmd_counts(out: dict[str, Any]) -> dict[str, Any]:
@@ -480,7 +509,9 @@ def main(argv: list[str]) -> int:
         return cmd_fetch_upstream(argv[1:])
     out = outputs()
     cmd, args = argv[0], argv[1:]
-    if cmd == "seed":
+    if cmd == "seed" and args[:1] == ["--tables"]:
+        cmd_seed_big(out, int(args[1]))
+    elif cmd == "seed":
         cmd_seed(out)
     elif cmd == "test-connections":
         cmd_test_connections(out)
@@ -488,6 +519,8 @@ def main(argv: list[str]) -> int:
         cmd_sync_jobs(out)
         cmd_sync_jobs(out, "jobset-dms-only.yaml.tmpl", "e2e-dms-only")
         cmd_sync_jobs(out, "jobset-postfail.yaml.tmpl", "e2e-postfail")
+        cmd_sync_jobs(out, "jobset-sql.yaml.tmpl", "e2e-sql")
+        cmd_sync_jobs(out, "jobset-recheck.yaml.tmpl", "e2e-recheck")
     elif cmd == "sync-jobs-fargate":
         cmd_sync_jobs(out, "jobset-fargate.yaml.tmpl", "e2e-fargate")
     elif cmd == "sync-jobs-ssm":

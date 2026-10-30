@@ -1,0 +1,35 @@
+# Sandbox job set for the module's Lambda SQL runtime (sql: jobs, pg8000 over TLS verify-full).
+# scripts/sandbox.py sync-jobs uploads it as version "e2e-sql" (e2e dry-ro, s4big).
+schemaVersion: 1
+description: Sandbox e2e on the Lambda SQL runtime - read and write probes in a dry run, truncateScope on reset
+
+defaults:
+  runtime: lambda
+  timeoutSeconds: 600
+  retry: { maxAttempts: 1, backoffSeconds: 30 }
+  idempotent: true
+  onError: fail
+
+phases:
+  pre:
+    - name: read-probe
+      sql: { connection: target, inline: "SELECT count(*)::int AS accounts FROM app.accounts" }
+    # Only in a dry run: the session is read-only there, so this write must be refused.
+    - name: write-probe
+      sql: { connection: target, inline: "CREATE TABLE app.e2e_dry_run_probe (x int)" }
+      when: "run.dryRun"
+      onError: warn
+
+  reset:
+    - name: truncate-tables
+      sql: { connection: target, truncateScope: true }   # ctx.resetTables of the spec file, any size
+      retry: { maxAttempts: 2, backoffSeconds: 30 }
+
+  post:
+    - name: row-counts-data-api
+      handler: builtin:checks/row_counts
+      with: { source: source, target: target, tables: [app.customers, app.accounts, app.transactions, app.audit_notes] }
+    - name: drop-control-tables
+      handler: builtin:cleanup/drop_control_tables
+      with: { connection: target, schema: dms_control, keepValidationFailures: true }
+      onError: warn

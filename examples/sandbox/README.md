@@ -116,6 +116,13 @@ e2e guard                # an armed MIGRATION# refuses before the reset
 e2e postdie              # a dead post releases its lock in seconds
 e2e s16                  # fan-out: FAILED and MANUAL reach the queue, SUCCEEDED does not (sqs_fanout)
 e2e s15                  # replaces the DMS task with terraform apply -replace (needs the TF_VAR_* above)
+e2e dry-ro               # dry run on the Lambda SQL runtime: a write is refused (job set e2e-sql)
+e2e s4big                # 600 more tables: reset list in S3, truncateScope, full count; drops them after
+e2e s17-lock-lost        # post finds its lock taken: LockLost, MANUAL
+e2e s18-recheck          # the task started by hand during a pre job: TaskStateChanged (job set e2e-recheck)
+e2e s19-chain-dump       # a chained resume that resets dumps first (ssm_runner)
+e2e s20-tampered-jobset  # a published job set file changed: JobSetTampered
+e2e s21-validation       # a row differs after the load: DmsValidationErrors, then with the flag off
 e2e s1                   # last: the final code is green
 
 (cd ../.. && uv run python tests/sfn/run_teststate.py --region us-east-1)   # TestState cases against AWS

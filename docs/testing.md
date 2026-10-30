@@ -55,6 +55,13 @@ prints a JSON verdict per check; the exit code is 0 only if every check passed.
 | `guard` | an armed `MIGRATION#` of another run refuses before the reset: target untouched | plants a `MIGRATION#` item | changes to the Arm guard |
 | `postdie` | a post that dies in `LoadRun` releases its run's lock in seconds | plants task locks | changes to `release_lock` |
 | `s16` | SQS fan-out: `FAILED` and `MANUAL` reach the filtered queue, `SUCCEEDED` does not | `sqs_fanout` | changes to notifications or message attributes |
+| `dry-ro` | a dry run's `sql:` jobs open read-only sessions: a read works, a write fails with `ReadOnlySqlTransaction`, the target is unchanged | `sync-jobs` (job set `e2e-sql`) | changes to the Lambda SQL runtime or dry runs |
+| `s4big` | a reset above 500 tables (`sbx seed --tables 600`): the list goes to `inspect/reset-tables.json`, `truncateScope` truncates all of them, the report gives the full count; drops the tables and reloads after | `sync-jobs` (job set `e2e-sql`) | changes to the reset scope or the payload cap |
+| `s17-lock-lost` | post finds its lock taken: `LockLost`, `MANUAL`, no post jobs, the other run's lock untouched | plants another owner on the lock | changes to the post lock takeover |
+| `s18-recheck` | the DMS task started by hand during a pre job: `TaskStateChanged` before the target is reset; reloads after | `sync-jobs` (job set `e2e-recheck`) | changes to `RecheckTask` |
+| `s19-chain-dump` | a chained resume that resets after an attempt without a dump takes the dump first | `ssm_runner`, `sync-jobs-ssm` | changes to dumps in a resume chain |
+| `s20-tampered-jobset` | one file of a published job set changed: `JobSetTampered` before any job runs | edits and restores a published job set | changes to job set pinning |
+| `s21-validation` | a row that differs after the load (a trigger on the target): `DmsValidationErrors`; with the flag off `COMPLETED_WITH_VALIDATION_ERRORS`; reloads after | — | changes to the validation outcome |
 
 `tests/python/test_docs_matrix.py` fails when this table and `e2e.py` disagree.
 
@@ -66,13 +73,8 @@ moves to the matrix above; `test_docs_matrix.py` fails while a scenario is in bo
 
 | Scenario | Proves | Covered offline by |
 |---|---|---|
-| `dry-ro` | a dry run's jobs open read-only sessions: a write fails with `ReadOnlySqlTransaction`, the target is unchanged | `test_sql_jobs.py`, `test_sql_runner.py` |
-| `s4big` | a reset above 500 tables: the list goes to `inspect/reset-tables.json`, `--truncate-scope` truncates all of them, the report gives the full count | `test_preflight.py`, `test_lambdas_core.py`, `test_sql_runner.py` |
-| `s17-lock-lost` | post finds its lock taken: `LockLost`, `MANUAL`, no post jobs, the other run's lock untouched | TestState case `post-lock-lost-stops`, `test_asl.py` |
-| `s18-recheck` | the task changes between inspect and reset: `TaskStateChanged` before the target is touched | TestState cases `recheck-task-*`, `test_asl.py` |
-| `s19-chain-dump` | a resume that resets after a run that did not dump takes a dump first | TestState cases `dump-runs-on-chained-reset-without-dump`, `chained-reset-after-a-dump-does-not-dump-again` |
-| `s20-tampered-jobset` | one file of a published job set changed: `JobSetTampered` before any job runs | `test_lambdas_core.py`, `test_sql_runner.py`, `test_jobset_example.py` |
-| `s21-validation` | a table that fails DMS validation: `DmsValidationErrors`; with the flag off `COMPLETED_WITH_VALIDATION_ERRORS` | `test_dms_outcome.py` |
+
+None at the moment: the 0.2.0 scenarios are in the matrix above.
 
 ## Adding a scenario
 
