@@ -12,15 +12,15 @@ runs offline, without AWS credentials, and is what `make lint test` and CI run.
 | State machine paths | local ASL runner (`tests/python/asl_runner.py`) | walks the real `migrate`/`post`/`job-runner` definitions and evaluates their real JSONata, state by state | `make py-test` |
 | Terraform | `terraform test` with a mock provider (`modules/dms-orchestration/tests/*.tftest.hcl`, `modules/artifacts-bucket/tests/*.tftest.hcl`) | IAM least privilege, per-project roles, validations, advisory checks, the upstream module contract, the bucket controls | `make tf-test` |
 | State machine cases | AWS TestState (`tests/sfn/cases/`, `tests/sfn/run_teststate.py`) | every case against the real Step Functions service; `--dry` builds the requests offline | `make teststate-dry`; with credentials `uv run python tests/sfn/run_teststate.py` |
-| Image | `docker build` + trivy | the `sql-runner` image builds, starts, and has no fixable HIGH/CRITICAL CVE | `make image`, CI job `image` |
+| Image (optional Fargate runtime) | hadolint, `docker build` + trivy | the `sql-runner` image builds from pinned, checksummed sources, starts, and has no fixable HIGH/CRITICAL CVE | `make image`, CI job `image` when the repository variable `BUILD_SQL_RUNNER_IMAGE` is `true` |
 | Content | denylist gate (`scripts/check_denylist.py`) | no denied term in files, paths, commit messages or authors | `make denylist` |
 | Documentation | pytest (`test_docs_links.py`, `test_docs_matrix.py`, `test_variables_doc.py`) | links resolve, commands in the docs parse, the configuration reference and this matrix match the code | `make py-test`, `make docs-check` |
 | Live | `examples/sandbox/scripts/e2e.py` in the sandbox | the end-to-end behaviour against real DMS, Aurora and Step Functions | only with an approved sandbox run ([sandbox README](../examples/sandbox/README.md)) |
 
 `make lint test` runs ruff, `terraform fmt`, the example job set check, pytest with coverage and
-`terraform test`. CI adds gitleaks, tflint, trivy config, checkov, shellcheck, hadolint, the
-terraform-docs check, both pinned Terraform versions, the image and, when the repository
-variable is set, `make sandbox-validate`.
+`terraform test`. CI adds gitleaks, tflint, trivy config, checkov, shellcheck, the
+terraform-docs check, both pinned Terraform versions and, when the repository variables are set,
+the image (hadolint, build, trivy; `BUILD_SQL_RUNNER_IMAGE`) and `make sandbox-validate`.
 
 ## End-to-end matrix
 

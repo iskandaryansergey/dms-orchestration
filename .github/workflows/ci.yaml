@@ -84,9 +84,6 @@ jobs:
       - name: shellcheck
         run: shellcheck scripts/*.sh src/jobs/sql-runner/bin/orch-job
 
-      - name: hadolint
-        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < src/jobs/sql-runner/Dockerfile
-
       - name: terraform-docs (docs/configuration.md is up to date)
         env:
           TFDOCS_VERSION: v0.19.0
@@ -219,13 +216,20 @@ jobs:
         if: vars.AWS_TESTSTATE_ROLE_ARN != ''
         run: uv run python tests/sfn/run_teststate.py
 
+  # The image is for the optional Fargate runtime only (ADR 0011): the module never builds it
+  # and the default path does not use it. Set the repository variable BUILD_SQL_RUNNER_IMAGE
+  # to 'true' to lint, build and scan it.
   image:
     name: sql-runner image
+    if: vars.BUILD_SQL_RUNNER_IMAGE == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: hadolint
+        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < src/jobs/sql-runner/Dockerfile
       - name: build
-        run: docker build -f src/jobs/sql-runner/Dockerfile -t sql-runner:ci .
+        # PowerShell is off by default; the smoke test covers the image with it.
+        run: docker build -f src/jobs/sql-runner/Dockerfile --build-arg INSTALL_POWERSHELL=true -t sql-runner:ci .
       - name: smoke test
         run: |
           docker run --rm --entrypoint psql sql-runner:ci --version
