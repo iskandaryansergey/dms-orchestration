@@ -513,3 +513,339 @@ def test_a_connection_without_host_or_data_api_fails_the_job(pg):
     out = _builtin("builtin:checks/row_counts", conns, **{"with": {"tables": ["app.a"]}})
     assert out["status"] == "fail" and "host" in out["message"] and "Data API" in out["message"]
     assert [c.closed for c in pg.connections] == [True]  # the source session opened first is closed
+
+
+# --- job sets: sql jobs and the runtime enum ------------------------------------------------
+
+
+def _normalize(*jobs: dict[str, Any], defaults: dict[str, Any] | None = None) -> dict[str, Any]:
+    from shared import jobset
+
+    body: dict[str, Any] = {"schemaVersion": 1, "phases": {"post": list(jobs)}}
+    if defaults:
+        body["defaults"] = defaults
+    return jobset.normalize(body)
+
+
+def test_a_sql_job_runs_in_lambda_by_default_and_is_capped_at_the_lambda_timeout():
+    (job,) = _normalize(
+        {"name": "ddl", "sql": {"connection": "target", "file": "ddl/010.sql"}, "timeoutSeconds": 3600},
+        defaults={"runtime": "fargate"},
+    )["post"]
+    assert job["runtime"] == "lambda" and job["timeoutSeconds"] == 840
+
+
+@pytest.mark.parametrize(
+    "job,fragment",
+    [
+        ({"sql": {"file": "a.sql"}, "command": ["x"]}, "exactly one"),
+        ({"sql": {"file": "a.sql"}, "handler": "builtin:a/b"}, "exactly one"),
+        ({"sql": {"file": "a.sql"}, "runtime": "fargate"}, "Lambda SQL runtime"),
+        ({"sql": {"file": "a.sql"}, "runtime": "ssm"}, "Lambda SQL runtime"),
+        ({"sql": {"file": "a.sql", "inline": "SELECT 1"}}, "one of file, inline or truncateScope"),
+        ({"sql": {"connection": "target"}}, "one of file, inline or truncateScope"),
+        ({"sql": {"truncateScope": False}}, "one of file, inline or truncateScope"),
+        ({"sql": {"inline": "SELECT 1", "cascade": True}}, "cascade"),
+        ({"sql": {"file": "ddl/../../x.sql"}}, "bad path"),
+        ({"sql": {"file": "/etc/x.sql"}}, "does not match"),
+        ({"sql": {"file": "a.sql", "mode": "x"}}, "unexpected property 'mode'"),
+        ({"sql": {"file": []}}, "fewer than 1"),
+        ({"runtime": "ssm"}, "needs 'command'"),
+        ({"runtime": "kubernetes", "command": ["x"]}, "kubernetes"),
+    ],
+)
+def test_bad_sql_jobs_are_rejected(job, fragment):
+    from shared.errors import InvalidJobSet
+
+    with pytest.raises(InvalidJobSet, match=re.escape(fragment)):
+        _normalize({"name": "j", **job})
+
+
+def test_runtime_enum_is_lambda_ssm_fargate():
+    schema = json.loads((ROOT / "src" / "shared" / "schemas" / "jobset.schema.json").read_text(encoding="utf-8"))
+    assert schema["$defs"]["runtime"]["enum"] == ["lambda", "ssm", "fargate"]
+    for where in (schema["$defs"]["job"], schema["$defs"]["jobDefaults"]):
+        assert where["properties"]["runtime"] == {"$ref": "#/$defs/runtime"}
+    (job,) = _normalize({"name": "dump", "runtime": "ssm", "command": ["pg-dump-s3"]})["post"]
+    assert job["runtime"] == "ssm"
+
+
+def test_a_sql_file_list_and_truncate_scope_are_valid():
+    jobs = _normalize(
+        {"name": "ddl", "sql": {"file": ["a.sql", "b.sql"], "singleTransaction": True, "vars": {"s": "app"}}},
+        {"name": "reset", "sql": {"truncateScope": True, "cascade": True}},
+    )["post"]
+    assert [j["runtime"] for j in jobs] == ["lambda", "lambda"]
+
+
+# --- prepare_job: sql jobs go to the module's sql_jobs Lambda -------------------------------
+
+SQL_JOBS_ARN = "arn:aws:lambda:eu-west-2:111122223333:function:dms-orch-test-sql_jobs"
+LONG = [f"app.t{i:04d}" for i in range(600)]
+
+
+@pytest.fixture
+def env(table, monkeypatch):
+    import boto3
+
+    from shared import aws as shared_aws
+
+    monkeypatch.setenv("ARTIFACTS_BUCKET", BUCKET)
+    monkeypatch.setenv("BUILTIN_JOBS_ARN", "arn:aws:lambda:eu-west-2:111122223333:function:dms-orch-test-builtin_jobs")
+    monkeypatch.setenv("SQL_JOBS_ARN", SQL_JOBS_ARN)
+    monkeypatch.setenv("TASK_DEFINITIONS", "{}")
+    monkeypatch.setenv("JOB_LAMBDA_ARNS", "[]")
+    monkeypatch.setenv("JOB_ROLE_ARNS", json.dumps({"ledger": ROLE}))
+    s3 = boto3.client("s3", region_name="eu-west-2")
+    s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
+    shared_aws.set_client("s3", s3)
+    shared_aws.set_client("sts", FakeSts())
+    shared_aws.set_client("secretsmanager", FakeSecrets(BOTH_SECRETS))
+    return s3
+
+
+def _ctx(**kw: Any) -> dict[str, Any]:
+    return {
+        "project": "ledger",
+        "taskKey": "core",
+        "migrationType": "full-load",
+        "resetTables": ["app.a", "app.b"],
+        "connections": {"target": TARGET, "source": SOURCE},
+        "jobsS3Prefix": f"s3://{BUCKET}/jobs/ledger/v1/",
+        **kw,
+    }
+
+
+def _sql_job(sql: dict[str, Any], **kw: Any) -> dict[str, Any]:
+    from shared import jobset
+
+    pin = kw.pop("bundleSha256", None)
+    raw = {"name": kw.pop("name", "ddl"), "sql": sql, **kw}
+    (job,) = jobset.normalize({"schemaVersion": 1, "phases": {"post": [raw]}})["post"]
+    return {**job, "bundleSha256": pin}
+
+
+def _prepare(job: dict[str, Any], phase: str = "post", **kw: Any) -> dict[str, Any]:
+    from lambdas.prepare_job.handler import handler
+
+    event = {"job": job, "phase": phase, "runId": "run-1", "dryRun": False, "ctx": _ctx(), "failure": None, **kw}
+    return handler(event)["spec"]
+
+
+def test_prepare_routes_sql_jobs_to_the_sql_jobs_lambda_with_the_project_role(env):
+    job = _sql_job({"file": "ddl/010.sql", "vars": {"schema": "{{ ctx.taskKey }}", "n": 3}})
+    spec = _prepare(job)
+    assert spec["runtime"] == "lambda" and spec["functionArn"] == SQL_JOBS_ARN
+    assert spec["jobRoleArn"] == ROLE
+    # vars are rendered like with:, the SQL text is left to the runtime (SQL quoting)
+    assert spec["sql"] == {"file": "ddl/010.sql", "vars": {"schema": "core", "n": 3}}
+    stored = json.loads(
+        env.get_object(Bucket=BUCKET, Key="runs/ledger/run-1/jobs/post/00-ddl/spec.json")["Body"].read()
+    )
+    assert stored["sql"] == spec["sql"]
+
+
+def test_prepare_refuses_sql_jobs_without_the_sql_jobs_lambda(env, monkeypatch):
+    from shared.errors import InvalidJobSet
+
+    monkeypatch.setenv("SQL_JOBS_ARN", "")
+    with pytest.raises(InvalidJobSet, match="sql_jobs_enabled"):
+        _prepare(_sql_job({"inline": "SELECT 1"}))
+
+
+def test_prepare_refuses_runtime_ssm_until_it_is_configured(env):
+    from shared import jobset
+    from shared.errors import InvalidJobSet
+
+    (job,) = jobset.normalize(
+        {"schemaVersion": 1, "phases": {"post": [{"name": "d", "runtime": "ssm", "command": ["x"]}]}}
+    )["post"]
+    with pytest.raises(InvalidJobSet, match="runtime ssm"):
+        _prepare(job)
+
+
+def test_prepare_refuses_a_reset_list_template_in_sql_vars_when_the_list_is_in_s3(env):
+    from shared.errors import InvalidJobSet
+
+    key = "runs/ledger/run-1/inspect/reset-tables.json"
+    env.put_object(Bucket=BUCKET, Key=key, Body=json.dumps({"resetTables": LONG}))
+    ctx = _ctx(resetTables=[], resetTablesCount=600, resetTablesUri=f"s3://{BUCKET}/{key}")
+    with pytest.raises(InvalidJobSet, match="truncateScope"):
+        _prepare(_sql_job({"inline": "SELECT 1", "vars": {"t": "{{ ctx.resetTables }}"}}), ctx=ctx, phase="reset")
+
+
+# --- the sql_jobs handler --------------------------------------------------------------------
+
+
+def _bundle(s3: Any, files: dict[str, bytes]) -> str:
+    from shared import bundle
+
+    hashes = {rel: bundle.digest(data) for rel, data in files.items()}
+    for rel, data in files.items():
+        s3.put_object(Bucket=BUCKET, Key=f"jobs/ledger/v1/{rel}", Body=data)
+    s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/bundle.sha256", Body=bundle.render(hashes).encode())
+    return bundle.total(hashes)
+
+
+def _run(spec: dict[str, Any]) -> dict[str, Any]:
+    from lambdas.sql_jobs.handler import handler
+
+    return handler({"spec": spec, "attempt": 1})
+
+
+def _result_json(s3: Any, spec: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(s3.get_object(Bucket=BUCKET, Key=spec["resultKey"])["Body"].read())
+
+
+DDL = (
+    b"CREATE TABLE IF NOT EXISTS {{ ident:var.schema }}.t (id bigint);\n"
+    b"COMMENT ON TABLE {{ ident:var.schema }}.t IS {{ run.runId }};\n"
+)
+
+
+def test_a_sql_file_job_runs_the_verified_bundle_file_and_writes_result_json(pg, env):
+    total = _bundle(env, {"ddl/010.sql": DDL, "jobset.json": b"{}"})
+    pg.answers = {"COMMENT ON": [{"applied": 1}]}
+    spec = _prepare(_sql_job({"file": "ddl/010.sql", "vars": {"schema": "app"}}, bundleSha256=total))
+    out = _run(spec)
+    assert out["status"] == "ok", out
+    (conn,) = pg.connections
+    assert not conn.read_only and conn.closed and conn.kw["host"] == TARGET["host"]
+    sql = pg.calls[0]["sql"]
+    assert 'CREATE TABLE IF NOT EXISTS "app".t' in sql and "IS 'run-1'" in sql and "{{" not in sql
+    assert out["summary"]["steps"] == ["ddl/010.sql"] and out["summary"]["result"] == {"applied": 1}
+    assert _result_json(env, spec) == out
+    # statement timeout from the job timeout, less the margin
+    assert conn.kw["startup_params"]["statement_timeout"] == str((840 - 30) * 1000)
+
+
+def test_a_tampered_bundle_file_never_reaches_the_database(pg, env):
+    total = _bundle(env, {"ddl/010.sql": DDL})
+    env.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/ddl/010.sql", Body=b"DROP SCHEMA app CASCADE;")
+    spec = _prepare(_sql_job({"file": "ddl/010.sql", "vars": {"schema": "app"}}, bundleSha256=total))
+    out = _run(spec)
+    assert out["status"] == "fail" and out["message"].startswith("JobSetTampered")
+    assert pg.connections == []
+    assert _result_json(env, spec)["status"] == "fail"
+
+
+def test_a_dry_run_write_fails_with_read_only_sql_transaction(pg, env):
+    total = _bundle(env, {"ddl/010.sql": DDL})
+    spec = _prepare(_sql_job({"file": "ddl/010.sql", "vars": {"schema": "app"}}, bundleSha256=total), dryRun=True)
+    out = _run(spec)
+    assert out["status"] == "fail"
+    assert (
+        out["message"].startswith("ReadOnlySqlTransaction: cannot execute CREATE") and "ddl/010.sql" in out["message"]
+    )
+    assert pg.connections[0].read_only and pg.connections[0].closed
+
+
+def test_a_dry_run_reads_and_reports_the_first_row(pg, env):
+    pg.answers = {"count(*)": [{"missing_tables": 2}]}
+    sql = "SELECT count(*) AS missing_tables FROM pg_tables WHERE schemaname = {{ var.s }}"
+    spec = _prepare(_sql_job({"inline": sql, "connection": "source", "vars": {"s": "app"}}), dryRun=True)
+    out = _run(spec)
+    assert out["status"] == "ok" and out["summary"]["result"] == {"missing_tables": 2}
+    assert out["summary"]["dryRun"] is True and pg.connections[0].kw["host"] == SOURCE["host"]
+    assert "schemaname = 'app'" in pg.calls[0]["sql"]
+
+
+def test_a_dry_run_refuses_sql_that_turns_read_only_off(pg, env):
+    for text in ("SET default_transaction_read_only = off; DELETE FROM t", "BEGIN READ WRITE; DELETE FROM t"):
+        out = _run(_prepare(_sql_job({"inline": text}), dryRun=True))
+        assert out["status"] == "fail" and "read-only" in out["message"]
+    assert pg.connections == []
+
+
+def test_truncate_scope_reads_the_full_list_and_truncates_in_one_statement(pg, env):
+    key = "runs/ledger/run-1/inspect/reset-tables.json"
+    env.put_object(Bucket=BUCKET, Key=key, Body=json.dumps({"resetTables": LONG}))
+    ctx = _ctx(resetTables=[], resetTablesCount=600, resetTablesUri=f"s3://{BUCKET}/{key}")
+    spec = _prepare(_sql_job({"truncateScope": True, "cascade": True}, name="truncate"), phase="reset", ctx=ctx)
+    assert "app.t0599" not in json.dumps(spec)  # the payload stays small
+    out = _run(spec)
+    assert out["status"] == "ok" and out["summary"]["tables"] == 600, out
+    (call,) = pg.calls
+    assert call["sql"].startswith('TRUNCATE TABLE "app"."t0000", ') and call["sql"].endswith('"app"."t0599" CASCADE')
+    assert call["sql"].count('"app"."t') == 600
+
+
+def test_truncate_scope_in_a_dry_run_only_counts(pg, env):
+    spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset", dryRun=True)
+    out = _run(spec)
+    assert out["status"] == "ok" and out["summary"] == {"connection": "target", "dryRun": True, "wouldTruncate": 2}
+    assert pg.calls == [] and pg.connections[0].read_only  # the connection is still checked
+
+
+def test_truncate_scope_with_nothing_to_reset_opens_no_session(pg, env):
+    spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset", ctx=_ctx(resetTables=[]))
+    out = _run(spec)
+    assert out["status"] == "ok" and out["summary"]["tables"] == 0 and pg.connections == []
+
+
+def test_truncate_scope_refuses_a_list_that_does_not_match_its_count_or_names(pg, env):
+    spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset", ctx=_ctx(resetTablesCount=3))
+    assert "the decision says 3" in _run(spec)["message"]
+    spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset", ctx=_ctx(resetTables=["a;b"]))
+    assert "unsafe" in _run(spec)["message"]
+    assert pg.calls == []
+
+
+def test_single_transaction_wraps_every_file_and_rolls_back_on_error(pg, env):
+    total = _bundle(env, {"a.sql": b"CREATE TABLE a();", "b.sql": b"CREATE TABLE b();"})
+    spec = _prepare(_sql_job({"file": ["a.sql", "b.sql"], "singleTransaction": True}, bundleSha256=total))
+    assert _run(spec)["status"] == "ok"
+    assert [c["sql"] for c in pg.calls] == ["BEGIN", "CREATE TABLE a();", "CREATE TABLE b();", "COMMIT"]
+    pg.calls.clear()
+    pg.errors = {"TABLE b": {"C": "42P07", "M": 'relation "b" already exists'}}
+    out = _run(spec)
+    assert out["status"] == "fail" and 'relation "b" already exists (b.sql)' in out["message"]
+    assert [c["sql"] for c in pg.calls] == ["BEGIN", "CREATE TABLE a();", "CREATE TABLE b();", "ROLLBACK"]
+
+
+def test_without_single_transaction_each_file_is_its_own_message(pg, env):
+    total = _bundle(env, {"a.sql": b"CREATE TABLE a();", "b.sql": b"CREATE TABLE b();"})
+    spec = _prepare(_sql_job({"file": ["a.sql", "b.sql"]}, bundleSha256=total))
+    assert _run(spec)["status"] == "ok"
+    assert [c["sql"] for c in pg.calls] == ["CREATE TABLE a();", "CREATE TABLE b();"]
+
+
+def test_template_values_are_quoted_never_spliced(pg, env):
+    text = "SELECT {{ var.v }}, {{ var.n }}, {{ var.b }}, {{ var.none }}, {{ var.l }}, {{ ident:var.t }}"
+    spec = _prepare(
+        _sql_job(
+            {"inline": text, "vars": {"v": "x'; DROP TABLE t; --", "n": 2, "b": True, "l": ["a", "b"], "t": "app.t"}}
+        )
+    )
+    assert _run(spec)["status"] == "ok"
+    assert pg.calls[0]["sql"] == "SELECT 'x''; DROP TABLE t; --', 2, TRUE, NULL, 'a', 'b', \"app\".\"t\""
+    bad = _prepare(_sql_job({"inline": "SELECT {{ ident:var.t }}", "vars": {"t": "x; DROP"}}), runId="run-2")
+    assert "unsafe identifier" in _run(bad)["message"]
+
+
+def test_the_spec_in_s3_must_be_the_job_that_was_invoked(pg, env):
+    spec = _prepare(_sql_job({"inline": "SELECT 1"}))
+    out = _run({**spec, "name": "other"})
+    assert out["status"] == "fail" and "spec.json" in out["message"] and pg.connections == []
+
+
+def test_a_summary_row_is_json_safe_and_small(pg, env):
+    import datetime
+    import decimal
+
+    row = {"d": decimal.Decimal("1.5"), "t": datetime.date(2020, 1, 2), "s": "x" * 1000}
+    row |= {f"c{i}": i for i in range(80)}
+    pg.answers = {"SELECT": [row]}
+    out = _run(_prepare(_sql_job({"inline": "SELECT 1"})))
+    result = out["summary"]["result"]
+    assert result["d"] == "1.5" and result["t"] == "2020-01-02" and len(result["s"]) == 256
+    assert len(result) == 50
+    json.dumps(out)
+
+
+def test_unknown_connection_and_an_unreadable_spec_are_job_failures(pg, env):
+    out = _run(_prepare(_sql_job({"inline": "SELECT 1", "connection": "nope"})))
+    assert out["status"] == "fail" and "not registered" in out["message"]
+    gone = _prepare(_sql_job({"inline": "SELECT 1"}), runId="run-3")
+    env.delete_object(Bucket=BUCKET, Key=gone["specS3Uri"].removeprefix(f"s3://{BUCKET}/"))
+    assert _run(gone)["status"] == "fail"

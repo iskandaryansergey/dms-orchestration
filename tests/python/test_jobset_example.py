@@ -45,6 +45,8 @@ def write_bundle(tmp_path: Path, jobset_text: str) -> Path:
 
 BAD = [
     ("pre:\n    - name: a\n      command: [psql-run, --file, nope.sql]\n", "not found"),
+    ("pre:\n    - name: a\n      sql: {file: [nope.sql]}\n", "nope.sql not found"),
+    ("pre:\n    - name: a\n      sql: {inline: 'SELECT 1', truncateScope: true}\n", "exactly one of file"),
     ("pre:\n    - name: a\n      handler: builtin:x/y\n      function: arn\n", "phases"),
     ("pre:\n    - name: a\n      command: [x]\n      when: 'a >'\n", "bad 'when'"),
     ("pre:\n    - {name: a, command: [x]}\n    - {name: a, command: [y]}\n", "duplicate"),

@@ -13,7 +13,8 @@ task registration pins the total per version, and runs refuse a bundle that diff
 
 Checks beyond the JSON Schema: duplicate job names, lambda/fargate fields,
 non-idempotent retries (shared.jobset.normalize), 'when' expressions parse, and
-every ``--file``/``--template`` path in a psql-run/mysql-run command exists in the bundle.
+every ``--file``/``--template`` path in a psql-run/mysql-run command and every ``sql.file``
+exists in the bundle.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ def jobset_files(bundle: Path) -> list[Path]:
 
 
 def referenced_paths(job: dict[str, Any]) -> list[str]:
+    if job.get("sql"):
+        return jobset.sql_files(job["sql"])
     cmd = job.get("command") or []
     if not cmd or Path(cmd[0]).name not in SQL_RUNNERS:
         return []

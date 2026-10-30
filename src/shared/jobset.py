@@ -5,8 +5,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from shared import validation
-from shared.errors import InvalidJobSet
+from shared import bundle, validation
+from shared.errors import InvalidJobSet, JobSetTampered
 
 PHASES = ("pre", "reset", "post", "on_failure")
 LAMBDA_MAX_TIMEOUT = 840  # keep below the 15-minute Lambda limit
@@ -17,6 +17,30 @@ BASE_DEFAULTS: dict[str, Any] = {
     "idempotent": True,
     "onError": "fail",
 }
+
+
+def sql_files(sql: dict[str, Any]) -> list[str]:
+    files = sql.get("file") or []
+    return [files] if isinstance(files, str) else list(files)
+
+
+def sql_problems(job: dict[str, Any]) -> list[str]:
+    """A ``sql:`` job runs in the Lambda SQL runtime and names exactly one kind of SQL."""
+    sql = job["sql"]
+    problems = []
+    if job["runtime"] != "lambda":
+        problems.append("a sql job runs in the Lambda SQL runtime (runtime lambda)")
+    kinds = [k for k in ("file", "inline") if sql.get(k)] + (["truncateScope"] if sql.get("truncateScope") else [])
+    if len(kinds) != 1:
+        problems.append("a sql job needs exactly one of file, inline or truncateScope: true")
+    if sql.get("cascade") and not sql.get("truncateScope"):
+        problems.append("cascade is only valid with truncateScope")
+    for rel in sql_files(sql):
+        try:
+            bundle.check_path(rel)
+        except JobSetTampered as err:
+            problems.append(str(err))
+    return problems
 
 
 def empty_jobs() -> dict[str, list[dict[str, Any]]]:
@@ -45,17 +69,19 @@ def normalize(jobset: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 errors.append(f"{where}: duplicate job name in phase")
             seen.add(name)
             if "runtime" not in raw:
-                job["runtime"] = (
-                    "lambda" if (raw.get("handler") or raw.get("function")) else defaults.get("runtime", "fargate")
-                )
+                lambda_kind = raw.get("handler") or raw.get("function") or raw.get("sql")
+                job["runtime"] = "lambda" if lambda_kind else defaults.get("runtime", "fargate")
+            if job.get("sql") is not None:
+                errors += [f"{where}: {p}" for p in sql_problems(job)]
             if job["runtime"] == "lambda":
-                if bool(job.get("handler")) == bool(job.get("function")):
-                    errors.append(f"{where}: a lambda job needs exactly one of 'handler' or 'function'")
+                kinds = [k for k in ("handler", "function", "sql") if job.get(k)]
+                if len(kinds) != 1 or job.get("command"):
+                    errors.append(f"{where}: a lambda job needs exactly one of 'handler', 'function' or 'sql'")
                 if job["timeoutSeconds"] > LAMBDA_MAX_TIMEOUT:
                     job["timeoutSeconds"] = LAMBDA_MAX_TIMEOUT
             else:
                 if not job.get("command"):
-                    errors.append(f"{where}: a fargate job needs 'command'")
+                    errors.append(f"{where}: a {job['runtime']} job needs 'command'")
                 if job.get("handler") or job.get("function"):
                     errors.append(f"{where}: 'handler'/'function' are only valid for lambda jobs")
             if not job.get("idempotent") and job["retry"]["maxAttempts"] > 1:

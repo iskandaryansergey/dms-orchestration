@@ -3,10 +3,11 @@
 * evaluates the job's ``when`` condition against the run context, the failure
   (for on_failure jobs) and the results of earlier jobs of this run;
 * renders ``{{ }}`` templates in ``command`` and ``with``;
-* resolves where the job runs: built-in Lambda, a project Lambda from the
-  allow-list, or a Fargate task definition for the job's image;
+* resolves where the job runs: built-in Lambda, the Lambda SQL runtime (``sql:`` jobs,
+  ``SQL_JOBS_ARN``), a project Lambda from the allow-list, or a Fargate task definition
+  for the job's image;
 * adds the project's job role (``jobRoleArn``): the Fargate task role and the role
-  built-in jobs assume, the only roles that can read the project's secrets;
+  built-in and sql jobs assume, the only roles that can read the project's secrets;
 * writes the full job spec to ``s3://<bucket>/runs/<project>/<runId>/jobs/<phase>/<nn>-<name>/spec.json``
   (Fargate jobs read it via ORCH_JOB_SPEC_S3; it never contains secret values);
 * expands a reset list kept in S3 (``ctx.resetTablesUri``, above the payload cap) into
@@ -59,12 +60,21 @@ def expand_reset_tables(ctx: dict[str, Any]) -> dict[str, Any]:
 
 def resolve_target(job: dict[str, Any]) -> dict[str, Any]:
     if job["runtime"] == "lambda":
+        if job.get("sql"):
+            arn = aws.env("SQL_JOBS_ARN", "")
+            if not arn:
+                raise InvalidJobSet(
+                    f"job {job['name']}: sql jobs need the module's sql_jobs Lambda (lambda.sql_jobs_enabled)"
+                )
+            return {"functionArn": arn}
         if job.get("handler"):
             return {"functionArn": aws.env("BUILTIN_JOBS_ARN")}
         allowed = json.loads(aws.env("JOB_LAMBDA_ARNS", "[]"))
         if job.get("function") not in allowed:
             raise InvalidJobSet(f"job {job['name']}: function {job.get('function')} is not in job_lambda_arns")
         return {"functionArn": job["function"]}
+    if job["runtime"] == "ssm":
+        raise InvalidJobSet(f"job {job['name']}: runtime ssm is not configured in this module")
     task_definitions = json.loads(aws.env("TASK_DEFINITIONS", "{}"))
     image = job.get("image") or "sql-runner"
     if image not in task_definitions:
@@ -119,19 +129,27 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
         spec.update(skip=True, skipReason=f"when is false: {job.get('when')}")
         return {"spec": spec}
 
-    if ctx is not payload_ctx and "ctx.resetTables" in json.dumps([job.get("command"), job.get("with")]):
+    if ctx is not payload_ctx and "ctx.resetTables" in json.dumps(
+        [job.get("command"), job.get("with"), job.get("sql")]
+    ):
         raise InvalidJobSet(
             f"job {job['name']}: {ctx['resetTablesCount']} tables to reset, the list is in S3; "
-            "use psql-run --truncate-scope instead of {{ ctx.resetTables }}"
+            "use psql-run --truncate-scope or sql.truncateScope instead of {{ ctx.resetTables }}"
         )
     try:
         spec["with"] = expr.render(job.get("with") or {}, scope)
         spec["command"] = expr.render_command(job.get("command") or [], scope)
+        if job.get("sql"):
+            # vars like with:; the SQL text itself is rendered by the runtime, with SQL quoting.
+            sql = dict(job["sql"])
+            if "vars" in sql:
+                sql["vars"] = expr.render(sql["vars"] or {}, scope)
+            spec["sql"] = sql
     except expr.ExprError as err:
         raise InvalidJobSet(f"job {job['name']}: bad template: {err}") from err
     spec.update(resolve_target(job))
-    if job["runtime"] == "fargate" or job.get("handler"):
-        # Fargate task role / role assumed by built-in jobs: only this project's secrets.
+    if job["runtime"] == "fargate" or job.get("handler") or job.get("sql"):
+        # Fargate task role / role assumed by built-in and sql jobs: only this project's secrets.
         role = json.loads(aws.env("JOB_ROLE_ARNS", "{}")).get(ctx.get("project"))
         if not role:
             raise InvalidJobSet(f"job {job['name']}: no job role for project {ctx.get('project')!r}")
