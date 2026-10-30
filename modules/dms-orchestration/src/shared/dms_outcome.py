@@ -63,6 +63,11 @@ START_TYPES = ("start-replication", "resume-processing", "reload-target")
 VALIDATED_STATE = "Validated"
 VALIDATION_OFF_STATES = {"Not enabled", ""}
 VALIDATION_IN_PROGRESS_STATES = {"Pending records", "Pending validation", "Pending revalidation", "Preparing table"}
+# DMS cannot validate a table without a primary key or unique index and reports "No primary key"
+# (seen as "No primary Key" in the sandbox; compared case-insensitively). That is not a mismatch:
+# the run does not fail on it, the table is listed as not validated (validationSkippedTables).
+# "Table error" and the other states stay problems.
+VALIDATION_SKIPPED_STATES = {"no primary key"}
 VALIDATION_LISTED_TABLES = 10
 
 
@@ -348,7 +353,7 @@ def validation_problems(table_stats: list[dict[str, Any]] | None, *, cdc_running
             continue
         what: list[str] = []
         state = str(t.get("ValidationState") or "")
-        tolerated = cdc_running and state in VALIDATION_IN_PROGRESS_STATES
+        tolerated = (cdc_running and state in VALIDATION_IN_PROGRESS_STATES) or _skipped(t)
         if state != VALIDATED_STATE and state not in VALIDATION_OFF_STATES and not tolerated:
             what.append(f"validation state {state}")
         failed = int(t.get("ValidationFailedRecords") or 0)
@@ -360,6 +365,26 @@ def validation_problems(table_stats: list[dict[str, Any]] | None, *, cdc_running
         if what:
             out.append(f"{table_name(t)}: {', '.join(what)}")
     return sorted(out)
+
+
+def _skipped(stat: dict[str, Any]) -> bool:
+    return str(stat.get("ValidationState") or "").strip().lower() in VALIDATION_SKIPPED_STATES
+
+
+def validation_skipped(table_stats: list[dict[str, Any]] | None) -> list[str]:
+    """Tables DMS loaded but cannot validate (no primary key): reported, never a failure."""
+    return sorted(
+        table_name(t) for t in table_stats or [] if t.get("TableState") != "Table does not exist" and _skipped(t)
+    )
+
+
+def _listed(names: list[str]) -> str:
+    more = len(names) - VALIDATION_LISTED_TABLES
+    return "; ".join(names[:VALIDATION_LISTED_TABLES]) + (f"; and {more} more" if more > 0 else "")
+
+
+def skipped_text(skipped: list[str]) -> str:
+    return f"{len(skipped)} table(s) not validated by DMS (no primary key): {_listed(skipped)}"
 
 
 def _problem_text(problems: list[str]) -> str:
@@ -411,7 +436,8 @@ def evaluate_outcome(
     only when the load finished) gates the outcome on DMS validation: with
     ``failOnValidationErrors`` (absent = on) a table not validated, with failed validation
     records or full-load error rows fails ``DmsValidationErrors``; off, the run succeeds as
-    ``COMPLETED_WITH_VALIDATION_ERRORS``. ``None``: validation is not looked at.
+    ``COMPLETED_WITH_VALIDATION_ERRORS``. A table DMS cannot validate (``No primary key``) is no
+    problem either way: the cause lists it as not validated. ``None``: validation is not looked at.
     """
     if task is None:
         return Outcome("FAILURE", error="DmsTaskDeleted", cause="replication task not found")
@@ -432,6 +458,9 @@ def evaluate_outcome(
             )
         rows = table_stats() if callable(table_stats) else table_stats
         problems = validation_problems(rows, cdc_running=status == "running") if rows is not None else []
+        skipped = validation_skipped(rows)
+        if skipped:
+            cause = f"{cause}; {skipped_text(skipped)}"
         if problems and spec.get("failOnValidationErrors", True):
             return Outcome("FAILURE", error="DmsValidationErrors", cause=_problem_text(problems), task=summary)
         if errored:

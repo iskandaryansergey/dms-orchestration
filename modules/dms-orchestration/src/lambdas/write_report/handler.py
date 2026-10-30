@@ -130,6 +130,12 @@ def build_report(event: dict[str, Any], store: Store, dms: Any) -> dict[str, Any
         except Exception as err:  # noqa: BLE001 - a report must still be written
             notes.append(f"table statistics unavailable: {err}")
     tables = [table_row(t) for t in raw]
+    # Tables DMS cannot validate (no primary key) do not fail the run; list them so nobody
+    # mistakes them for validated.
+    skipped = dms_outcome.validation_skipped(raw)
+    warnings = list(inspect.get("warnings") or [])
+    if skipped:
+        warnings.append(dms_outcome.skipped_text(skipped))
 
     events = [
         {"at": e["sk"].split("#")[1], "source": e.get("source"), "phase": e.get("phase"), "detail": e.get("detail")}
@@ -163,7 +169,9 @@ def build_report(event: dict[str, Any], store: Store, dms: Any) -> dict[str, Any
         "taskStateBefore": inspect.get("state"),
         "completionSpec": inspect.get("completionSpec"),
         "connections": inspect.get("connections"),
-        "warnings": inspect.get("warnings") or [],
+        "warnings": warnings,
+        "validationSkippedTables": skipped[: dms_outcome.VALIDATION_LISTED_TABLES],
+        "validationSkippedCount": len(skipped),
         "dms": outcome.get("dms") or inspect.get("task"),
         "dmsCompletedBy": outcome.get("completedBy"),
         "tables": tables,
@@ -349,6 +357,7 @@ def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
         "executionArn": report.get("executionArn"),
         "severity": SEVERITY.get(report["status"], "low"),
         "verdict": (report.get("preflight") or {}).get("verdict"),
+        "validationSkippedCount": report.get("validationSkippedCount") or None,
     }
     log.info(LOGGER, "report written", runId=report["runId"], status=report["status"], uri=uri)
     return {

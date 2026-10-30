@@ -508,3 +508,38 @@ def test_resumed_run_keeps_the_request_flag():
 
     post = (Path(__file__).resolve().parents[2] / "modules/dms-orchestration/asl/post.asl.json").read_text("utf-8")
     assert "'failOnTableErrors', 'failOnValidationErrors'," in post
+
+
+# --- tables DMS cannot validate (no primary key) are reported, not failed ----------------
+
+
+@pytest.mark.parametrize("state", ["No primary key", "No primary Key"])
+def test_a_table_without_primary_key_does_not_fail_the_run(state):
+    stats = [vstat("a"), vstat("notes", state=state)]
+    res = d.evaluate_outcome(FINISHED, FULL_LOAD, started_at=STARTED, now=AFTER, table_stats=stats)
+    assert (res.kind, res.outcome) == ("SUCCESS", "COMPLETED")
+    assert "app.notes" in res.cause and "no primary key" in res.cause.lower()
+
+
+def test_validation_skipped_lists_pk_less_tables_only():
+    stats = [vstat("a"), vstat("n1", state="No primary key"), vstat("e", state="Table error")]
+    assert d.validation_skipped(stats) == ["app.n1"]
+    assert d.validation_problems(stats) == ["app.e: validation state Table error"]
+
+
+def test_a_pk_less_table_with_failed_records_or_error_rows_still_fails():
+    stats = [vstat("notes", state="No primary key", error_rows=2)]
+    res = d.evaluate_outcome(FINISHED, FULL_LOAD, started_at=STARTED, now=AFTER, table_stats=stats)
+    assert (res.kind, res.error) == ("FAILURE", "DmsValidationErrors")
+
+
+def test_table_error_validation_state_still_fails():
+    stats = [vstat("a", state="Table error")]
+    res = d.evaluate_outcome(FINISHED, FULL_LOAD, started_at=STARTED, now=AFTER, table_stats=stats)
+    assert (res.kind, res.error) == ("FAILURE", "DmsValidationErrors")
+
+
+def test_the_skipped_note_is_capped():
+    stats = [vstat(f"t{i:02d}", state="No primary key") for i in range(d.VALIDATION_LISTED_TABLES + 3)]
+    res = d.evaluate_outcome(FINISHED, FULL_LOAD, started_at=STARTED, now=AFTER, table_stats=stats)
+    assert res.kind == "SUCCESS" and "and 3 more" in res.cause

@@ -1771,3 +1771,38 @@ def test_post_repeat_with_an_unpinned_job_set_version_is_refused(env, table):
 def test_job_set_errors_are_configuration_failures():
     for error in ("JobSetNotPinned", "JobSetTampered"):
         assert _classify({"Error": error, "Cause": "x"})["category"] == "CONFIG"
+
+
+def test_write_report_lists_tables_dms_cannot_validate_as_a_warning(env, store):
+    from lambdas.write_report.handler import handler
+
+    store.put_run("run-pk", {"project": "ledger"})
+    tables = [
+        {"SchemaName": "app", "TableName": "a", "TableState": "Table completed", "ValidationState": "Validated"},
+    ] + [
+        {
+            "SchemaName": "app",
+            "TableName": f"n{i:02d}",
+            "TableState": "Table completed",
+            "ValidationState": "No primary Key",
+        }
+        for i in range(12)
+    ]
+    use(dms=FakeDms(FINISHED, tables))
+    out = handler(
+        {
+            "runId": "run-pk",
+            "status": "SUCCEEDED",
+            "request": {"project": "ledger", "taskKey": "core", "notify": {}},
+            "ctx": {"taskArn": TASK_ARN},
+            "dmsOutcome": {"outcome": "COMPLETED"},
+            "started": True,
+        }
+    )
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-pk/report.json")["Body"].read())
+    assert report["validationSkippedTables"] == [f"app.n{i:02d}" for i in range(10)]
+    assert report["validationSkippedCount"] == 12
+    assert any("12 table(s) not validated by DMS (no primary key)" in w for w in report["warnings"])
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-pk/report.md")["Body"].read().decode()
+    assert "## Warnings" in md and "app.n00" in md and "and 2 more" in md
+    assert json.loads(out["message"])["validationSkippedCount"] == 12
