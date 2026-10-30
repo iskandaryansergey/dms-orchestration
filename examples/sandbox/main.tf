@@ -101,14 +101,32 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_https" {
   cidr_ipv4         = var.vpc_cidr
 }
 
-resource "aws_vpc_endpoint" "interface" {
-  # From the module's network_contract: rds (a task with snapshot_dumps), ec2messages and
-  # ssmmessages (the SSM runtime; ssm is in interface_endpoints already), ecr.api and ecr.dkr
-  # (the optional Fargate runtime, with sql_runner_image_tag).
-  for_each = toset(concat(
+locals {
+  # What the module's network_contract asks for with these variables: rds (snapshot_dumps),
+  # ec2messages and ssmmessages (the SSM runtime; ssm is in interface_endpoints already),
+  # ecr.api and ecr.dkr (the optional Fargate runtime, with sql_runner_image_tag). Not read from
+  # the module output: module.dms depends on these endpoints and the module reads module.dms,
+  # so that would be a cycle; the check below compares the two.
+  interface_endpoints = toset(concat(
     var.interface_endpoints,
-    [for e in module.dms_orchestration.network_contract.required_vpc_endpoints : e if contains(["rds", "ec2messages", "ssmmessages", "ecr.api", "ecr.dkr"], e)],
+    var.snapshot_dumps ? ["rds"] : [],
+    var.ssm_runner ? ["ec2messages", "ssmmessages"] : [],
+    local.sql_runner_image != "" ? ["ecr.api", "ecr.dkr"] : [],
   ))
+}
+
+check "endpoints_cover_the_network_contract" {
+  assert {
+    condition = alltrue([
+      for e in module.dms_orchestration.network_contract.required_vpc_endpoints :
+      contains(local.interface_endpoints, e) if contains(["rds", "ec2messages", "ssmmessages", "ecr.api", "ecr.dkr"], e)
+    ])
+    error_message = "network_contract.required_vpc_endpoints lists an interface endpoint the sandbox does not create."
+  }
+}
+
+resource "aws_vpc_endpoint" "interface" {
+  for_each            = local.interface_endpoints
   vpc_id              = aws_vpc.this.id
   service_name        = "com.amazonaws.${var.region}.${each.key}"
   vpc_endpoint_type   = "Interface"

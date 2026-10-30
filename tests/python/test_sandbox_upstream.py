@@ -149,6 +149,18 @@ def test_sandbox_sources_the_upstream_modules_from_the_fetched_directory():
         assert "git::" not in path.read_text(encoding="utf-8"), path
 
 
+def test_endpoint_keys_do_not_read_the_orchestrator_module():
+    # module.dms depends_on the endpoints, and the orchestrator reads module.dms outputs
+    # (var.dms, and var.projects validates against it): keys taken from network_contract
+    # close a cycle that terraform validate refuses. A check block compares them instead.
+    tf = (SANDBOX / "main.tf").read_text(encoding="utf-8")
+    block = re.search(r'resource "aws_vpc_endpoint" "interface" \{(.*?)\n\}', tf, flags=re.DOTALL)
+    assert block, "aws_vpc_endpoint.interface not found"
+    assert "module.dms_orchestration" not in block.group(1)
+    check = re.search(r'check "endpoints_cover_the_network_contract" \{(.*?)\n\}', tf, flags=re.DOTALL)
+    assert check and "network_contract.required_vpc_endpoints" in check.group(1)
+
+
 def test_local_lint_does_not_reach_into_the_fetched_upstream_checkout():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(r'extend-exclude\s*=\s*\[[^\]]*"examples/sandbox/upstream"', pyproject)
