@@ -33,7 +33,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,7 @@ import orch_verify  # noqa: E402
 
 from shared import fingerprint, preflight  # noqa: E402
 
+UTC = timezone.utc  # noqa: UP017 - the SSM runtime runs the AMI's python3 (3.9 has no UTC alias in datetime)
 PART_SIZE = 8 * 1024 * 1024  # S3 multipart: every part but the last >= 5 MiB
 NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")

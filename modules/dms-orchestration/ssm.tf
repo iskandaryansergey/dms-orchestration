@@ -17,4 +17,8 @@ locals {
     [for k in sort(keys(var.ssm.target_tags)) : { Key = "tag:${k}", Values = [var.ssm.target_tags[k]] }],
     [{ Key = "PingStatus", Values = ["Online"] }],
   )
+
+  # Runtime zip: src/jobs/sql-runner without the Dockerfile, plus the shared modules the image
+  # copies (tests/python/test_sql_runner.py keeps both lists equal). Code for the AMI's python3.
+  ssm_runtime_shared = ["__init__.py", "expr.py", "preflight.py", "fingerprint.py", "bundle.py", "errors.py"]
 }
