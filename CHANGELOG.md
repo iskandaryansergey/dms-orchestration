@@ -137,6 +137,22 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
 - The sandbox `MaxFileSize` workaround (`fix_target_max_file_size` in `sbx test-connections`) and
   the targeted apply and destroy steps: upstream fixed them in `08def61`.
 
+### Fixed
+- `post` may read the pinned `context.json`: the core Lambdas get `s3:GetObjectVersion`; without
+  it every post stopped `ContextNotPinned` (e635341).
+- The SSM runtime zip carries the pinned RDS CA bundle and `orch-job` points psql and mysql at
+  it; a runner AMI has none at the image's path (4ad8649).
+- Lambda functions and state machines depend on their role policies: a first apply no longer
+  creates a VPC function or a `.sync` state before its policy (b33aa9f).
+- A timed-out `StartReplicationTask` is not retried: an explicit `States.Timeout` retrier with
+  `MaxAttempts 0` comes before the `States.TaskFailed` one (5e0fcc4).
+- `truncateScope` skips tables missing on the target and names them (`skippedMissing`): a reset
+  list from the DMS statistics of an earlier run no longer fails on tables dropped since (941d281).
+- Sandbox: the SQL Lambda reaches S3 through the gateway endpoint (25af970); interface endpoint
+  keys come from the sandbox variables, so `terraform validate` has no cycle (aa19e10); the task
+  turned `fail_on_validation_errors` off for its table without a primary key (e53fcec), no longer
+  needed; the README applies and destroys without `-target` (544d1e8).
+
 ## [0.1.0] — 2026-10-29
 
 The first release.

@@ -89,7 +89,7 @@ def test_changelog_0_2_0_has_the_sections_and_every_breaking_change():
     text = read("CHANGELOG.md")
     body = next(b for h, b in releases(text).items() if h.startswith("[0.2.0]"))
     sections = re.findall(r"^### (.+)$", body, re.MULTILINE)
-    assert sections == ["Security", "Changed", "Added", "Removed"], sections
+    assert sections == ["Security", "Changed", "Added", "Removed", "Fixed"], sections
     changed = body.split("### Changed", 1)[1].split("\n### ", 1)[0]
     assert changed.count("**Breaking:**") >= 10
     missing = [t for t in BREAKING_0_2_0 if t not in changed]
