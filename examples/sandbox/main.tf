@@ -392,6 +392,16 @@ resource "aws_vpc_security_group_egress_rule" "sql_lambda_vpc" {
   cidr_ipv4         = var.vpc_cidr
 }
 
+# truncate reads spec.json from S3: the gateway endpoint's addresses (prefix list) are outside
+# the VPC CIDR.
+resource "aws_vpc_security_group_egress_rule" "sql_lambda_s3" {
+  security_group_id = aws_security_group.sql_lambda.id
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  prefix_list_id    = aws_vpc_endpoint.gateway["s3"].prefix_list_id
+}
+
 resource "aws_iam_role" "sql_lambda" {
   name = local.sql_lambda
   assume_role_policy = jsonencode({

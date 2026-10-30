@@ -172,6 +172,16 @@ def test_sandbox_task_does_not_fail_on_the_table_dms_cannot_validate():
     assert re.search(r"defaults\s*=\s*\{[^}]*fail_on_validation_errors\s*=\s*false", tf)
 
 
+def test_sandbox_sql_lambda_reaches_s3_through_the_gateway_endpoint():
+    # truncate reads spec.json from S3; the gateway endpoint's addresses are the S3 prefix list,
+    # outside the VPC CIDR: without this egress the call hangs until the Lambda timeout (live run).
+    tf = (SANDBOX / "main.tf").read_text(encoding="utf-8")
+    rules = re.findall(r'resource "aws_vpc_security_group_egress_rule" "[^"]+" \{(.*?)\n\}', tf, flags=re.DOTALL)
+    assert any(
+        "aws_security_group.sql_lambda.id" in r and 'aws_vpc_endpoint.gateway["s3"].prefix_list_id' in r for r in rules
+    )
+
+
 def test_local_lint_does_not_reach_into_the_fetched_upstream_checkout():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(r'extend-exclude\s*=\s*\[[^\]]*"examples/sandbox/upstream"', pyproject)
