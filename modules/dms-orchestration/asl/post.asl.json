@@ -286,19 +286,34 @@
     },
     "HandOverLock": {
       "Type": "Task",
-      "Comment": "Auto-resume is a new migrate execution (ADR 0005). The lock moves to its run id first, so nothing else can take the task in between; its AcquireLock takes it over.",
-      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Comment": "Auto-resume is a new migrate execution (ADR 0005). The lock moves to its run id first, so nothing else can take the task in between; its AcquireLock takes it over. In the same transaction RUN#<runId>.resumeChildRunId names that execution: resolve_context accepts attempt / parentRunId only from it (review finding 5).",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:transactWriteItems",
       "Arguments": {
-        "TableName": "${table_name}",
-        "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
-        "UpdateExpression": "SET runId = :n, executionArn = :e, gsi2sk = :e, handedOverFrom = :o, acquiredAt = :t",
-        "ConditionExpression": "runId = :o",
-        "ExpressionAttributeValues": {
-          ":n": { "S": "{% $nextRunId %}" },
-          ":e": { "S": "{% '${migrate_executions_prefix}' & $nextRunId %}" },
-          ":o": { "S": "{% $runId %}" },
-          ":t": { "S": "{% $now() %}" }
-        }
+        "TransactItems": [
+          {
+            "Update": {
+              "TableName": "${table_name}",
+              "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
+              "UpdateExpression": "SET runId = :n, executionArn = :e, gsi2sk = :e, handedOverFrom = :o, acquiredAt = :t",
+              "ConditionExpression": "runId = :o",
+              "ExpressionAttributeValues": {
+                ":n": { "S": "{% $nextRunId %}" },
+                ":e": { "S": "{% '${migrate_executions_prefix}' & $nextRunId %}" },
+                ":o": { "S": "{% $runId %}" },
+                ":t": { "S": "{% $now() %}" }
+              }
+            }
+          },
+          {
+            "Update": {
+              "TableName": "${table_name}",
+              "Key": { "pk": { "S": "{% 'RUN#' & $runId %}" }, "sk": { "S": "META" } },
+              "UpdateExpression": "SET resumeChildRunId = :n",
+              "ConditionExpression": "attribute_exists(pk)",
+              "ExpressionAttributeValues": { ":n": { "S": "{% $nextRunId %}" } }
+            }
+          }
+        ]
       },
       "TimeoutSeconds": 10,
       "Retry": [
@@ -333,18 +348,32 @@
     },
     "GiveLockBack": {
       "Type": "Task",
-      "Comment": "The new migrate did not start: take the lock back so this run can finish and release it.",
-      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Comment": "The new migrate did not start: take the lock back so this run can finish and release it, and withdraw the hand-over from RUN# so no execution of that name can claim this run as its parent.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:transactWriteItems",
       "Arguments": {
-        "TableName": "${table_name}",
-        "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
-        "UpdateExpression": "SET runId = :o, executionArn = :e, gsi2sk = :e",
-        "ConditionExpression": "runId = :n",
-        "ExpressionAttributeValues": {
-          ":n": { "S": "{% $nextRunId %}" },
-          ":e": { "S": "{% $states.context.Execution.Id %}" },
-          ":o": { "S": "{% $runId %}" }
-        }
+        "TransactItems": [
+          {
+            "Update": {
+              "TableName": "${table_name}",
+              "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
+              "UpdateExpression": "SET runId = :o, executionArn = :e, gsi2sk = :e",
+              "ConditionExpression": "runId = :n",
+              "ExpressionAttributeValues": {
+                ":n": { "S": "{% $nextRunId %}" },
+                ":e": { "S": "{% $states.context.Execution.Id %}" },
+                ":o": { "S": "{% $runId %}" }
+              }
+            }
+          },
+          {
+            "Update": {
+              "TableName": "${table_name}",
+              "Key": { "pk": { "S": "{% 'RUN#' & $runId %}" }, "sk": { "S": "META" } },
+              "UpdateExpression": "REMOVE resumeChildRunId",
+              "ConditionExpression": "attribute_exists(pk)"
+            }
+          }
+        ]
       },
       "TimeoutSeconds": 10,
       "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2 }],

@@ -220,10 +220,23 @@ def test_post_stops_when_it_cannot_take_the_lock_over():
     assert not after & {"DeleteMigration", "PostJobs", "ClassifyFailure", "HandOverLock", "StartResume"}
 
 
+def _sdk_calls(args: Any) -> list[dict[str, Any]]:
+    """The DynamoDB calls of a state: its Arguments, or each item of a transaction."""
+    if not isinstance(args, dict):
+        return []  # one JSONata expression: nothing static to check
+    items = args.get("TransactItems")
+    return [next(iter(i.values())) for i in items] if isinstance(items, list) else [args]
+
+
 def test_post_resumes_only_through_a_lock_hand_over():
     states = render(POST)["States"]
     assert [n for n, s in states.items() if "StartResume" in _edges(s)] == ["HandOverLock"]
-    assert states["HandOverLock"]["Arguments"]["ConditionExpression"] == "runId = :o"
+    hand = states["HandOverLock"]
+    assert hand["Resource"].endswith("dynamodb:transactWriteItems")
+    lock, run = _sdk_calls(hand["Arguments"])
+    assert lock["ConditionExpression"] == "runId = :o"
+    # The parent run names its only child: resolve_context accepts attempt/parentRunId only from it.
+    assert run["UpdateExpression"] == "SET resumeChildRunId = :n"
     assert states["StartResume"]["Resource"] == "arn:aws:states:::states:startExecution"  # no .sync
     assert "GiveLockBack" in _edges(states["StartResume"])
 
@@ -285,12 +298,12 @@ def test_dynamodb_expressions_alias_reserved_words():
 
     for name in ALL:
         for state_name, state in render(name)["States"].items():
-            args = state.get("Arguments", {})
-            for key in ("UpdateExpression", "ConditionExpression"):
-                if key in args:
-                    words = set(re.findall(r"(?<![#:])\b([A-Za-z_][A-Za-z0-9_]*)\b", args[key]))
-                    words -= {"SET", "REMOVE", "AND", "OR", "NOT", "attribute_not_exists", "attribute_exists"}
-                    assert not (words & DDB_RESERVED), f"{state_name}.{key} uses reserved {words & DDB_RESERVED}"
+            for args in _sdk_calls(state.get("Arguments", {})):
+                for key in ("UpdateExpression", "ConditionExpression"):
+                    if key in args:
+                        words = set(re.findall(r"(?<![#:])\b([A-Za-z_][A-Za-z0-9_]*)\b", args[key]))
+                        words -= {"SET", "REMOVE", "AND", "OR", "NOT", "attribute_not_exists", "attribute_exists"}
+                        assert not (words & DDB_RESERVED), f"{state_name}.{key} uses reserved {words & DDB_RESERVED}"
 
 
 # --- shared fixtures for scenarios -------------------------------------------------
@@ -423,6 +436,7 @@ def migrate_mocks(req: dict[str, Any] | None = None, dec: dict[str, Any] | None 
         "RecordContextVersion": lambda _a: {},
         "ReadMigration": lambda _a: {},
         "RecheckTask": lambda _a: {"ReplicationTasks": [{"Status": "ready"}]},
+        "RecordChainDump": lambda _a: {},
         "StartPostDryRun": lambda a: {"ExecutionArn": "arn:post:" + a["Name"]},
         "Arm": lambda _a: {},
         "StartReplicationTask": lambda _a: {"ReplicationTask": {"Status": "starting"}},
@@ -782,9 +796,12 @@ def test_post_failure_auto_resumes_as_a_new_migrate_with_the_lock_handed_over():
     run = run_post(mocks)
     assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
     assert run.output["status"] == "RESUMED" and run.output["nextRunId"] == "run-1-r2"
-    hand = run.called("HandOverLock")[0]["ExpressionAttributeValues"]
+    lock, parent = _sdk_calls(run.called("HandOverLock")[0])
+    hand = lock["ExpressionAttributeValues"]
     assert hand[":o"] == {"S": "run-1"} and hand[":n"] == {"S": "run-1-r2"}
     assert hand[":e"]["S"].endswith(":execution:dms-orch-test-migrate:run-1-r2")
+    assert parent["Key"] == {"pk": {"S": "RUN#run-1"}, "sk": {"S": "META"}}
+    assert parent["ExpressionAttributeValues"] == {":n": {"S": "run-1-r2"}}
     start = run.called("StartResume")[0]
     assert start["Name"] == "run-1-r2" and start["StateMachineArn"].endswith(":stateMachine:dms-orch-test-migrate")
     chained = start["Input"]
@@ -812,6 +829,9 @@ def test_post_takes_the_lock_back_when_the_new_migrate_does_not_start():
     )
     run = run_post(mocks)
     assert run.status == "FAILED" and run.called("GiveLockBack") and run.called("ReleaseLock")
+    lock, parent = _sdk_calls(run.called("GiveLockBack")[0])
+    assert lock["ConditionExpression"] == "runId = :n"
+    assert parent["Key"]["pk"] == {"S": "RUN#run-1"} and parent["UpdateExpression"] == "REMOVE resumeChildRunId"
     assert run.called("WriteReport")[0]["Payload"]["status"] == "FAILED"
 
 
@@ -1044,10 +1064,10 @@ def _attribute_values(node: Any):
 def test_dynamodb_sdk_arguments_use_sdk_attribute_type_names(name):
     for state_name, state in render(name)["States"].items():
         if state.get("Resource", "").startswith("arn:aws:states:::aws-sdk:dynamodb:"):
-            args = state["Arguments"]
-            for key in ("Item", "Key", "ExpressionAttributeValues"):
-                types = set(_attribute_values(args.get(key, {})))
-                assert types <= SDK_ATTRIBUTE_TYPES, f"{state_name}.{key}: {types - SDK_ATTRIBUTE_TYPES}"
+            for args in _sdk_calls(state["Arguments"]):
+                for key in ("Item", "Key", "ExpressionAttributeValues"):
+                    types = set(_attribute_values(args.get(key, {})))
+                    assert types <= SDK_ATTRIBUTE_TYPES, f"{state_name}.{key}: {types - SDK_ATTRIBUTE_TYPES}"
 
 
 # --- pre-flight cycle and baseline (ADR 0006) ---------------------------------
@@ -1284,6 +1304,74 @@ def test_a_task_that_moved_since_inspect_stops_the_run_before_the_target_is_touc
 def test_a_failed_recheck_is_classified_before_the_target_is_touched():
     run = run_migrate(reset_mocks(RecheckTask=raises("DatabaseMigration.ResourceNotFoundFault", "gone")))
     assert run.status == "FAILED" and run.called("RunDumpJob") == [] and run.called("RunResetJob") == []
+
+
+def chained_reset_mocks(chain: dict[str, Any] | None, **over: Any) -> dict[str, Any]:
+    req = request(operation="resume", attempt=2, parentRunId="run-0", parentStartedAt="2026-10-28T10:00:00Z")
+    mocks = reset_mocks(**over)
+    c = ctx(dump=[DUMP_JOB])
+    if chain is not None:
+        c["chain"] = chain
+    mocks["ResolveContext"] = payload({"runId": "run-1-r2", "request": req, "ctx": c, "attempt": 2})
+    return mocks
+
+
+@pytest.mark.parametrize("chain", [{"dumped": False, "dumpUri": None}, None])
+def test_a_chained_reset_dumps_when_the_chain_has_no_dump(chain):
+    """Review finding 5: the first run did not reset (no dump), the resume did, and skipped the
+    dump because it was a resume. A context without the chain (older run) dumps too."""
+    run = run_migrate(chained_reset_mocks(chain))
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    assert [n for n in run.path if n in ("DumpJobs", "RecordChainDump", "ResetJobs")] == [
+        "DumpJobs",
+        "RecordChainDump",
+        "ResetJobs",
+    ]
+
+
+def test_a_chained_reset_after_a_dump_in_the_chain_does_not_dump_again():
+    run = run_migrate(chained_reset_mocks({"dumped": True, "dumpUri": "s3://b/dumps/x/"}))
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    assert run.called("RunDumpJob") == [] and run.called("RunResetJob")
+
+
+def dump_ok(args: Any) -> Any:
+    return {
+        "Output": {
+            "name": "dump-target",
+            "phase": args["Input"]["phase"],
+            "status": "ok",
+            "summary": {"dumpS3Uri": "s3://b/dumps/ledger/core/t-run-1/", "dryRun": args["Input"]["dryRun"]},
+        }
+    }
+
+
+def test_the_dump_is_recorded_on_the_run_for_the_next_resume():
+    mocks = reset_mocks()
+    mocks["RunDumpJob"] = dump_ok
+    run = run_migrate(mocks)
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    rec = run.called("RecordChainDump")[0]
+    assert rec["Key"] == {"pk": {"S": "RUN#run-1"}, "sk": {"S": "META"}}
+    assert rec["ExpressionAttributeValues"] == {
+        ":d": {"Bool": True},
+        ":u": {"S": "s3://b/dumps/ledger/core/t-run-1/"},
+    }
+
+
+def test_a_dry_run_dump_is_not_a_dump_of_the_chain():
+    mocks = reset_mocks()
+    mocks["RunDumpJob"] = dump_ok
+    mocks["ResolveContext"] = payload(
+        {"runId": "run-1", "request": request(dryRun=True), "ctx": ctx(dump=[DUMP_JOB]), "attempt": 1}
+    )
+    run = run_migrate(mocks)
+    assert run.called("RecordChainDump")[0]["ExpressionAttributeValues"] == {":d": {"Bool": False}, ":u": {"S": ""}}
+
+
+def test_a_failed_dump_record_does_not_stop_the_run():
+    run = run_migrate(reset_mocks(RecordChainDump=raises("DynamoDb.InternalServerErrorException")))
+    assert run.status == "SUCCEEDED" and run.called("RunResetJob")
 
 
 def test_failed_dump_stops_before_the_reset():

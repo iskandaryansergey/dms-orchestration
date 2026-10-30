@@ -13,6 +13,8 @@ A run is `migrate <runId>` → DMS → `post <runId>-post`; an auto-resume conti
 
 ```
 ResolveContext ──fail──► FailInvalidRequest                          (nothing locked)
+  │      (attempt / parentRunId / parentStartedAt only from the execution post handed over to:
+  │       RUN#<parentRunId>.resumeChildRunId = this execution name, else InvalidRunRequest)
   │
 AcquireLock ──ConditionalCheckFailed──► MarkRunEndedWithoutLock ─► FailWithoutLock (RunAlreadyActive)
   │            (a lock handed over to this run id by post is taken over)
@@ -36,7 +38,8 @@ ReadMigration (getItem MIGRATION#, consistent) ─► ArmGuard ── armed / cl
   │      ── nothing above truncates the target; a refusal above leaves it as it was ──
 CheckReset ── decision.reset ──► RecheckTask (describeReplicationTasks) ─► CheckTaskUnchanged
   │                                 ── running / gone / changed since InspectTask ──► ClassifyFailure (TaskStateChanged)
-  │                              ─► DumpJobs (Map; when dump is on) ─► RecheckTask ─► CheckTaskUnchanged
+  │                              ─► DumpJobs (Map; dump on and no dump in the chain yet: ctx.chain.dumped)
+  │                              ─► RecordChainDump (RUN# chainDumped, dumpUri) ─► RecheckTask ─► CheckTaskUnchanged
   │                              ─► ResetJobs (Map) ──error──► ClassifyFailure
   │
 PrepareStart (startedAt = now) ─► SaveContext (runs/<project>/<runId>/context.json for post)
@@ -93,9 +96,11 @@ PostJobs (Map) ──error──► ClassifyFailure
   ▼
 WriteReport ─► CheckNotify ─► Notify ─► CheckLockHeld ─► ReleaseLock ─► Done ─► Succeeded | Failed
 
-ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock (LOCK# runId = <runId>-r<n+1>)
+ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock (one transaction: LOCK# runId = <runId>-r<n+1>,
+                                                     RUN#<runId>.resumeChildRunId = <runId>-r<n+1>)
                                                   ─► StartResume (migrate, no .sync) ─► WriteReport (RESUMED)
-                                                     └─ start failed ─► GiveLockBack ─► OnFailureJobs
+                                                     └─ start failed ─► GiveLockBack (lock back, resumeChildRunId removed)
+                                                                        ─► OnFailureJobs
                                    └─► OnFailureJobs (Map, failures ignored) ─► WriteReport (FAILED)
 ```
 
@@ -117,6 +122,9 @@ ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock 
   `TakeOverLock` sets it); without the lock post runs no jobs and no resume; `StartResume` only
   after `HandOverLock`, without `.sync`;
 * the lock-contention path never reaches `ReleaseLock`;
+* a chained resume dumps before its reset unless a run of the chain already dumped
+  (`ctx.chain`, from the parent's `RUN#`); the chain fields of a request come only from the
+  execution post handed the lock to (`test_lambdas_core.py`);
 * every `lambda:invoke` has the AWS-recommended Lambda retries and a Catch;
 * DynamoDB expressions alias reserved words; SDK attribute type names (`Bool`, not `BOOL`).
 
@@ -126,7 +134,7 @@ ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock 
 |---|---|---|---|
 | both | `runId`, `req`, `ctx` | ResolveContext / LoadRun | run id (= migrate execution name), request with defaults, registration + jobs |
 | both | `inspect`, `jobCtx` | InspectTask / LoadRun | task state and completion spec, context passed to jobs |
-| both | `attempt` | ResolveContext / LoadRun | 1 + number of chained resumes (`req.attempt`) |
+| both | `attempt` | ResolveContext / LoadRun | 1 + number of chained resumes (`req.attempt`, accepted only from the execution post handed over to) |
 | both | `startedAt` | PrepareStart / LoadRun | time before the start call (the failed run's for `waitOnly`) |
 | migrate | `decision`, `waitOnly` | InspectTask, CheckDecision | start type / reset; arm without starting |
 | migrate | `migration` | ReadMigration | `{status, runId}` of an existing `MIGRATION#` item (Arm guard) or null |
