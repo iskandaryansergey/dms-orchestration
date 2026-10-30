@@ -775,6 +775,7 @@
       "TimeoutSeconds": 60,
       "Retry": [
         { "ErrorEquals": ["DatabaseMigration.InvalidResourceStateException"], "MaxAttempts": 0 },
+        { "ErrorEquals": ["States.Timeout"], "MaxAttempts": 0 },
         {
           "ErrorEquals": ["States.TaskFailed"],
           "IntervalSeconds": 5,

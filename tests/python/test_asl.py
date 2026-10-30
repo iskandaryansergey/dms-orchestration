@@ -268,6 +268,12 @@ def test_start_retries_only_task_failures_and_leaves_a_timeout_to_the_handoff():
     assert retried == {"States.TaskFailed"}
     catch = {e: c["Next"] for c in start["Catch"] for e in c["ErrorEquals"]}
     assert catch["States.Timeout"] == "RecordStartError"
+    # Seen live (TestState against AWS): the States.TaskFailed retrier retried a States.Timeout.
+    # The first matching retrier wins, so the timeout gets its own MaxAttempts 0 ahead of it.
+    names = [r["ErrorEquals"] for r in start["Retry"]]
+    first_timeout = next(i for i, n in enumerate(names) if "States.Timeout" in n)
+    assert start["Retry"][first_timeout].get("MaxAttempts") == 0
+    assert first_timeout < next(i for i, n in enumerate(names) if "States.TaskFailed" in n)
 
 
 def test_migrate_start_timeout_records_the_error_and_keeps_the_lock():
