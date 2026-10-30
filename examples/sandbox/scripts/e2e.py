@@ -1063,13 +1063,24 @@ def s13() -> bool:
 def idem() -> bool:
     """StartExecution with a fixed name (the second guard of the handoff, ADR 0005). Uses the
     post machine with a run id that has no saved context: post fails in LoadRun and touches
-    nothing. Records what AWS answers for the same name with the same and a different input."""
-    name = f"idem-{secrets.token_hex(3)}"
-    body_a = json.dumps({"runId": f"{name}-none", "taskArn": OUT["task_arn"], "outcome": {}, "startedBy": "e2e"})
-    body_b = json.dumps({"runId": f"{name}-none", "taskArn": OUT["task_arn"], "outcome": {}, "startedBy": "e2e-2"})
+    nothing. Records what AWS answers for the same name with the same and a different input.
+    Such a post can end within 200 ms, before the second call: then that attempt shows nothing
+    about a running execution and is repeated under a new name (up to five times)."""
     sm = OUT["post_state_machine_arn"]
-    first = SFN.start_execution(stateMachineArn=sm, name=name, input=body_a)
-    again = SFN.start_execution(stateMachineArn=sm, name=name, input=body_a)
+    for attempt in range(1, 6):
+        name = f"idem-{secrets.token_hex(3)}"
+        body_a = json.dumps({"runId": f"{name}-none", "taskArn": OUT["task_arn"], "outcome": {}, "startedBy": "e2e"})
+        body_b = json.dumps({"runId": f"{name}-none", "taskArn": OUT["task_arn"], "outcome": {}, "startedBy": "e2e-2"})
+        first = SFN.start_execution(stateMachineArn=sm, name=name, input=body_a)
+        try:
+            again = SFN.start_execution(stateMachineArn=sm, name=name, input=body_a)
+            break
+        except SFN.exceptions.ExecutionAlreadyExists:
+            if SFN.describe_execution(executionArn=first["executionArn"]).get("stopDate") is None:
+                raise
+            print(f"idem attempt {attempt}: {name} ended before the second call, again")
+    else:
+        return verdict("IDEM", {"first execution still running at the second call": False})
     try:
         SFN.start_execution(stateMachineArn=sm, name=name, input=body_b)
         other = "accepted"
