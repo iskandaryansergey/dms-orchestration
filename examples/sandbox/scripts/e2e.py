@@ -1302,7 +1302,7 @@ def s4big(n: int = 600) -> bool:
             )
         except Exception as err:  # noqa: BLE001
             listed = {"error": str(err)}
-        tables = listed.get("tables", listed) if isinstance(listed, dict) else listed
+        tables = listed.get("resetTables", listed) if isinstance(listed, dict) else listed  # {"resetTables", "count"}
         rep = report(run["runId"])
         loaded = sandbox.data_api(
             OUT,
