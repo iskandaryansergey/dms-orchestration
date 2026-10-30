@@ -22,7 +22,7 @@ check "fargate_image_tags" {
       for image in values(var.fargate.images) :
       length(regexall(":latest$", image)) == 0 ? length(regexall(":[^/]+$", image)) > 0 : false
     ])
-    error_message = "fargate.images must use an immutable tag (git SHA or semver), never ':latest' or no tag."
+    error_message = "fargate.images must be pinned: a digest (@sha256:..., preferred) or an immutable tag (git SHA or semver), never ':latest' or no tag."
   }
 }
 

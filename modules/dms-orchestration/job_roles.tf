@@ -55,21 +55,22 @@ locals {
   job_role_assume = {
     for p in keys(var.projects) : p => jsonencode({
       Version = "2012-10-17"
-      Statement = concat([
-        merge(jsondecode(local.ecs_assume).Statement[0], { Sid = "EcsTasksOfThisAccount" }),
-        {
+      Statement = concat(
+        # Fargate runtime only (fargate.images): the job role is the task role override.
+        local.fargate_enabled ? [merge(jsondecode(local.ecs_assume).Statement[0], { Sid = "EcsTasksOfThisAccount" })] : [],
+        [{
           Sid       = "BuiltinJobsLambda"
           Effect    = "Allow"
           Principal = { AWS = aws_iam_role.lambda_jobs.arn }
           Action    = "sts:AssumeRole"
-        },
-        ], local.ssm_enabled ? [{
-          # SSM runtime: orch-job on a runner instance assumes the job role of the run's project
-          # (docs/security.md: every project trusts the same runner role).
-          Sid       = "SsmRunnerInstances"
-          Effect    = "Allow"
-          Principal = { AWS = var.ssm.instance_role_arn }
-          Action    = "sts:AssumeRole"
+          },
+          ], local.ssm_enabled ? [{
+            # SSM runtime: orch-job on a runner instance assumes the job role of the run's project
+            # (docs/security.md: every project trusts the same runner role).
+            Sid       = "SsmRunnerInstances"
+            Effect    = "Allow"
+            Principal = { AWS = var.ssm.instance_role_arn }
+            Action    = "sts:AssumeRole"
       }] : [])
     })
   }

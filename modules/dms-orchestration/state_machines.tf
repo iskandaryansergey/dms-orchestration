@@ -15,15 +15,17 @@ locals {
     state_machine_timeout_seconds = 518400 # 6 days: longest job (24 h) x 5 attempts + margin
     prepare_job_arn               = aws_lambda_function.this["prepare_job"].arn
     table_name                    = local.table_name
-    ecs_cluster_arn               = local.cluster_arn
-    fargate_platform_version      = var.fargate.platform_version
-    subnets_json                  = jsonencode(var.subnet_ids)
-    security_groups_json          = jsonencode(local.security_group_ids)
-    assign_public_ip              = var.fargate.assign_public_ip ? "ENABLED" : "DISABLED"
-    artifacts_bucket              = local.bucket_name
-    ssm_document_name             = local.ssm_document_name
-    ssm_instance_filters_json     = jsonencode(local.ssm_instance_filters)
-    jobs_log_group_name           = aws_cloudwatch_log_group.jobs.name
+    # Without fargate.images RunFargateJob is unreachable (prepare_job refuses runtime fargate,
+    # no ecs:RunTask): the name the module would give its cluster keeps the definition valid.
+    ecs_cluster_arn           = coalesce(local.cluster_arn, "arn:${local.partition}:ecs:${local.region}:${local.account_id}:cluster/${local.prefix}")
+    fargate_platform_version  = var.fargate.platform_version
+    subnets_json              = jsonencode(var.subnet_ids)
+    security_groups_json      = jsonencode(local.security_group_ids)
+    assign_public_ip          = var.fargate.assign_public_ip ? "ENABLED" : "DISABLED"
+    artifacts_bucket          = local.bucket_name
+    ssm_document_name         = local.ssm_document_name
+    ssm_instance_filters_json = jsonencode(local.ssm_instance_filters)
+    jobs_log_group_name       = aws_cloudwatch_log_group.jobs.name
   })))
 
   # Both run machines (ADR 0005) get the same values; each uses the ones it needs.
@@ -147,8 +149,8 @@ resource "aws_ecs_task_definition" "job" {
   network_mode             = "awsvpc"
   cpu                      = var.fargate.cpu
   memory                   = var.fargate.memory
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.ecs_task.arn
+  execution_role_arn       = aws_iam_role.ecs_execution[0].arn
+  task_role_arn            = aws_iam_role.ecs_task[0].arn
 
   runtime_platform {
     operating_system_family = "LINUX"

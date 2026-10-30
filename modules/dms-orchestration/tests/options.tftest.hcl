@@ -148,6 +148,32 @@ run "customer_managed_key" {
   }
 }
 
+# Fargate is the optional third runtime (ADR 0011): images turn on the cluster, the task
+# definitions, the ECS roles and the ECR endpoints, all of which are absent by default.
+run "fargate_optional" {
+  command = apply
+
+  assert {
+    condition     = length(aws_ecs_cluster.this) == 1 && output.ecs_cluster_arn == aws_ecs_cluster.this[0].arn
+    error_message = "fargate.images without cluster_arn creates the cluster and exports its ARN"
+  }
+
+  assert {
+    condition     = keys(aws_ecs_task_definition.job) == ["sql-runner"] && length(aws_iam_role.ecs_execution) == 1 && length(aws_iam_role.ecs_task) == 1
+    error_message = "one task definition per image and the ECS execution and task roles"
+  }
+
+  assert {
+    condition     = contains(output.network_contract.required_vpc_endpoints, "ecr.api") && contains(output.network_contract.required_vpc_endpoints, "ecr.dkr")
+    error_message = "Fargate pulls the image through the ECR endpoints"
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_role.job["ledger"].assume_role_policy, "EcsTasksOfThisAccount") && jsondecode(aws_ssm_parameter.task["ledger/core"].value).runtimes.fargate == true
+    error_message = "job roles trust ECS tasks and the registration lists the Fargate runtime"
+  }
+}
+
 run "advisory_checks_warn" {
   command = apply
 
