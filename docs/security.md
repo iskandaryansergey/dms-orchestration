@@ -16,7 +16,14 @@ The architecture stays on one page ([`architecture.md`](architecture.md)); the s
   required. The job role gets `rds-db:connect` for exactly that database user through the
   upstream aurora module's policy. DMS endpoints and the Data API keep their secrets.
 * Cluster snapshots (`dump.method = snapshot`, ADR 0007): the job role creates them only on the
-  registered target clusters and with its project tag, and deletes only snapshots with that tag.
+  registered target clusters and with its project tag (`dms-orch:project`), and describes and
+  deletes only snapshots with that tag. The boundary is the tag, not the snapshot identifier:
+  tags may be added only to the project's own snapshots (the project tag cannot be changed to
+  another project) or, on create, to a snapshot without the tag named like the project's, so a
+  job cannot retag another project's snapshot and then delete it. No project name may be a
+  prefix of another. That RDS evaluates `rds:req-tag` / `aws:RequestTag` on
+  `CreateDBClusterSnapshot` as written is verified only by the sandbox e2e scenario `s10snap`;
+  the Terraform tests check the policy text.
 * Lambda and Fargate run in private subnets with a security group without ingress;
   databases allow it by security group reference. Its egress is 443 to the VPC CIDR (interface
   endpoints) and the S3/DynamoDB prefix lists (gateway endpoints) — never `0.0.0.0/0`
@@ -57,7 +64,7 @@ runs the `.tftest.hcl` files with a mock provider; the Python tests run with mot
 | `iam:PassRole` only of the module's roles, only to ECS tasks; the assessment role only to DMS | `iam.tftest.hcl::least_privilege`, `iam.tftest.hcl::assessment_role_is_passed_only_to_dms` |
 | Data API only on the registered clusters of the project | `iam.tftest.hcl::least_privilege`, `iam.tftest.hcl::per_project_job_roles` |
 | Permissions boundary on every role | `iam.tftest.hcl::least_privilege` |
-| Cluster snapshots: create only of the project's target clusters with the project tag, describe and delete only tagged ones | `iam.tftest.hcl::snapshot_dumps_are_scoped_by_the_project_tag`, `test_jobs_lambdas.py::test_snapshot_retention_deletes_only_old_snapshots_of_this_task` |
+| Cluster snapshots: create only of the project's target clusters with the project tag, tag only own or untagged ones (no retag to or from another project), describe and delete only tagged ones; no project name is a prefix of another (tag conditions on create proven by e2e `s10snap`) | `iam.tftest.hcl::snapshot_dumps_are_scoped_by_the_project_tag`, `validations.tftest.hcl::project_key_prefix_of_another_is_refused`, `test_jobs_lambdas.py::test_snapshot_retention_deletes_only_old_snapshots_of_this_task` |
 | `rds-db:connect` only through the upstream aurora module's policy for the connection's user | `iam.tftest.hcl::iam_database_auth_for_fargate_jobs`, `validations.tftest.hcl::iam_connection_without_a_policy_is_refused` |
 | The IAM token reaches only psql's environment, never a file, an argument or a log | `test_sql_runner.py::test_iam_token_reaches_psql_only_through_its_environment`, `test_sql_runner.py::test_iam_connection_file_holds_no_password_and_reads_no_secret`, `test_sql_runner.py::test_iam_connection_needs_tls` |
 | Task tokens and secrets masked in logs | `test_shared_misc.py::test_log_masks_tokens` |
