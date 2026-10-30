@@ -1136,3 +1136,49 @@ def test_wake_budget_fits_the_pre_flight_job_and_the_lambda(aws):
     (job,) = preflight_jobs("lambda", {})
     assert job["timeoutSeconds"] >= 2 * budget + 120
     assert job["timeoutSeconds"] + 30 <= 900
+
+
+# --- review finding 9: the pinned bundle hash reaches the runtimes ---------------
+
+
+def test_prepare_passes_the_pinned_bundle_hash_to_the_runtime(jobs_env):
+    from lambdas.prepare_job.handler import handler
+
+    spec = handler(event(job(bundleSha256="b" * 64)))["spec"]
+    assert spec["bundleSha256"] == "b" * 64  # routing fields keep it for the runtime too
+    key = "runs/ledger/run-1/jobs/reset/01-reset-target/spec.json"
+    stored = json.loads(jobs_env.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+    assert stored["bundleSha256"] == "b" * 64
+    assert handler(event(job(), runId="run-2"))["spec"]["bundleSha256"] is None
+
+
+def _bundle_spec(s3: Any, files: dict[str, bytes], pin: bool = True) -> dict[str, Any]:
+    from shared import bundle
+
+    s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
+    hashes = {rel: bundle.digest(data) for rel, data in files.items()}
+    for rel, data in files.items():
+        s3.put_object(Bucket=BUCKET, Key=f"jobs/ledger/v1/{rel}", Body=data)
+    s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/bundle.sha256", Body=bundle.render(hashes).encode())
+    return builtin_spec(
+        "builtin:x", jobsS3Prefix=CTX["jobsS3Prefix"], bundleSha256=bundle.total(hashes) if pin else None
+    )
+
+
+def test_builtin_jobs_read_bundle_files_only_when_they_match_the_pin(aws):
+    from lambdas.builtin_jobs import handler as builtin
+    from shared.errors import JobSetTampered
+
+    s3 = boto3.client("s3", region_name="eu-west-2")
+    shared_aws.set_client("s3", s3)
+    shared_aws.set_client("sts", FakeSts())
+    spec = _bundle_spec(s3, {"sql/check.sql": b"SELECT 1;", "jobset.json": b"{}"})
+    assert builtin.bundle_file(spec, "sql/check.sql") == b"SELECT 1;"
+    s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/sql/check.sql", Body=b"DROP TABLE t;")
+    with pytest.raises(JobSetTampered, match="hash"):
+        builtin.bundle_file(spec, "sql/check.sql")
+    s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/sql/extra.sql", Body=b"SELECT 2;")
+    with pytest.raises(JobSetTampered, match="not in"):
+        builtin.bundle_file(spec, "sql/extra.sql")
+    with pytest.raises(JobSetTampered, match="pinned"):
+        builtin.bundle_file({**spec, "bundleSha256": "c" * 64}, "jobset.json")

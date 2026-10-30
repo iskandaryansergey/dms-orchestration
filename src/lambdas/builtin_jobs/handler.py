@@ -30,7 +30,7 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
-from shared import aws, dms_outcome, log
+from shared import aws, bundle, dms_outcome, log
 
 LOGGER = log.get_logger("builtin_jobs")
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
@@ -102,6 +102,34 @@ def artifacts_s3(spec: dict[str, Any]) -> Any:
     """
     session = f"{spec.get('runId', 'run')}-{spec.get('name', 'job')}"
     return aws.job_client("s3", spec.get("jobRoleArn"), session_name=session)
+
+
+def bundle_file(spec: dict[str, Any], rel: str) -> bytes:
+    """A file of the job set bundle, read as the project job role, checked against the pin.
+
+    The only way a built-in job reads job set files: ``bundle.sha256`` must carry the total the
+    run pinned (spec ``bundleSha256``) and list the file with its hash (JobSetTampered).
+    """
+    prefix_uri = spec.get("jobsS3Prefix")
+    if not prefix_uri:
+        raise ValueError("the job has no job set bundle (jobsS3Prefix)")
+    bucket, _, prefix = str(prefix_uri).removeprefix("s3://").partition("/")
+    s3 = artifacts_s3(spec)
+    base = prefix.rstrip("/")
+
+    def get(key: str) -> bytes | None:
+        try:
+            return s3.get_object(Bucket=bucket, Key=f"{base}/{key}")["Body"].read()
+        except ClientError as err:
+            if err.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                return None
+            raise
+
+    files = bundle.check_manifest(get(bundle.MANIFEST), spec.get("bundleSha256"))
+    data = get(bundle.check_path(rel))
+    if data is None:
+        raise ValueError(f"{rel} is not in the job set bundle")
+    return data if files is None else bundle.verify(rel, data, files)
 
 
 class DataApi:
