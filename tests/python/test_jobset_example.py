@@ -237,3 +237,62 @@ def test_bundle_paths_are_relative_and_plain():
     assert bundle.parse(good)[0] == {"ddl/a.sql": "1" * 64, "jobset.json": "2" * 64}
     with pytest.raises(JobSetTampered, match="total"):
         bundle.parse(good.replace("1" * 64, "3" * 64, 1))
+
+
+FAKE_AWS = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$AWS_LOG"
+if [[ $1 == s3 && $2 == ls ]]; then exit "${AWS_LS_EXIT:-1}"; fi
+"""
+
+
+def _sync_jobs(tmp_path: Path, *args: str, ls_exit: int = 1) -> tuple[int, str, list[str]]:
+    import os
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "aws").write_bytes(FAKE_AWS.encode())
+    (bin_dir / "aws").chmod(0o755)
+    py = Path(sys.executable)
+    (bin_dir / "python").write_bytes(f'#!/usr/bin/env bash\nexec "{py.as_posix()}" "$@"\n'.encode())
+    (bin_dir / "python").chmod(0o755)
+    log = tmp_path / "aws.log"
+    log.write_text("")
+    to_bash = subprocess.run(
+        [bash, "-c", 'cygpath -u "$1" 2>/dev/null || echo "$1"', "_", str(bin_dir)], text=True, capture_output=True
+    ).stdout.strip()
+    env = {**os.environ, "AWS_LOG": str(log), "AWS_LS_EXIT": str(ls_exit), "ORCH_BUCKET": "artifacts"}
+    script = (ROOT / "scripts" / "sync-jobs.sh").as_posix()
+    proc = subprocess.run(
+        [bash, "-c", f'PATH="{to_bash}:$PATH" exec "$0" "$@"', script, *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return proc.returncode, proc.stdout + proc.stderr, log.read_text().splitlines()
+
+
+def test_sync_jobs_creates_every_object_without_overwrite_and_prints_the_total(tmp_path, capsys):
+    code, out, calls = _sync_jobs(tmp_path, "ledger", "v7", str(EXAMPLE))
+    assert code == 0, out
+    puts = [c for c in calls if c.startswith("s3api put-object")]
+    assert puts and all("--if-none-match *" in c for c in puts)
+    assert not [c for c in calls if c.startswith("s3 sync") or c.startswith("s3 cp")]
+    assert "--key jobs/ledger/v7/bundle.sha256" in puts[-1]  # the manifest last: a listed version is complete
+    assert jobset_tool.main(["hash", str(EXAMPLE)]) == 0
+    total = capsys.readouterr().out.strip()
+    assert f"bundle sha256: {total}" in out
+    assert f'v7 = "{total}"' in out  # the line for jobs.bundles in Terraform
+
+
+def test_sync_jobs_has_no_force_and_refuses_an_existing_version(tmp_path):
+    code, out, calls = _sync_jobs(tmp_path, "ledger", "v7", str(EXAMPLE), "--force")
+    assert code == 2 and not calls
+    code, out, calls = _sync_jobs(tmp_path / "again", "ledger", "v7", str(EXAMPLE), ls_exit=0)
+    assert code == 1 and "immutable" in out
+    assert not [c for c in calls if "put-object" in c]
