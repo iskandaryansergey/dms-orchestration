@@ -7,21 +7,21 @@ MODULE := modules/dms-orchestration
 test: py-test tf-test
 
 lint:
-	uv run ruff check src tests scripts examples
-	uv run ruff format --check src tests scripts examples
+	uv run ruff check modules/dms-orchestration/src tests scripts examples
+	uv run ruff format --check modules/dms-orchestration/src tests scripts examples
 	$(TF) fmt -check -recursive modules
 	$(TF) fmt -check examples/sandbox
 	uv run python scripts/jobset_tool.py validate examples/jobs/postgres-basic
 	uv run python scripts/jobset_tool.py validate examples/jobs/minimal
 
 fmt:
-	uv run ruff format src tests scripts examples
-	uv run ruff check --fix src tests scripts examples
+	uv run ruff format modules/dms-orchestration/src tests scripts examples
+	uv run ruff check --fix modules/dms-orchestration/src tests scripts examples
 	$(TF) fmt -recursive modules
 	$(TF) fmt examples/sandbox
 
 py-test:
-	uv run pytest --cov=src/shared --cov=src/lambdas --cov=src/jobs/sql-runner --cov-report=term
+	uv run pytest --cov=modules/dms-orchestration/src/shared --cov=modules/dms-orchestration/src/lambdas --cov=modules/dms-orchestration/src/jobs/sql-runner --cov-report=term
 
 TF_MODULES := $(MODULE) modules/artifacts-bucket
 
@@ -33,7 +33,7 @@ tf-test:
 teststate-dry:
 	uv run python tests/sfn/run_teststate.py --dry
 
-# Lambda SQL runtime: pg8000 and its dependencies vendored into src/lambdas/sql_jobs/vendor from
+# Lambda SQL runtime: pg8000 and its dependencies vendored into modules/dms-orchestration/src/lambdas/sql_jobs/vendor from
 # requirements.txt (hashes, wheels only). vendor-check rebuilds into a temporary directory and fails
 # on any difference or on a CA bundle that does not match its pin (needs PyPI, not AWS).
 vendor:
@@ -43,7 +43,7 @@ vendor-check:
 	uv run python scripts/vendor_sql_jobs.py check
 
 image:
-	docker build -f src/jobs/sql-runner/Dockerfile -t sql-runner:dev .
+	docker build -f modules/dms-orchestration/src/jobs/sql-runner/Dockerfile -t sql-runner:dev .
 
 # Denylist gate. Patterns come from DENYLIST_PATTERNS, --patterns-file (outside the repo) or
 # ~/.config/dms-orchestration/denylist. DENYLIST_ARGS="--history --all" also scans commits.

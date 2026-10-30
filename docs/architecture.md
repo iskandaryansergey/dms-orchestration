@@ -33,14 +33,14 @@ migration journal (locks, runs, baselines, dumps) stays in a long-lived one.
 | [`migrate`](../modules/dms-orchestration/asl/migrate.asl.json) | lock → inspect → pre-flight verdict → (assessment) → pre-jobs → (dump) → (reset) → arm → start DMS → report `STARTED`; never waits for DMS |
 | [`post`](../modules/dms-orchestration/asl/post.asl.json) | started by the DMS event: outcome → post-jobs or failure branch → target baseline → report → SNS → unlock; can be repeated (`operation=post`, `fromJob`) |
 | [`job-runner`](../modules/dms-orchestration/asl/job-runner.asl.json) | one job: `when`, Lambda, SSM or Fargate, retries, `onError`, `JOB#` record; sub-machine of both |
-| [`dms_event_handler`](../src/lambdas/dms_event_handler/handler.py), [`handoff`](../src/shared/handoff.py) | event → describe → `evaluate_outcome` → claim `MIGRATION#` → start `post` |
-| [`watchdog`](../src/lambdas/watchdog/handler.py) | lost events, finished task without `post`, dead executions, orphan locks, overdue migrations |
-| [`release_lock`](../src/lambdas/release_lock/handler.py) | failed or aborted executions: unlock unless DMS already runs (then `post` unlocks) |
-| [`preflight`](../src/shared/preflight.py), [`fingerprint`](../src/shared/fingerprint.py) | target fingerprint, diff against the expectation and the baseline, verdict (ADR 0006) |
-| [`dms_outcome`](../src/shared/dms_outcome.py) | start decision (start type, tables to reset) and the outcome of a finished task |
-| [`resolve_context`](../src/lambdas/resolve_context/handler.py), [`inspect_task`](../src/lambdas/inspect_task/handler.py), [`classify_failure`](../src/lambdas/classify_failure/handler.py), [`write_report`](../src/lambdas/write_report/handler.py), [`prepare_job`](../src/lambdas/prepare_job/handler.py) | request and registration; task state; failure category; report and notification attributes; job routing |
-| [`builtin_jobs`](../src/lambdas/builtin_jobs/handler.py) | built-in checks: connections, grants, row counts, target check, snapshots, diagnostics |
-| [`sql-runner`](../src/jobs/sql-runner/) (SSM runtime zip; optional Fargate image) | orch-job, psql, `pg_dump`/`pg_restore` to S3, `verify-target` (the target check in psql), IAM token login, python, bash, pwsh |
+| [`dms_event_handler`](../modules/dms-orchestration/src/lambdas/dms_event_handler/handler.py), [`handoff`](../modules/dms-orchestration/src/shared/handoff.py) | event → describe → `evaluate_outcome` → claim `MIGRATION#` → start `post` |
+| [`watchdog`](../modules/dms-orchestration/src/lambdas/watchdog/handler.py) | lost events, finished task without `post`, dead executions, orphan locks, overdue migrations |
+| [`release_lock`](../modules/dms-orchestration/src/lambdas/release_lock/handler.py) | failed or aborted executions: unlock unless DMS already runs (then `post` unlocks) |
+| [`preflight`](../modules/dms-orchestration/src/shared/preflight.py), [`fingerprint`](../modules/dms-orchestration/src/shared/fingerprint.py) | target fingerprint, diff against the expectation and the baseline, verdict (ADR 0006) |
+| [`dms_outcome`](../modules/dms-orchestration/src/shared/dms_outcome.py) | start decision (start type, tables to reset) and the outcome of a finished task |
+| [`resolve_context`](../modules/dms-orchestration/src/lambdas/resolve_context/handler.py), [`inspect_task`](../modules/dms-orchestration/src/lambdas/inspect_task/handler.py), [`classify_failure`](../modules/dms-orchestration/src/lambdas/classify_failure/handler.py), [`write_report`](../modules/dms-orchestration/src/lambdas/write_report/handler.py), [`prepare_job`](../modules/dms-orchestration/src/lambdas/prepare_job/handler.py) | request and registration; task state; failure category; report and notification attributes; job routing |
+| [`builtin_jobs`](../modules/dms-orchestration/src/lambdas/builtin_jobs/handler.py) | built-in checks: connections, grants, row counts, target check, snapshots, diagnostics |
+| [`sql-runner`](../modules/dms-orchestration/src/jobs/sql-runner/) (SSM runtime zip; optional Fargate image) | orch-job, psql, `pg_dump`/`pg_restore` to S3, `verify-target` (the target check in psql), IAM token login, python, bash, pwsh |
 | [`orch.py`](../scripts/orch.py) | operator CLI: start, status, report, stop, repeat post, dumps, restore, gate |
 
 ## Job runtimes

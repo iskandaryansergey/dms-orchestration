@@ -49,7 +49,7 @@ run "least_privilege" {
 
   assert {
     condition = alltrue(flatten([
-      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0], aws_iam_role_policy.scheduler], values(aws_iam_role_policy.job)) : [
+      for p in concat([aws_iam_role_policy.migrate[0], aws_iam_role_policy.post[0], aws_iam_role_policy.job_runner[0], aws_iam_role_policy.lambda_core[0], aws_iam_role_policy.lambda_waiter[0], aws_iam_role_policy.lambda_jobs[0], aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0], aws_iam_role_policy.scheduler[0]], values(aws_iam_role_policy.job)) : [
         for st in jsondecode(p.policy).Statement : alltrue([for a in flatten([st.Action]) : a != "*" && !endswith(a, ":*")])
       ]
     ]))
@@ -58,7 +58,7 @@ run "least_privilege" {
 
   assert {
     condition = alltrue(flatten([
-      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0], aws_iam_role_policy.scheduler], values(aws_iam_role_policy.job)) : [
+      for p in concat([aws_iam_role_policy.migrate[0], aws_iam_role_policy.post[0], aws_iam_role_policy.job_runner[0], aws_iam_role_policy.lambda_core[0], aws_iam_role_policy.lambda_waiter[0], aws_iam_role_policy.lambda_jobs[0], aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0], aws_iam_role_policy.scheduler[0]], values(aws_iam_role_policy.job)) : [
         for st in jsondecode(p.policy).Statement : alltrue([
           for a in flatten([st.Action]) : contains([
             "dms:DescribeReplicationTasks", "dms:DescribeTableStatistics", "dms:DescribeConnections", "dms:DescribeEvents", "dms:DescribeEndpoints", "dms:DescribeReplicationTaskAssessmentRuns",
@@ -74,30 +74,30 @@ run "least_privilege" {
   }
 
   assert {
-    condition     = contains(flatten([for st in jsondecode(aws_iam_role_policy.migrate.policy).Statement : flatten([st.Action])]), "dms:DescribeReplicationTasks")
+    condition     = contains(flatten([for st in jsondecode(aws_iam_role_policy.migrate[0].policy).Statement : flatten([st.Action])]), "dms:DescribeReplicationTasks")
     error_message = "migrate reads the task again before the dump and the reset (RecheckTask)"
   }
 
   assert {
-    condition     = toset(one([for st in jsondecode(aws_iam_role_policy.migrate.policy).Statement : st.Resource if st.Sid == "StartDmsTasks"])) == toset(values(var.dms.task_arns))
+    condition     = toset(one([for st in jsondecode(aws_iam_role_policy.migrate[0].policy).Statement : st.Resource if st.Sid == "StartDmsTasks"])) == toset(values(var.dms.task_arns))
     error_message = "dms:StartReplicationTask must be limited to the DMS task ARNs"
   }
 
   assert {
     condition = alltrue([
-      for p in [aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0]] :
+      for p in [aws_iam_role_policy.post[0], aws_iam_role_policy.job_runner[0], aws_iam_role_policy.lambda_core[0], aws_iam_role_policy.lambda_waiter[0], aws_iam_role_policy.lambda_jobs[0], aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0]] :
       length([for st in jsondecode(p.policy).Statement : st if contains(flatten([st.Action]), "dms:StartReplicationTask")]) == 0
     ])
     error_message = "only migrate starts DMS tasks (ADR 0005)"
   }
 
   assert {
-    condition     = one([for st in jsondecode(aws_iam_role_policy.lambda_waiter.policy).Statement : st.Resource if st.Sid == "StartPost"]) == ["arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run["post"].name}"]
+    condition     = one([for st in jsondecode(aws_iam_role_policy.lambda_waiter[0].policy).Statement : st.Resource if st.Sid == "StartPost"]) == ["arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run["post"].name}"]
     error_message = "the handoff Lambdas may start only the post machine"
   }
 
   assert {
-    condition     = length([for p in [aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.lambda_waiter] : p if strcontains(p.policy, "states:SendTask")]) == 0
+    condition     = length([for p in [aws_iam_role_policy.migrate[0], aws_iam_role_policy.post[0], aws_iam_role_policy.lambda_waiter[0]] : p if strcontains(p.policy, "states:SendTask")]) == 0
     error_message = "no task tokens any more (ADR 0005)"
   }
 
@@ -108,14 +108,14 @@ run "least_privilege" {
 
   assert {
     condition = alltrue([
-      for p in [aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.ecs_execution[0]] :
+      for p in [aws_iam_role_policy.migrate[0], aws_iam_role_policy.post[0], aws_iam_role_policy.lambda_core[0], aws_iam_role_policy.lambda_waiter[0], aws_iam_role_policy.ecs_execution[0]] :
       length([for st in jsondecode(p.policy).Statement : st if contains(flatten([st.Action]), "secretsmanager:GetSecretValue")]) == 0
     ])
     error_message = "orchestration roles must not read secrets"
   }
 
   assert {
-    condition     = one([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st.Condition if st.Sid == "PassJobRoles"]).StringEquals["iam:PassedToService"] == "ecs-tasks.amazonaws.com"
+    condition     = one([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st.Condition if st.Sid == "PassJobRoles"]).StringEquals["iam:PassedToService"] == "ecs-tasks.amazonaws.com"
     error_message = "iam:PassRole only to ECS tasks"
   }
 
@@ -125,22 +125,22 @@ run "least_privilege" {
   }
 
   assert {
-    condition     = alltrue([for r in [aws_iam_role.migrate, aws_iam_role.post, aws_iam_role.lambda_core, aws_iam_role.ecs_task[0], aws_iam_role.scheduler] : r.permissions_boundary == var.permissions_boundary_arn])
+    condition     = alltrue([for r in [aws_iam_role.migrate[0], aws_iam_role.post[0], aws_iam_role.lambda_core[0], aws_iam_role.ecs_task[0], aws_iam_role.scheduler[0]] : r.permissions_boundary == var.permissions_boundary_arn])
     error_message = "every role gets the permissions boundary"
   }
 
   assert {
-    condition     = jsondecode(aws_iam_role.post.assume_role_policy).Statement[0].Condition.StringEquals["aws:SourceAccount"] == "111122223333"
+    condition     = jsondecode(aws_iam_role.post[0].assume_role_policy).Statement[0].Condition.StringEquals["aws:SourceAccount"] == "111122223333"
     error_message = "trust policies are scoped to the account (confused deputy)"
   }
 
   assert {
-    condition     = one([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Condition if st.Sid == "RecordRestoreBaseline"])["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == ["TARGET#*"]
+    condition     = one([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st.Condition if st.Sid == "RecordRestoreBaseline"])["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == ["TARGET#*"]
     error_message = "built-in jobs write only TARGET# items (the restore baseline)"
   }
 
   assert {
-    condition     = length([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st if contains(flatten([st.Action]), "dynamodb:PutItem")]) == 1
+    condition     = length([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st if contains(flatten([st.Action]), "dynamodb:PutItem")]) == 1
     error_message = "built-in jobs have exactly one DynamoDB write statement"
   }
 
@@ -166,14 +166,14 @@ run "no_secrets_no_data_api_no_fargate" {
   }
 
   assert {
-    condition     = length([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st if st.Sid == "RunJobTasks"]) == 0
+    condition     = length([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st if st.Sid == "RunJobTasks"]) == 0
     error_message = "no ECS permissions without Fargate images"
   }
 
   # Found in the sandbox: CreateStateMachine checks the managed rule of every .sync
   # integration in the definition, and job-runner always has RunFargateJob.
   assert {
-    condition     = length([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st if st.Sid == "SyncIntegrationRule"]) == 1
+    condition     = length([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st if st.Sid == "SyncIntegrationRule"]) == 1
     error_message = "job-runner needs the ECS .sync managed rule even without Fargate images"
   }
 
@@ -249,29 +249,29 @@ run "per_project_job_roles" {
 
   assert {
     condition = alltrue([
-      for p in [aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_task[0]] :
+      for p in [aws_iam_role_policy.lambda_jobs[0], aws_iam_role_policy.ecs_task[0]] :
       length([for st in jsondecode(p.policy).Statement : st if length(setintersection(toset(flatten([st.Action])), toset(["secretsmanager:GetSecretValue", "rds-data:ExecuteStatement"]))) > 0]) == 0
     ])
     error_message = "shared job roles must not read secrets or use the Data API"
   }
 
   assert {
-    condition     = length([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st if st.Sid == "TestEndpointConnections"]) == 0
+    condition     = length([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st if st.Sid == "TestEndpointConnections"]) == 0
     error_message = "no TestConnection grant without registered endpoint ARNs"
   }
 
   assert {
-    condition     = toset(one([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Resource if st.Sid == "AssumeProjectJobRoles"])) == toset(["arn:aws:iam::111122223333:role/dms-orch-dev-job-ledger", "arn:aws:iam::111122223333:role/dms-orch-dev-job-cards"])
+    condition     = toset(one([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st.Resource if st.Sid == "AssumeProjectJobRoles"])) == toset(["arn:aws:iam::111122223333:role/dms-orch-dev-job-ledger", "arn:aws:iam::111122223333:role/dms-orch-dev-job-cards"])
     error_message = "built-in Lambda jobs work through the project's job role"
   }
 
   assert {
-    condition     = contains(one([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st.Resource if st.Sid == "PassJobRoles"]), "arn:aws:iam::111122223333:role/dms-orch-dev-job-cards")
+    condition     = contains(one([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st.Resource if st.Sid == "PassJobRoles"]), "arn:aws:iam::111122223333:role/dms-orch-dev-job-cards")
     error_message = "the job runner may pass project job roles to ECS"
   }
 
   assert {
-    condition     = jsondecode(aws_sfn_state_machine.job_runner.definition).States.RunFargateJob.Arguments.Overrides.TaskRoleArn == "{% $spec.jobRoleArn %}"
+    condition     = jsondecode(aws_sfn_state_machine.job_runner[0].definition).States.RunFargateJob.Arguments.Overrides.TaskRoleArn == "{% $spec.jobRoleArn %}"
     error_message = "Fargate jobs run with the project's job role"
   }
 
@@ -297,7 +297,7 @@ run "per_project_job_roles" {
 
   assert {
     condition = alltrue(flatten([
-      for p in [aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_task[0]] : [
+      for p in [aws_iam_role_policy.lambda_jobs[0], aws_iam_role_policy.ecs_task[0]] : [
         for st in jsondecode(p.policy).Statement : [for r in flatten([st.Resource]) : !strcontains(r, "/runs/")]
       ]
     ]))
@@ -306,7 +306,7 @@ run "per_project_job_roles" {
 
   assert {
     condition = alltrue([
-      for p in [aws_iam_role_policy.migrate, aws_iam_role_policy.lambda_core, aws_iam_role_policy.job_runner] :
+      for p in [aws_iam_role_policy.migrate[0], aws_iam_role_policy.lambda_core[0], aws_iam_role_policy.job_runner[0]] :
       contains(flatten([for st in jsondecode(p.policy).Statement : flatten([st.Resource])]), "arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runs/*")
     ])
     error_message = "migrate (context), the core Lambdas (reports, context) and job-runner (results) keep runs/*"
@@ -315,7 +315,7 @@ run "per_project_job_roles" {
   assert {
     condition = alltrue([
       for st in jsondecode(aws_iam_role.job["ledger"].assume_role_policy).Statement :
-      st.Principal == { Service = "ecs-tasks.amazonaws.com" } ? st.Condition.StringEquals["aws:SourceAccount"] == "111122223333" : st.Principal == { AWS = aws_iam_role.lambda_jobs.arn }
+      st.Principal == { Service = "ecs-tasks.amazonaws.com" } ? st.Condition.StringEquals["aws:SourceAccount"] == "111122223333" : st.Principal == { AWS = aws_iam_role.lambda_jobs[0].arn }
     ])
     error_message = "job roles trust ECS tasks of this account and the built-in jobs Lambda role only"
   }
@@ -414,12 +414,12 @@ run "assessment_role_is_passed_only_to_dms" {
   }
 
   assert {
-    condition     = one([for st in jsondecode(aws_iam_role_policy.migrate.policy).Statement : st if st.Sid == "PassAssessmentRole"]).Resource == ["arn:aws:iam::111122223333:role/dms-assessment"] && one([for st in jsondecode(aws_iam_role_policy.migrate.policy).Statement : st if st.Sid == "PassAssessmentRole"]).Condition.StringEquals["iam:PassedToService"] == "dms.amazonaws.com"
+    condition     = one([for st in jsondecode(aws_iam_role_policy.migrate[0].policy).Statement : st if st.Sid == "PassAssessmentRole"]).Resource == ["arn:aws:iam::111122223333:role/dms-assessment"] && one([for st in jsondecode(aws_iam_role_policy.migrate[0].policy).Statement : st if st.Sid == "PassAssessmentRole"]).Condition.StringEquals["iam:PassedToService"] == "dms.amazonaws.com"
     error_message = "iam:PassRole only on the assessment role and only to DMS"
   }
 
   assert {
-    condition     = length([for p in [aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter] : p if strcontains(p.policy, "dms-assessment")]) == 0
+    condition     = length([for p in [aws_iam_role_policy.post[0], aws_iam_role_policy.job_runner[0], aws_iam_role_policy.lambda_core[0], aws_iam_role_policy.lambda_waiter[0]] : p if strcontains(p.policy, "dms-assessment")]) == 0
     error_message = "no other role may pass the assessment role"
   }
 
@@ -620,7 +620,7 @@ run "ssm_runtime_least_privilege" {
 
   assert {
     condition = toset(flatten([
-      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : flatten([st.Resource]) if contains(flatten([st.Action]), "ssm:SendCommand")
+      for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : flatten([st.Resource]) if contains(flatten([st.Action]), "ssm:SendCommand")
       ])) == toset([
       "arn:aws:ssm:eu-west-2:111122223333:document/dms-orch-dev-orch-job",
       "arn:aws:ec2:eu-west-2:111122223333:instance/i-0123456789abcdef0",
@@ -630,7 +630,7 @@ run "ssm_runtime_least_privilege" {
 
   assert {
     condition = alltrue([
-      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : alltrue([for a in flatten([st.Action]) : contains(["ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation"], a)])
+      for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : alltrue([for a in flatten([st.Action]) : contains(["ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation"], a)])
       if startswith(jsonencode(st.Action), "[\"ssm:") || startswith(jsonencode(st.Action), "\"ssm:") ? st.Resource == "*" : false
     ])
     error_message = "only DescribeInstanceInformation and GetCommandInvocation (no resource-level permissions) run on Resource '*'"
@@ -638,7 +638,7 @@ run "ssm_runtime_least_privilege" {
 
   assert {
     condition = length([
-      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st
+      for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st
       if length(setintersection(toset(flatten([st.Action])), toset(["ssm:CancelCommand", "ssm:StartSession", "ssm:SendCommand*", "ssm:UpdateDocument", "ssm:CreateDocument"]))) > 0
     ]) == 0
     error_message = "the job-runner neither cancels commands nor opens sessions nor edits documents"
@@ -646,7 +646,7 @@ run "ssm_runtime_least_privilege" {
 
   assert {
     condition = alltrue([
-      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0]], values(aws_iam_role_policy.job)) :
+      for p in concat([aws_iam_role_policy.migrate[0], aws_iam_role_policy.post[0], aws_iam_role_policy.lambda_core[0], aws_iam_role_policy.lambda_waiter[0], aws_iam_role_policy.lambda_jobs[0], aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0]], values(aws_iam_role_policy.job)) :
       !strcontains(p.policy, "ssm:SendCommand")
     ])
     error_message = "only the job-runner sends SSM commands"
@@ -654,7 +654,7 @@ run "ssm_runtime_least_privilege" {
 
   assert {
     condition = alltrue([
-      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement :
+      for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement :
       !contains(flatten([st.Resource]), var.ssm.instance_role_arn) if contains(flatten([st.Action]), "iam:PassRole")
     ])
     error_message = "the runner instance role is never passed (to ECS or anything else)"
@@ -740,7 +740,7 @@ run "ssm_runtime_with_target_tags" {
 
   assert {
     condition = one([
-      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st if st.Sid == "SendToTaggedRunners"
+      for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st if st.Sid == "SendToTaggedRunners"
       ]) == {
       Sid       = "SendToTaggedRunners"
       Effect    = "Allow"
@@ -752,7 +752,7 @@ run "ssm_runtime_with_target_tags" {
   }
 
   assert {
-    condition     = strcontains(aws_sfn_state_machine.job_runner.definition, "\"tag:dms-orch:runner\"")
+    condition     = strcontains(aws_sfn_state_machine.job_runner[0].definition, "\"tag:dms-orch:runner\"")
     error_message = "FindSsmRunner filters the runners by the same tags"
   }
 }

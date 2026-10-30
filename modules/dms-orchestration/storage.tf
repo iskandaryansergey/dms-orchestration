@@ -64,7 +64,7 @@ resource "aws_dynamodb_table" "this" {
 
   server_side_encryption {
     enabled     = true
-    kms_key_arn = var.kms_key_arn
+    kms_key_arn = local.kms_key_arn
   }
 
   tags = local.tags
@@ -161,7 +161,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
   rule {
     apply_server_side_encryption_by_default {
       sse_algorithm     = local.use_cmk ? "aws:kms" : "AES256"
-      kms_master_key_id = var.kms_key_arn
+      kms_master_key_id = local.kms_key_arn
     }
     bucket_key_enabled = local.use_cmk
   }
@@ -234,7 +234,7 @@ resource "aws_sns_topic" "this" {
   # Not alias/aws/sns: its key policy cannot let CloudWatch alarms publish, so alarms
   # would silently never arrive. Without a CMK (sandbox) the topic is unencrypted;
   # with one, kms_key_policy_requirements lists cloudwatch.amazonaws.com.
-  kms_master_key_id = local.use_cmk ? var.kms_key_arn : null
+  kms_master_key_id = local.kms_key_arn
   tags              = local.tags
 }
 

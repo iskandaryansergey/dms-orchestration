@@ -49,7 +49,7 @@ run "bring_your_own_bucket_topic_cluster_sg" {
   }
 
   assert {
-    condition     = jsondecode(aws_sfn_state_machine.job_runner.definition).States.RunFargateJob.Arguments.Cluster == var.fargate.cluster_arn
+    condition     = jsondecode(aws_sfn_state_machine.job_runner[0].definition).States.RunFargateJob.Arguments.Cluster == var.fargate.cluster_arn
     error_message = "jobs run in the caller's cluster"
   }
 
@@ -108,7 +108,7 @@ run "customer_managed_key" {
   }
 
   assert {
-    condition     = aws_dynamodb_table.this[0].server_side_encryption[0].kms_key_arn == var.kms_key_arn && aws_sqs_queue.dlq.kms_master_key_id == var.kms_key_arn
+    condition     = aws_dynamodb_table.this[0].server_side_encryption[0].kms_key_arn == var.kms_key_arn && aws_sqs_queue.dlq[0].kms_master_key_id == var.kms_key_arn
     error_message = "table and DLQ encrypted with the CMK"
   }
 
@@ -118,7 +118,7 @@ run "customer_managed_key" {
   }
 
   assert {
-    condition     = length(jsondecode(output.kms_key_policy_requirements)) == 3
+    condition     = length(jsondecode(output.kms_key_policy_statements)) == 3 && length(jsondecode(output.kms_key_policy_requirements)) == 4
     error_message = "key policy requirements are published"
   }
 
@@ -128,17 +128,17 @@ run "customer_managed_key" {
   }
 
   assert {
-    condition     = contains(one([for st in jsondecode(output.kms_key_policy_requirements) : st.Principal.Service if st.Sid == "EventsToEncryptedQueueAndScheduler"]), "cloudwatch.amazonaws.com")
+    condition     = contains(one([for st in jsondecode(output.kms_key_policy_statements) : st.Principal.Service if st.Sid == "EventsToEncryptedQueueAndScheduler"]), "cloudwatch.amazonaws.com")
     error_message = "the CMK key policy must let CloudWatch alarms publish to the encrypted topic"
   }
 
   assert {
-    condition     = contains(one([for st in jsondecode(output.kms_key_policy_requirements) : st.Principal.AWS if st.Sid == "ModuleRoles"]), "arn:aws:iam::111122223333:role/dms-orch-stage-job-ledger")
+    condition     = contains(one([for st in jsondecode(output.kms_key_policy_statements) : st.Principal.AWS if st.Sid == "ModuleRoles"]), "arn:aws:iam::111122223333:role/dms-orch-stage-job-ledger")
     error_message = "project job roles must be allowed to use the CMK"
   }
 
   assert {
-    condition     = length([for st in jsondecode(aws_iam_role_policy.lambda_waiter.policy).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
+    condition     = length([for st in jsondecode(aws_iam_role_policy.lambda_waiter[0].policy).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
     error_message = "roles may use the CMK"
   }
 
@@ -207,7 +207,7 @@ run "sql_jobs_off_and_no_images_without_warnings" {
     condition = (
       !contains(keys(aws_lambda_function.this), "sql_jobs")
       && aws_lambda_function.this["prepare_job"].environment[0].variables.SQL_JOBS_ARN == ""
-      && !anytrue([for r in flatten([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st.Resource if st.Sid == "InvokeJobLambdas"]) : strcontains(r, "sql_jobs")])
+      && !anytrue([for r in flatten([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st.Resource if st.Sid == "InvokeJobLambdas"]) : strcontains(r, "sql_jobs")])
     )
     error_message = "lambda.sql_jobs_enabled = false removes the function and its routes"
   }
@@ -246,7 +246,7 @@ run "ssm_runtime_with_a_platform_document" {
   }
 
   assert {
-    condition     = one([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st.Resource if st.Sid == "SendJobDocument"]) == ["arn:aws:ssm:eu-west-2:111122223333:document/platform-dms-orch-job"]
+    condition     = one([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st.Resource if st.Sid == "SendJobDocument"]) == ["arn:aws:ssm:eu-west-2:111122223333:document/platform-dms-orch-job"]
     error_message = "the job-runner sends only the named document"
   }
 

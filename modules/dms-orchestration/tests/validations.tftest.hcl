@@ -110,12 +110,14 @@ run "https_egress_to_the_internet" {
 run "https_egress_explicit_ranges" {
   command = plan
   variables {
-    https_egress_cidr_blocks     = ["10.1.2.0/24"]
-    https_egress_prefix_list_ids = ["pl-0123456789abcdef0"]
+    https_egress_vpc_cidr          = false
+    https_egress_gateway_endpoints = false
+    https_egress_cidr_blocks       = ["10.1.2.0/24"]
+    https_egress_prefix_list_ids   = ["pl-0123456789abcdef0"]
   }
   assert {
     condition     = keys(aws_vpc_security_group_egress_rule.https_cidr) == ["10.1.2.0/24"] && keys(aws_vpc_security_group_egress_rule.https_prefix_list) == ["0"]
-    error_message = "explicit https egress replaces the defaults"
+    error_message = "with the switches off only the explicit https egress ranges remain"
   }
 }
 

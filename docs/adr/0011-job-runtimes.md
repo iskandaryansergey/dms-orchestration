@@ -42,7 +42,7 @@ Three runtimes, chosen per job (`runtime: lambda | ssm | fargate`):
 * **The module never builds an image.** It takes a Lambda zip it packages from the repository
   (or a prebuilt one, `lambda.artifact_s3_*`) and, for Fargate, a pre-pushed image URI, pinned
   by digest. Whoever builds the image builds it from the hardened Dockerfile
-  (`src/jobs/sql-runner/Dockerfile`): base image pinned by digest through `BASE_IMAGE`, every
+  (`modules/dms-orchestration/src/jobs/sql-runner/Dockerfile`): base image pinned by digest through `BASE_IMAGE`, every
   source a build arg for internal mirrors (`PGDG_APT_URL`, `PGDG_KEY_URL`, `PIP_INDEX_URL`,
   `RDS_CA_URL`, `POWERSHELL_DEB_URL`), every download checked (PGDG key fingerprint, CA bundle
   and PowerShell `.deb` by sha256), Python wheels by hash only, PowerShell off by default. CI
@@ -86,7 +86,7 @@ command fails the job instead of hanging the run.
   exist.
 * The vendored driver and the CA bundle are updated by changing `requirements.in` or the pin,
   running `make vendor` and committing; CI refuses a tree that differs. The image's Python
-  dependencies follow the same rule (`src/jobs/sql-runner/requirements.in` compiled with
+  dependencies follow the same rule (`modules/dms-orchestration/src/jobs/sql-runner/requirements.in` compiled with
   hashes).
 * The zip of every module Lambda carries the vendored driver (about 3 MB unpacked).
 * **Residual risk of SSM: projects sharing a runner are not isolated from each other.** Every

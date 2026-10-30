@@ -201,7 +201,7 @@ phases:
       function: arn:aws:lambda:eu-west-2:111122223333:function:ledger-check  # must be in job_lambda_arns
 ```
 
-JSON Schema: [`src/shared/schemas/jobset.schema.json`](../src/shared/schemas/jobset.schema.json).
+JSON Schema: [`modules/dms-orchestration/src/shared/schemas/jobset.schema.json`](../modules/dms-orchestration/src/shared/schemas/jobset.schema.json).
 `runtime: ssm` jobs need the module's SSM runtime (`ssm.enabled`); a module without it refuses
 them when they are prepared (`InvalidJobSet`). On a runner the command comes from `spec.json`,
 never from the SSM document, and runs as `ssm.runner_user` with the AMI's `python3` (3.9 or
@@ -340,7 +340,7 @@ Every job ends with a result (Lambda: return value; Fargate: `/out/result.json`)
 * `warn` lets the run continue and shows up in the report.
 * `skipped` is set by the orchestrator when `when:` is false.
 
-Schema: [`src/shared/schemas/job_result.schema.json`](../src/shared/schemas/job_result.schema.json).
+Schema: [`modules/dms-orchestration/src/shared/schemas/job_result.schema.json`](../modules/dms-orchestration/src/shared/schemas/job_result.schema.json).
 
 ## Retries and idempotency
 

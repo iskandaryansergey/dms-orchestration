@@ -24,14 +24,16 @@ package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
-pythonpath = ["src", "src/jobs/sql-runner", "scripts"]
+pythonpath = ["modules/dms-orchestration/src", "modules/dms-orchestration/src/jobs/sql-runner", "scripts"]
 addopts = "-q"
 
 [tool.ruff]
 line-length = 120
 target-version = "py313"
+# First-party packages (shared, lambdas) for import sorting: the code the module packages.
+src = [".", "modules/dms-orchestration/src"]
 # Fetched by `sandbox.py fetch-upstream`, not ours (gitignored); vendored third-party wheels.
-extend-exclude = ["examples/sandbox/upstream", "src/lambdas/sql_jobs/vendor"]
+extend-exclude = ["examples/sandbox/upstream", "modules/dms-orchestration/src/lambdas/sql_jobs/vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
@@ -41,5 +43,5 @@ ignore = ["S101", "S603", "S607"]
 "tests/**" = ["S105", "S106", "S107", "S108", "S311"]
 
 [tool.coverage.run]
-source = ["src/shared", "src/lambdas"]
-omit = ["src/lambdas/sql_jobs/vendor/*"]
+source = ["modules/dms-orchestration/src/shared", "modules/dms-orchestration/src/lambdas"]
+omit = ["modules/dms-orchestration/src/lambdas/sql_jobs/vendor/*"]

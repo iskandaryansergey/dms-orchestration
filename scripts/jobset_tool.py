@@ -30,7 +30,7 @@ from typing import Any
 
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules" / "dms-orchestration" / "src"))
 
 from shared import bundle as bundle_hash  # noqa: E402
 from shared import expr, jobset  # noqa: E402

@@ -12,19 +12,19 @@
 ############################################
 
 locals {
-  job_role_names = { for p in keys(var.projects) : p => "${local.prefix}-job-${p}" }
+  job_role_names = { for p in keys(local.projects) : p => "${local.prefix}-job-${p}" }
   job_role_arns  = { for p, n in local.job_role_names : p => "arn:${local.partition}:iam::${local.account_id}:role/${n}" }
 
   project_secret_arns = {
-    for p, proj in var.projects : p => distinct(flatten([
-      for t in values(proj.tasks) : [for c in values(t.connections) : c.secret_arn if c.secret_arn != null]
+    for p, proj in local.projects : p => distinct(flatten([
+      for t in values(proj.tasks) : [for c in values(t.connections) : c.secret_arn if c.secret_arn != ""]
     ]))
   }
 
   # auth = "iam" connections, keyed "<project>/<task>/<connection>" (known
   # at plan); the policy ARN itself may come from a module applied in the same plan.
   iam_database_connections = merge(flatten([
-    for p, proj in var.projects : [
+    for p, proj in local.projects : [
       for task_key, t in proj.tasks : {
         for name, c in t.connections : "${p}/${task_key}/${name}" => { project = p, policy_arn = c.iam_policy_arn } if c.auth == "iam"
       }
@@ -32,7 +32,7 @@ locals {
   ])...)
 
   project_data_api_arns = {
-    for p, proj in var.projects : p => distinct(compact(flatten([
+    for p, proj in local.projects : p => distinct(compact(flatten([
       for t in values(proj.tasks) : [for c in values(t.connections) : c.data_api_cluster_arn]
     ])))
   }
@@ -40,20 +40,20 @@ locals {
   # dump.method = snapshot: the target clusters of the project's tasks with
   # snapshot_dumps. Snapshots themselves are scoped by the project tag (job_role_policies).
   project_snapshot_clusters = {
-    for p, proj in var.projects : p => distinct(compact([
+    for p, proj in local.projects : p => distinct(compact([
       for t in values(proj.tasks) : try(coalesce(t.connections["target"].cluster_arn, t.connections["target"].data_api_cluster_arn), null) if t.defaults.snapshot_dumps
     ]))
   }
 
   project_job_prefixes = {
-    for p in keys(var.projects) : p => coalescelist(
+    for p in keys(local.projects) : p => coalescelist(
       distinct([for r in values(local.task_registrations) : trim(r.jobs.s3Prefix, "/") if r.project == p]),
       ["jobs/${p}"],
     )
   }
 
   job_role_assume = {
-    for p in keys(var.projects) : p => jsonencode({
+    for p in keys(local.projects) : p => jsonencode({
       Version = "2012-10-17"
       Statement = concat(
         # Fargate runtime only (fargate.images): the job role is the task role override.
@@ -61,7 +61,7 @@ locals {
         [{
           Sid       = "BuiltinJobsLambda"
           Effect    = "Allow"
-          Principal = { AWS = aws_iam_role.lambda_jobs.arn }
+          Principal = { AWS = aws_iam_role.lambda_jobs[0].arn }
           Action    = "sts:AssumeRole"
           },
           ], local.ssm_enabled ? [{
@@ -76,7 +76,7 @@ locals {
   }
 
   job_role_policies = {
-    for p in keys(var.projects) : p => {
+    for p in keys(local.projects) : p => {
       Version = "2012-10-17"
       Statement = concat([
         {

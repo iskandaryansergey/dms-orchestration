@@ -462,7 +462,7 @@ def test_run_command_returns_the_exit_code_of_a_quick_command(tmp_path):
 
 # --- Dockerfile (trivy image findings; CI builds and scans the image) -----------------
 
-DOCKERFILE = Path(__file__).resolve().parents[2] / "src" / "jobs" / "sql-runner" / "Dockerfile"
+DOCKERFILE = Path(__file__).resolve().parents[2] / "modules/dms-orchestration/src/jobs/sql-runner/Dockerfile"
 
 
 def test_dockerfile_upgrades_openssl_from_security_repo() -> None:
@@ -519,14 +519,14 @@ def test_dockerfile_checks_every_download() -> None:
     assert text.count("sha256sum -c") == 2
     assert '"${PGDG_KEY_FINGERPRINT}"' in text
     # One RDS CA bundle across runtimes: the one the Lambda SQL runtime pins.
-    sqlclient = (REPO_ROOT / "src/shared/sqlclient.py").read_text(encoding="utf-8")
+    sqlclient = (REPO_ROOT / "modules/dms-orchestration/src/shared/sqlclient.py").read_text(encoding="utf-8")
     assert f'CA_BUNDLE_SHA256 = "{args["RDS_CA_SHA256"]}"' in sqlclient
 
 
 def test_dockerfile_installs_python_packages_by_hash_only() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "--require-hashes" in text and '--index-url "${PIP_INDEX_URL}"' in text
-    reqs = (REPO_ROOT / "src/jobs/sql-runner/requirements.txt").read_text(encoding="utf-8")
+    reqs = (REPO_ROOT / "modules/dms-orchestration/src/jobs/sql-runner/requirements.txt").read_text(encoding="utf-8")
     pins = re.findall(r"^([A-Za-z0-9_.-]+)==\S+ \\$", reqs, re.M)
     assert {"boto3", "botocore", "urllib3"} <= set(pins)
     for block in re.split(r"\n(?=[A-Za-z])", reqs.strip()):
@@ -558,9 +558,9 @@ def test_sandbox_build_context_holds_every_file_the_dockerfile_copies() -> None:
     """Seen live: orch_dump.py was copied by the Dockerfile but missing from the zip CodeBuild
     builds from, so the image build failed. Every COPY source must be in sql_runner_files."""
     repo = Path(__file__).resolve().parents[2]
-    dockerfile = (repo / "src/jobs/sql-runner/Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (repo / "modules/dms-orchestration/src/jobs/sql-runner/Dockerfile").read_text(encoding="utf-8")
     tf = (repo / "examples/sandbox/sql_runner.tf").read_text(encoding="utf-8")
-    listed = set(re.findall(r'"(src/[^"]+)"', tf))
+    listed = set(re.findall(r'"(modules/dms-orchestration/src/[^"]+)"', tf))
     copied = [
         src
         for line in dockerfile.splitlines()
@@ -905,8 +905,8 @@ def test_connections_file_is_removed_when_the_job_wrapper_fails(job_env, monkeyp
     assert not (job_env.tmp / "tmp" / "connections.json").exists()
 
 
-RUNTIME_SHARED = Path(__file__).resolve().parents[2] / "src" / "shared"
-RUNTIME_DIR = Path(__file__).resolve().parents[2] / "src" / "jobs" / "sql-runner"
+RUNTIME_SHARED = Path(__file__).resolve().parents[2] / "modules" / "dms-orchestration" / "src" / "shared"
+RUNTIME_DIR = Path(__file__).resolve().parents[2] / "modules" / "dms-orchestration" / "src" / "jobs" / "sql-runner"
 SSM_TF = Path(__file__).resolve().parents[2] / "modules" / "dms-orchestration" / "ssm.tf"
 
 

@@ -55,14 +55,14 @@ run "state_machines" {
   }
 
   assert {
-    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner]) : m.type == "STANDARD"])
+    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner[0]]) : m.type == "STANDARD"])
     error_message = "state machines must be STANDARD (ADR 0001)"
   }
 
   # Review finding 9: state input/output (table names, job summaries, DMS messages)
   # stays out of CloudWatch Logs unless the caller opts in.
   assert {
-    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner]) : !m.logging_configuration[0].include_execution_data])
+    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner[0]]) : !m.logging_configuration[0].include_execution_data])
     error_message = "execution data must not be logged by default"
   }
 
@@ -109,7 +109,7 @@ run "state_machines" {
   }
 
   assert {
-    condition     = aws_cloudwatch_event_rule.execution_status.event_pattern == jsonencode({ source = ["aws.states"], "detail-type" = ["Step Functions Execution Status Change"], detail = { status = ["FAILED", "TIMED_OUT", "ABORTED"], stateMachineArn = [for m in ["migrate", "post"] : "arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run[m].name}"] } })
+    condition     = aws_cloudwatch_event_rule.execution_status[0].event_pattern == jsonencode({ source = ["aws.states"], "detail-type" = ["Step Functions Execution Status Change"], detail = { status = ["FAILED", "TIMED_OUT", "ABORTED"], stateMachineArn = [for m in ["migrate", "post"] : "arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run[m].name}"] } })
     error_message = "release_lock listens to both run machines"
   }
 
@@ -124,17 +124,17 @@ run "state_machines" {
   }
 
   assert {
-    condition     = jsonencode(jsondecode(aws_sfn_state_machine.job_runner.definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.Subnets) == jsonencode(var.subnet_ids)
+    condition     = jsonencode(jsondecode(aws_sfn_state_machine.job_runner[0].definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.Subnets) == jsonencode(var.subnet_ids)
     error_message = "Fargate jobs must run in the module subnets"
   }
 
   assert {
-    condition     = jsondecode(aws_sfn_state_machine.job_runner.definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp == "DISABLED"
+    condition     = jsondecode(aws_sfn_state_machine.job_runner[0].definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp == "DISABLED"
     error_message = "Fargate jobs get no public IP by default"
   }
 
   assert {
-    condition     = aws_sfn_state_machine.run["migrate"].logging_configuration[0].level == "ALL" && startswith(aws_cloudwatch_log_group.sfn.name, "/aws/vendedlogs/states/")
+    condition     = aws_sfn_state_machine.run["migrate"].logging_configuration[0].level == "ALL" && startswith(aws_cloudwatch_log_group.sfn[0].name, "/aws/vendedlogs/states/")
     error_message = "state machine logs go to a /aws/vendedlogs/ group"
   }
 
@@ -239,7 +239,7 @@ run "lambda_and_events" {
       aws_lambda_function.this["sql_jobs"].timeout == 900
       && aws_lambda_function.this["sql_jobs"].memory_size == 1024
       && aws_lambda_function.this["sql_jobs"].handler == "lambdas.sql_jobs.handler.handler"
-      && aws_lambda_function.this["sql_jobs"].role == aws_iam_role.lambda_jobs.arn
+      && aws_lambda_function.this["sql_jobs"].role == aws_iam_role.lambda_jobs[0].arn
       && aws_lambda_function.this["builtin_jobs"].memory_size == 512
     )
     error_message = "sql_jobs: 900 s, 1024 MB, the jobs role; the others keep lambda.memory_mb"
@@ -252,8 +252,8 @@ run "lambda_and_events" {
 
   assert {
     condition = (
-      contains(flatten([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st.Resource if st.Sid == "InvokeJobLambdas"]), aws_lambda_function.this["sql_jobs"].arn)
-      && contains(flatten([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Resource if st.Sid == "Logs"]), "${aws_cloudwatch_log_group.lambda["sql_jobs"].arn}:*")
+      contains(flatten([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st.Resource if st.Sid == "InvokeJobLambdas"]), aws_lambda_function.this["sql_jobs"].arn)
+      && contains(flatten([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st.Resource if st.Sid == "Logs"]), "${aws_cloudwatch_log_group.lambda["sql_jobs"].arn}:*")
     )
     error_message = "the job runner invokes sql_jobs; sql_jobs logs to its own group with the jobs role"
   }
@@ -269,22 +269,22 @@ run "lambda_and_events" {
   }
 
   assert {
-    condition     = jsondecode(aws_cloudwatch_event_rule.dms_task_state.event_pattern).source == ["aws.dms"]
+    condition     = jsondecode(aws_cloudwatch_event_rule.dms_task_state[0].event_pattern).source == ["aws.dms"]
     error_message = "DMS rule listens to aws.dms"
   }
 
   assert {
-    condition     = jsondecode(aws_cloudwatch_event_rule.execution_status.event_pattern).detail.status == ["FAILED", "TIMED_OUT", "ABORTED"]
+    condition     = jsondecode(aws_cloudwatch_event_rule.execution_status[0].event_pattern).detail.status == ["FAILED", "TIMED_OUT", "ABORTED"]
     error_message = "lock safety net on FAILED/TIMED_OUT/ABORTED"
   }
 
   assert {
-    condition     = aws_scheduler_schedule.watchdog.schedule_expression == "rate(5 minutes)"
+    condition     = aws_scheduler_schedule.watchdog[0].schedule_expression == "rate(5 minutes)"
     error_message = "watchdog every 5 minutes by default"
   }
 
   assert {
-    condition     = aws_cloudwatch_event_target.dms_task_state.dead_letter_config[0].arn == aws_sqs_queue.dlq.arn
+    condition     = aws_cloudwatch_event_target.dms_task_state[0].dead_letter_config[0].arn == aws_sqs_queue.dlq[0].arn
     error_message = "undeliverable DMS events go to the DLQ"
   }
 
@@ -306,11 +306,11 @@ run "lambda_and_events" {
   # The pre-check checks/connections runs TestConnection itself,
   # only on this replication instance and the registered endpoints.
   assert {
-    condition = toset(flatten([one([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Resource if st.Sid == "TestEndpointConnections"])])) == toset([
+    condition = toset(flatten([one([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st.Resource if st.Sid == "TestEndpointConnections"])])) == toset([
       "arn:aws:dms:eu-west-2:111122223333:rep:RI1",
       "arn:aws:dms:eu-west-2:111122223333:endpoint:SRC",
       "arn:aws:dms:eu-west-2:111122223333:endpoint:TGT",
-    ]) && one([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Action if st.Sid == "TestEndpointConnections"]) == ["dms:TestConnection"]
+    ]) && one([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st.Action if st.Sid == "TestEndpointConnections"]) == ["dms:TestConnection"]
     error_message = "built-in jobs may run TestConnection on the registered endpoints only"
   }
 
@@ -446,7 +446,7 @@ run "no_ecs_resources_by_default" {
   }
 
   assert {
-    condition     = !strcontains(aws_iam_role.job["ledger"].assume_role_policy, "ecs-tasks.amazonaws.com") && !strcontains(aws_iam_role_policy.job_runner.policy, "ecs:RunTask") && !strcontains(aws_iam_role_policy.job_runner.policy, "iam:PassRole")
+    condition     = !strcontains(aws_iam_role.job["ledger"].assume_role_policy, "ecs-tasks.amazonaws.com") && !strcontains(aws_iam_role_policy.job_runner[0].policy, "ecs:RunTask") && !strcontains(aws_iam_role_policy.job_runner[0].policy, "iam:PassRole")
     error_message = "no job role trusts ECS tasks and the job-runner neither runs tasks nor passes roles"
   }
 
@@ -466,7 +466,7 @@ run "no_ssm_runtime_by_default" {
   }
 
   assert {
-    condition     = !strcontains(aws_iam_role_policy.job_runner.policy, "ssm:") && !strcontains(aws_iam_role.job["ledger"].assume_role_policy, "SsmRunnerInstances")
+    condition     = !strcontains(aws_iam_role_policy.job_runner[0].policy, "ssm:") && !strcontains(aws_iam_role.job["ledger"].assume_role_policy, "SsmRunnerInstances")
     error_message = "without ssm.enabled the job-runner sends no command and no job role trusts a runner"
   }
 

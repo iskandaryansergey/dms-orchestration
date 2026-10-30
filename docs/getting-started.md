@@ -15,7 +15,7 @@ the sandbox: [`examples/sandbox/README.md`](../examples/sandbox/README.md).
 | Source and target databases (Aurora PostgreSQL or PostgreSQL), each with a Secrets Manager secret holding `host`, `port`, `username`, `password`, `dbname` | jobs and pre-flight read connections through secret ARNs only |
 | The RDS Data API on the target cluster (recommended) | pre-flight's target check and the built-in SQL checks; without it the check runs in psql on Fargate (`preflight.verifyRuntime`, [preflight.md](preflight.md)) |
 | Private subnets (at least two) and the VPC endpoints of the `network_contract` output | Lambdas and Fargate jobs run without internet access |
-| The `sql-runner` image in your registry (`src/jobs/sql-runner/Dockerfile`, `make image`) | Fargate jobs: psql, dumps, the psql target check |
+| The `sql-runner` image in your registry (`modules/dms-orchestration/src/jobs/sql-runner/Dockerfile`, `make image`) | Fargate jobs: psql, dumps, the psql target check |
 | Python 3.13 with `uv` and the AWS CLI v2 on the operator machine | `orch.py`, `sync-jobs.sh` |
 
 ## 2. Wire the module

@@ -5,7 +5,7 @@ asn1crypto==1.5.1 \
 pg8000==1.31.6 \
     --hash=sha256:1ffe27af94fa5b37ce6885b98d591dc75562ff076859bf50ca7729af59345a80 \
     --hash=sha256:553b240256d4b2d8f0ad2af28d07df1f9980247f74ac98d2c2b573762ec1ff1b
-    # via -r src/lambdas/sql_jobs/requirements.in
+    # via -r modules/dms-orchestration/src/lambdas/sql_jobs/requirements.in
 python-dateutil==3.0.0 \
     --hash=sha256:3c79630202e4152c6add678446984236efe4f57e84d8e892aab0637bab82e9fd \
     --hash=sha256:7ebcb3c29a92f3ceafe79a7a48a5c45677e9e004bbeec5742ac0bbb00560b7a2
