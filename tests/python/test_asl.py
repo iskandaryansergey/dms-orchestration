@@ -179,11 +179,32 @@ def test_nothing_touches_the_target_before_the_assessment_and_the_arm_guard_pass
 
 
 def test_every_terminal_path_of_post_passes_release_lock():
-    states = render(POST)["States"]
+    """Except when the lock was lost: then it belongs to someone else (review finding 8)."""
+    import copy
+
+    states = copy.deepcopy(render(POST)["States"])
+    held = states["CheckLockHeld"]
+    lost = "{% $exists($failure.Error) and $failure.Error = 'LockLost' %}"
+    assert [c["Condition"] for c in held["Choices"]] == [lost]
+    assert held["Default"] == "ReleaseLock"
+    # Only TakeOverLock can set that failure.
+    setters = {n for n, st in states.items() if '"Error": "LockLost"' in json.dumps(st)}
+    assert setters == {"TakeOverLock"}, setters
+    held["Choices"] = []
     after_load = states["LoadRun"]["Next"]
     without_release = _reachable(states, after_load, blocked=frozenset({"ReleaseLock"}))
     terminals = {n for n in without_release if states[n]["Type"] in TERMINAL}
     assert terminals == set(), f"terminal states reachable without ReleaseLock: {terminals}"
+
+
+def test_post_stops_when_it_cannot_take_the_lock_over():
+    """Review finding 8: post went on (post jobs, auto-resume) without the lock."""
+    states = render(POST)["States"]
+    catch = {e: c["Next"] for c in states["TakeOverLock"]["Catch"] for e in c["ErrorEquals"]}
+    assert catch == {"DynamoDb.ConditionalCheckFailedException": "LockLost", "States.ALL": "LockLost"}
+    assert _success_edges(states["TakeOverLock"]) == ["DeleteMigration"]
+    after = _reachable(states, "LockLost")
+    assert not after & {"DeleteMigration", "PostJobs", "ClassifyFailure", "HandOverLock", "StartResume"}
 
 
 def test_post_resumes_only_through_a_lock_hand_over():
@@ -711,7 +732,7 @@ def test_post_success_runs_post_jobs_reports_and_unlocks():
     run = run_post(post_mocks())
     assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
     assert run.path[:4] == ["LoadRun", "TakeOverLock", "DeleteMigration", "CheckOutcome"]
-    assert run.path[-4:] == ["Notify", "ReleaseLock", "Done", "Succeeded"]
+    assert run.path[-5:] == ["Notify", "CheckLockHeld", "ReleaseLock", "Done", "Succeeded"]
     load = run.called("LoadRun")[0]["Payload"]
     assert load["mode"] == "post" and load["input"] == POST_INPUT
     take = run.called("TakeOverLock")[0]
@@ -792,10 +813,23 @@ def test_post_load_failure_fails_without_touching_anything():
     assert run.path == ["LoadRun", "FailLoad"]
 
 
+@pytest.mark.parametrize(
+    "error", ["DynamoDb.ConditionalCheckFailedException", "DynamoDb.ThrottlingException", "States.Timeout"]
+)
+def test_post_without_the_lock_reports_manual_notifies_and_leaves_the_lock_alone(error):
+    """The lock names another run (or could not be read after the retries): post runs nothing,
+    reports MANUAL with a notification and never deletes a lock it does not hold."""
+    run = run_post(post_mocks(TakeOverLock=raises(error)))
+    assert (run.status, run.error) == ("FAILED", "LockLost"), (run.error, run.path)
+    assert run.called("WriteReport")[0]["Payload"]["status"] == "MANUAL"
+    assert run.called("Notify") and run.called("ReleaseLock") == []
+    assert run.called("DeleteMigration") == [] and run.called("RunPostJob") == []
+    assert run.called("ClassifyFailure") == [] and run.called("HandOverLock") == []
+
+
 def test_post_lock_bookkeeping_failures_do_not_stop_the_run():
     run = run_post(
         post_mocks(
-            TakeOverLock=raises("DynamoDb.ConditionalCheckFailedException"),
             DeleteMigration=raises("DynamoDb.ConditionalCheckFailedException"),
             ReleaseLock=raises("DynamoDb.ConditionalCheckFailedException"),
         )

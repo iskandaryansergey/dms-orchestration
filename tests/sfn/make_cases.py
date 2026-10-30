@@ -305,6 +305,12 @@ CASES: dict[str, dict[str, Any]] = {
         mock=err("StepFunctions.ExecutionAlreadyExistsException", "Execution already exists"),
         nextRunId="run-1-r2",
     ),
+    "post-lock-lost-stops": case(
+        "post",
+        "TakeOverLock",
+        {"status": "CAUGHT_ERROR", "nextState": "LockLost", "variables": {"finalStatus": "MANUAL"}},
+        mock=CONDITIONAL,
+    ),
     "post-hand-over-lost": case(
         "post",
         "HandOverLock",

@@ -78,14 +78,17 @@ the same name; `ExecutionAlreadyExists` counts as started.
 ```
 LoadRun (resolve_context, mode post: saved context + outcome) ──fail──► FailLoad (release_lock frees the lock)
   │
-TakeOverLock (LOCK# executionArn = this execution) ─► DeleteMigration     (best effort, never fail the run)
+TakeOverLock (LOCK# executionArn = this execution; condition runId = this run)
+  │      ── ConditionalCheckFailed or retries exhausted ──► LockLost ─► WriteReport (MANUAL) ─► Notify ─► Failed
+  │         (ReleaseLock skipped: the lock is not this run's)
+DeleteMigration     (best effort, never fail the run)
   │
 CheckOutcome ── failure ──► ClassifyFailure
   ▼
 PostJobs (Map) ──error──► ClassifyFailure
   │  finalStatus = SUCCEEDED
   ▼
-WriteReport ─► CheckNotify ─► Notify ─► ReleaseLock ─► Done ─► Succeeded | Failed
+WriteReport ─► CheckNotify ─► Notify ─► CheckLockHeld ─► ReleaseLock ─► Done ─► Succeeded | Failed
 
 ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock (LOCK# runId = <runId>-r<n+1>)
                                                   ─► StartResume (migrate, no .sync) ─► WriteReport (RESUMED)
@@ -103,8 +106,9 @@ ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock 
 * nothing destructive before every refusing check: `DumpJobs` and `ResetJobs` are reachable only
   through `CheckAssessment` (assessment passed or off) and the read-only Arm guard
   (`ReadMigration` → `ArmGuard`); `Arm` keeps its condition as the atomic write;
-* post: every terminal after `LoadRun` passes `ReleaseLock`; `StartResume` only after
-  `HandOverLock`, without `.sync`;
+* post: every terminal after `LoadRun` passes `ReleaseLock`, except after `LockLost` (only
+  `TakeOverLock` sets it); without the lock post runs no jobs and no resume; `StartResume` only
+  after `HandOverLock`, without `.sync`;
 * the lock-contention path never reaches `ReleaseLock`;
 * every `lambda:invoke` has the AWS-recommended Lambda retries and a Catch;
 * DynamoDB expressions alias reserved words; SDK attribute type names (`Bool`, not `BOOL`).
@@ -121,14 +125,14 @@ ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock 
 | migrate | `migration` | ReadMigration | `{status, runId}` of an existing `MIGRATION#` item (Arm guard) or null |
 | post | `dmsOutcome`, `failure` | LoadRun | DMS outcome from the handoff: success payload or `{Error, Cause}` |
 | post | `nextRunId` | CheckAutoResume | run id of the chained migrate |
-| both | `classification`, `finalStatus`, `report` | ClassifyFailure, several, WriteReport | category; STARTED, PLANNED, REJECTED, SUCCEEDED, RESUMED or FAILED; report |
+| both | `classification`, `finalStatus`, `report` | ClassifyFailure, several, WriteReport | category; STARTED, PLANNED, REJECTED, MANUAL, SUCCEEDED, RESUMED or FAILED; report |
 
 ## Retry and timeouts
 
 | State | Retry | On error |
 |---|---|---|
 | Lambda tasks | Lambda service errors, 6×, backoff 2, full jitter | ClassifyFailure (report states: still notify and unlock) |
-| AcquireLock / Arm / HandOverLock / ReleaseLock | DynamoDB throttling, 5× | contention → reject / classify; ReleaseLock errors → Done (safety nets clean up) |
+| AcquireLock / Arm / TakeOverLock / HandOverLock / ReleaseLock | DynamoDB throttling, 5× | contention → reject / classify; TakeOverLock → LockLost (MANUAL, lock left alone); ReleaseLock errors → Done (safety nets clean up) |
 | StartReplicationTask | `InvalidResourceStateException` 0×; other errors DMS answered (`States.TaskFailed`) 4×, ≤ 60 s; `States.Timeout` never (the start may have reached DMS) | InvalidResourceState or timeout → RecordStartError (the handoff judges the task); else Disarm and classify |
 | StartPostDryRun / StartResume | execution limit, timeout 3× | `ExecutionAlreadyExists` = already started |
 | Notify | 3× | ignored |
