@@ -258,14 +258,12 @@ CASES: dict[str, dict[str, Any]] = {
         "migrate",
         "CheckContextVersion",
         {"status": "SUCCEEDED", "nextState": "RecordContextVersion"},
-        mock={"result": {}},
         input_={"ETag": '"e"', "VersionId": "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"},
     ),
     "context-without-version-stops-before-dms": case(
         "migrate",
         "CheckContextVersion",
         {"status": "SUCCEEDED", "nextState": "ClassifyFailure"},
-        mock={"result": {}},
         input_={"ETag": '"e"'},
     ),
     "record-context-version": case(

@@ -70,9 +70,6 @@
   "input": {
     "ETag": "\"e\""
   },
-  "mock": {
-    "result": {}
-  },
   "expect": {
     "status": "SUCCEEDED",
     "nextState": "ClassifyFailure"

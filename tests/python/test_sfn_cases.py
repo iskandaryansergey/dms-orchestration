@@ -85,6 +85,24 @@ def test_generated_cases_are_up_to_date():
         assert path.exists() and json.loads(path.read_text()) == body, f"run tests/sfn/make_cases.py ({name})"
 
 
+def test_cases_mock_only_task_states():
+    """Seen live: AWS TestState refuses a mock on a Choice ("State type 'Choice' is not supported
+    when a mock is specified"); only Task states take one."""
+    for path in CASES:
+        case = json.loads(path.read_text())
+        state = render(case["definition"])["States"][case["state"]]
+        assert "mock" not in case or state["Type"] == "Task", path.stem
+
+
+def test_mocked_ssm_command_ids_have_the_api_length():
+    """Seen live: TestState validates a mock against the API schema ("Field 'CommandId' is smaller
+    than the minimum length"); SSM command ids are 36 characters."""
+    for path in CASES:
+        result = (json.loads(path.read_text()).get("mock") or {}).get("result") or {}
+        command_id = (result.get("Command") or {}).get("CommandId", result.get("CommandId"))
+        assert command_id is None or len(command_id) == 36, path.stem
+
+
 def test_teststate_requests_send_context_only_with_a_mock():
     """Seen live: AWS TestState refuses a context when no mock is given ("TestState does not support
     context when a mock is not specified"); the Choice-state cases carry one."""

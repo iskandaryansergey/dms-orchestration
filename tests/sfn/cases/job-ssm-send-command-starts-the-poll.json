@@ -29,7 +29,7 @@
   "mock": {
     "result": {
       "Command": {
-        "CommandId": "cmd-1",
+        "CommandId": "0f2c4a1e-7b3d-4e5f-9a6b-1c2d3e4f5a6b",
         "Status": "Pending"
       }
     }
@@ -38,7 +38,7 @@
     "status": "SUCCEEDED",
     "nextState": "WaitSsm",
     "variables": {
-      "ssmCommandId": "cmd-1",
+      "ssmCommandId": "0f2c4a1e-7b3d-4e5f-9a6b-1c2d3e4f5a6b",
       "ssmInstanceId": "i-0bbb",
       "ssmStatus": "Pending",
       "ssmPolls": 0

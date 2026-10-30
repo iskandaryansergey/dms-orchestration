@@ -71,9 +71,6 @@
     "ETag": "\"e\"",
     "VersionId": "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"
   },
-  "mock": {
-    "result": {}
-  },
   "expect": {
     "status": "SUCCEEDED",
     "nextState": "RecordContextVersion"
