@@ -408,14 +408,18 @@ def s2() -> bool:
     )
 
 
-def interrupt_load() -> None:
+def interrupt_load(arn: str | None = None) -> bool:
     """Interrupt the load from outside. On Aurora the 235k rows load in ~12 s, faster than
     DMS starts accepting StopReplicationTask (seen live: the stop landed after the load
     finished). So once DMS starts, hold a SHARE lock on the biggest target table (its
     inserts wait), stop the task, and keep the lock until DMS gives the task up: that
     table is then certainly not loaded. StopReplicationTask itself is the probe of
-    "really running" (Describe lags, docs/dms-observations.md)."""
+    "really running" (Describe lags, docs/dms-observations.md). Returns False without touching
+    anything when the run ``arn`` ends before DMS starts (a run refused up front)."""
     while task()["Status"] not in ("starting", "running"):
+        if arn and (_describe(arn) or {}).get("status") not in (None, "RUNNING"):
+            print("the run ended before DMS started: nothing to interrupt")
+            return False
         time.sleep(2)
     hold = sandbox.connect(OUT, "target")
     try:
@@ -436,6 +440,7 @@ def interrupt_load() -> None:
         hold.run("ROLLBACK")
         hold.close()
     print("released the lock at", datetime.now(UTC).isoformat())
+    return True
 
 
 def s3() -> bool:
@@ -1339,6 +1344,8 @@ def s17_lock_lost() -> bool:
     taken = False
     deadline = time.monotonic() + 900
     while time.monotonic() < deadline and not taken:
+        if (_describe(run["arn"]) or {}).get("status") not in (None, "RUNNING"):
+            break  # the run ended before DMS started
         if task()["Status"] in ("starting", "running"):
             TABLE.update_item(
                 Key={"pk": f"LOCK#{OUT['task_arn']}", "sk": "LOCK"},
@@ -1382,10 +1389,14 @@ def s18_recheck() -> bool:
         operation="migrate", startType="reload-target", targetReset={"policy": "always"}, jobsVersion="e2e-recheck"
     )
     deadline = time.monotonic() + 600
-    while time.monotonic() < deadline and not events_with(run["runId"], '"hold"'):
+
+    def running() -> bool:
+        return (_describe(run["arn"]) or {}).get("status") in (None, "RUNNING")
+
+    while time.monotonic() < deadline and running() and not events_with(run["runId"], '"hold"'):
         time.sleep(3)
     started_by_hand = False
-    while not started_by_hand and time.monotonic() < deadline:
+    while not started_by_hand and time.monotonic() < deadline and running():
         try:
             DMS.start_replication_task(ReplicationTaskArn=OUT["task_arn"], StartReplicationTaskType="reload-target")
             started_by_hand = True
@@ -1424,9 +1435,9 @@ def s19_chain_dump() -> bool:
         targetReset={"policy": "if-interrupted"},
         jobsVersion="e2e-ssm",
         dump={"enabled": True},
-        autoResume={"maxAttempts": 1, "categories": ["EXTERNAL_STOP"]},
+        autoResume={"maxAttempts": 1, "onlyCategories": ["EXTERNAL_STOP"]},
     )
-    interrupt_load()
+    interrupt_load(run["arn"])
     d = wait(run, timeout=3600)
     first, last = run["runId"], d["runId"]
     j1, j2 = jobs(first), jobs(last)
