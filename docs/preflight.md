@@ -18,8 +18,8 @@ InspectTask ─► TargetVerify (job-runner, builtin checks/target_verify) ─�
   summary (`src/shared/fingerprint.py`); `auto` (default) takes Fargate when the last baseline
   had more than `fargateAboveTables` (500) tables or a database above `fargateAboveBytes`
   (50 GiB), or the target has no Data API, provided the image exists, else the Lambda. With
-  neither the Data API nor the image no check runs: the verdict comes from the DMS state alone
-  and the report says so.
+  neither the Data API nor the image no check runs and there is no fingerprint: see
+  [Without a fingerprint](#without-a-fingerprint).
 * The scope is the task's table mapping (selection rules, include/exclude, `%`). Objects in the
   scanned schemas that the rules do not select are listed as warnings and left alone.
 * The expectation comes from the source catalogue (connection `source` with the Data API),
@@ -32,12 +32,39 @@ InspectTask ─► TargetVerify (job-runner, builtin checks/target_verify) ─�
 | `ready` | runs | first run, target empty in scope | — |
 | `resume` | runs | interrupted (or a CDC resume) and the target equals the baseline of the last run | — |
 | `prepare` | runs | tables missing; pre-jobs run, then the target is checked again | — |
-| `reset` | runs | the target was dirty and `allowReset` was given: truncate every table in scope, then `reload-target` (`start-replication` for a new task) | check the report: `decision.resetTables` |
+| `reset` | runs | the target was dirty and `allowReset` was given: truncate every table in scope (see [Reset scope](#reset-scope)), then `reload-target` (`start-replication` for a new task) | check the report: `decision.resetTables` / `resetTablesCount` |
 | `manual` | `MANUAL` (failed, severity high) | `TargetNotEmpty`, `TargetChanged`, `AlreadyCompleted`, `PreflightTablesMissing` or `ResetNotConfigured`; the report has the diff | find out who changed the target; then either undo it or run again with `--allow-reset` |
 | `manual` | `MANUAL` | `RestoredTarget`: the target was restored from a dump (`orch.py restore`) and DMS still reports loaded tables, so a resume would skip them | run again with `--allow-reset` (full `reload-target`, `RUNBOOK.md` §11) |
+| `manual` | `MANUAL` | `NoFingerprint`: no target check ran, so nothing says what is in the target; a reset (`allowReset`) or a first run would act on an unchecked target | give the target a check (connection `target` with the Data API, or the sql-runner image); for a first run only, `preflight.allowNoFingerprint` |
 | `reject` | `REJECTED` | the task is running, busy or needs attention | as before |
 
 `plan` runs the check and reports the verdict without running anything.
+
+## Without a fingerprint
+
+* `allowReset` never resets without a fingerprint: the verdict is `manual` / `NoFingerprint`.
+* A fresh task (first run) is `manual` / `NoFingerprint`, unless the request sets
+  `preflight.allowNoFingerprint: true`: then it is `ready` (with a warning) and still never reset.
+* An interrupted task resumes on the DMS decision, with a warning; its partial-table reset is
+  the DMS `targetReset` policy, as before.
+
+## Reset scope
+
+A `reset` truncates the tables of the target fingerprint that the task's selection rules select
+(include/exclude, `%`), not the DMS table statistics. Above 500 tables the list goes to
+`<run prefix>/inspect/reset-tables.json` in the artifacts bucket: the decision carries
+`resetTables: []`, `resetTablesCount` and `resetTablesUri`, and `prepare_job` expands the list
+into the job's `spec.json` only. The reset job reads it there:
+
+```yaml
+reset:
+  - name: truncate-tables
+    command: [psql-run, --connection, target, --truncate-scope]
+```
+
+`--truncate-scope` checks the list against `resetTablesCount`. A `{{ ctx.resetTables }}` template
+works up to 500 tables; above that `prepare_job` refuses it (`InvalidJobSet`), as it would carry
+the whole list through the state payload. The report and the verdict reason give the full count.
 
 ## Baseline
 

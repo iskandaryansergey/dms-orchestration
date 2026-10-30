@@ -45,7 +45,7 @@ phases:
   reset:
     - name: truncate-tables
       description: empty partially loaded tables (resume) or all tables (reload-target) to avoid duplicates
-      command: [psql-run, --connection, target, --truncate, "{{ ctx.resetTables }}"]
+      command: [psql-run, --connection, target, --truncate-scope]   # ctx.resetTables of the spec file, any size
       retry: { maxAttempts: 2, backoffSeconds: 30 }
 
   post:
