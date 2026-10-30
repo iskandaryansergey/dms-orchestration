@@ -57,6 +57,7 @@ Metadata and secret ARNs only, never secret values. Every `secret_arn` must also
 | `auto_resume_max_attempts` | `1` | how many times a run resumes by itself after a retryable failure |
 | `auto_resume_categories` | `TRANSIENT_SOURCE_CONN`, `TRANSIENT_TARGET_CONN`, `DMS_RESTART` | failure categories that may resume by themselves |
 | `fail_on_table_errors` | `true` | a load that finishes with tables in error fails the run instead of `COMPLETED_WITH_TABLE_ERRORS` |
+| `fail_on_validation_errors` | `true` | DMS validation mismatches (`ValidationState` not `Validated`, failed records or full-load error rows) fail the run instead of `COMPLETED_WITH_VALIDATION_ERRORS` |
 | `dump_before_reset` | `false` | take a target dump before every reset (as `dump.enabled` in the request) |
 | `snapshot_dumps` | `false` | allow `dump.method = snapshot`: grants the job role cluster snapshot rights; needs `connections.target.cluster_arn` (or `data_api_cluster_arn`) |
 
