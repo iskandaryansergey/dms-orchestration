@@ -1443,3 +1443,24 @@ def test_run_request_accepts_allow_no_fingerprint():
     validation.validate(
         "run_request", {"project": "ledger", "taskKey": "core", "preflight": {"allowNoFingerprint": True}}
     )
+
+
+def test_write_report_counts_a_reset_list_kept_in_s3(env, store):
+    from lambdas.write_report.handler import handler
+
+    store.put_run("run-1", {"project": "ledger", "status": "RUNNING"})
+    use(dms=FakeDms(FINISHED))
+    decision = {"action": "start", "resetScope": "all", "resetTables": [], "resetTablesCount": 600}
+    handler(
+        {
+            "runId": "run-1",
+            "status": "SUCCEEDED",
+            "request": {"project": "ledger", "taskKey": "core", "notify": {}},
+            "ctx": {"taskArn": TASK_ARN},
+            "inspect": {"state": "completed", "decision": decision},
+            "started": True,
+            "attempt": 1,
+        }
+    )
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-1/report.md")["Body"].read().decode()
+    assert "- Target reset: all (600 tables)" in md

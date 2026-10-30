@@ -1012,6 +1012,22 @@ def test_reset_verdict_replaces_the_decision_and_feeds_the_reset_jobs():
     assert run.called("StartReplicationTask")[0]["StartReplicationTaskType"] == "reload-target"
 
 
+def test_a_reset_list_in_s3_reaches_the_reset_jobs_as_count_and_uri():
+    uri = "s3://b/runs/r/inspect/reset-tables.json"
+    reset = decision(
+        start_type="reload-target",
+        reset=True,
+        resetScope="all",
+        resetTables=[],
+        resetTablesCount=600,
+        resetTablesUri=uri,
+    )
+    run = run_migrate(migrate_mocks(Preflight=payload(verdict("reset", dec=reset))))
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    ctx = run.called("RunResetJob")[0]["Input"]["ctx"]
+    assert (ctx["resetTables"], ctx["resetTablesCount"], ctx["resetTablesUri"]) == ([], 600, uri)
+
+
 def test_prepare_runs_the_pre_jobs_then_checks_again_once():
     mocks = migrate_mocks(Preflight=sequence({"Payload": verdict("prepare")}, {"Payload": verdict("ready")}))
     mocks["ResolveContext"] = payload({"runId": "run-1", "request": request(), "ctx": ctx_with_check(), "attempt": 1})

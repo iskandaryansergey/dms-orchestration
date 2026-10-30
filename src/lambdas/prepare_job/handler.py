@@ -8,7 +8,11 @@
 * adds the project's job role (``jobRoleArn``): the Fargate task role and the role
   built-in jobs assume, the only roles that can read the project's secrets;
 * writes the full job spec to ``s3://<bucket>/runs/<runId>/jobs/<phase>/<nn>-<name>/spec.json``
-  (Fargate jobs read it via ORCH_JOB_SPEC_S3; it never contains secret values).
+  (Fargate jobs read it via ORCH_JOB_SPEC_S3; it never contains secret values);
+* expands a reset list kept in S3 (``ctx.resetTablesUri``, above the payload cap) into
+  ``spec.json`` only: the state payload keeps ``resetTables`` empty and ``resetTablesCount``.
+  Such a job reads the list from its spec (``psql-run --truncate-scope``); a ``{{ ctx.resetTables }}``
+  template is refused, it would carry the whole list through the payload.
 
 Input: ``{"job", "phase", "runId", "dryRun", "ctx", "failure"}``. Output: ``{"spec": {...}}``.
 """
@@ -19,7 +23,7 @@ import json
 from typing import Any
 
 from shared import aws, expr, log
-from shared.errors import InvalidJobSet
+from shared.errors import InvalidJobSet, JobFailed
 from shared.store import Store
 
 LOGGER = log.get_logger("prepare_job")
@@ -35,6 +39,22 @@ def previous_results(store: Store, run_id: str) -> dict[str, dict[str, Any]]:
             "attempt": item.get("attempt"),
         }
     return out
+
+
+def expand_reset_tables(ctx: dict[str, Any]) -> dict[str, Any]:
+    """ctx with the full reset list when inspect_task put it in S3 (``resetTablesUri``)."""
+    uri = ctx.get("resetTablesUri")
+    if not uri:
+        return ctx
+    bucket = aws.env("ARTIFACTS_BUCKET")
+    if not str(uri).startswith(f"s3://{bucket}/"):
+        raise JobFailed(f"reset list {uri} is not in the artifacts bucket")
+    key = str(uri).removeprefix(f"s3://{bucket}/")
+    tables = json.loads(aws.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()).get("resetTables")
+    count = int(ctx.get("resetTablesCount") or 0)
+    if not isinstance(tables, list) or len(tables) != count:
+        raise JobFailed(f"reset list {uri}: {len(tables or [])} table(s), the decision says {count}")
+    return {**ctx, "resetTables": tables}
 
 
 def resolve_target(job: dict[str, Any]) -> dict[str, Any]:
@@ -58,7 +78,8 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
     job = event["job"]
     phase = event["phase"]
     run_id = event["runId"]
-    ctx = event.get("ctx") or {}
+    payload_ctx = event.get("ctx") or {}
+    ctx = expand_reset_tables(payload_ctx)
     dry_run = bool(event.get("dryRun"))
     index = int(job.get("index", 0))
     base = f"runs/{run_id}/jobs/{phase}/{index:02d}-{job['name']}"
@@ -98,6 +119,11 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
         spec.update(skip=True, skipReason=f"when is false: {job.get('when')}")
         return {"spec": spec}
 
+    if ctx is not payload_ctx and "ctx.resetTables" in json.dumps([job.get("command"), job.get("with")]):
+        raise InvalidJobSet(
+            f"job {job['name']}: {ctx['resetTablesCount']} tables to reset, the list is in S3; "
+            "use psql-run --truncate-scope instead of {{ ctx.resetTables }}"
+        )
     try:
         spec["with"] = expr.render(job.get("with") or {}, scope)
         spec["command"] = expr.render_command(job.get("command") or [], scope)
@@ -125,6 +151,7 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
         Body=json.dumps(spec, indent=2, default=str).encode(),
         ContentType="application/json",
     )
+    spec["ctx"] = payload_ctx  # the full reset list stays in spec.json
     return {"spec": spec}
 
 

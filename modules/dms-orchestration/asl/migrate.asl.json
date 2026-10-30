@@ -282,7 +282,7 @@
       "Assign": {
         "preflight": "{% $states.result.Payload %}",
         "decision": "{% $states.result.Payload.decision %}",
-        "jobCtx": "{% $merge([$jobCtx, {'startType': $states.result.Payload.decision.startType, 'resetScope': $states.result.Payload.decision.resetScope, 'resetTables': $states.result.Payload.decision.resetTables}]) %}"
+        "jobCtx": "{% $merge([$jobCtx, {'startType': $states.result.Payload.decision.startType, 'resetScope': $states.result.Payload.decision.resetScope, 'resetTables': $states.result.Payload.decision.resetTables, 'resetTablesCount': $states.result.Payload.decision.resetTablesCount, 'resetTablesUri': $states.result.Payload.decision.resetTablesUri}]) %}"
       },
       "Next": "CheckVerdict"
     },
