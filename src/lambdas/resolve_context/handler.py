@@ -28,7 +28,16 @@ from typing import Any
 from botocore.exceptions import ClientError
 
 from shared import aws, jobset, log, validation
-from shared.errors import ContextNotPinned, InvalidRunRequest, JobSetNotFound, RunAlreadyActive, UnknownTask
+from shared import bundle as bundle_hash
+from shared.errors import (
+    ContextNotPinned,
+    InvalidRunRequest,
+    JobSetNotFound,
+    JobSetNotPinned,
+    JobSetTampered,
+    RunAlreadyActive,
+    UnknownTask,
+)
 from shared.store import Store, now_iso, run_prefix
 
 LOGGER = log.get_logger("resolve_context")
@@ -46,15 +55,59 @@ def load_registration(project: str, task_key: str) -> dict[str, Any]:
     return json.loads(value)
 
 
-def load_jobs(bucket: str, prefix: str, version: str, job_set: str) -> dict[str, list[dict[str, Any]]]:
-    key = f"{prefix.strip('/')}/{version}/{jobset.jobset_file_name(job_set)}"
+def _get(bucket: str, key: str) -> bytes | None:
     try:
-        body = aws.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+        return aws.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
     except ClientError as err:
         if err.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "AccessDenied"):
-            raise JobSetNotFound(f"job set not found at s3://{bucket}/{key} (run scripts/sync-jobs.sh)") from err
+            return None
         raise
-    return jobset.normalize(json.loads(body))
+
+
+def load_jobs(
+    bucket: str, prefix: str, version: str, job_set: str, jobs_cfg: dict[str, Any] | None = None
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any] | None]:
+    """The job set of one version, checked against the bundle hash Terraform registered.
+
+    ``jobs_cfg`` is the registration's ``jobs`` block: ``bundles`` maps a version to the total of
+    its ``bundle.sha256`` (``jobset_tool.py hash``); ``allowUnpinned`` lets a version run without
+    one (sandbox). A registered hash is always enforced. Returns the jobs, each stamped with
+    ``bundleSha256`` for the runtimes, and ``{"sha256", "files", "pinned"}`` (None: no manifest,
+    only when unpinned runs are allowed).
+    """
+    cfg = jobs_cfg or {}
+    pinned = (cfg.get("bundles") or {}).get(version)
+    if not pinned and not cfg.get("allowUnpinned"):
+        raise JobSetNotPinned(
+            f"job set version {version!r} has no bundle hash in the task registration "
+            "(projects.<p>.tasks.<t>.jobs.bundles; jobset_tool.py hash <bundle-dir>)"
+        )
+    base = f"{prefix.strip('/')}/{version}"
+    key = f"{base}/{jobset.jobset_file_name(job_set)}"
+    manifest = _get(bucket, f"{base}/{bundle_hash.MANIFEST}")
+    body = _get(bucket, key)
+    if body is None:
+        raise JobSetNotFound(f"job set not found at s3://{bucket}/{key} (run scripts/sync-jobs.sh)")
+    pin: dict[str, Any] | None = None
+    if manifest is None:
+        if pinned:
+            raise JobSetTampered(
+                f"s3://{bucket}/{base}/ has no {bundle_hash.MANIFEST}, but version {version} is pinned"
+            )
+    else:
+        files, total = bundle_hash.parse(manifest.decode("utf-8", errors="replace"))
+        if pinned and total != pinned:
+            raise JobSetTampered(
+                f"s3://{bucket}/{base}/ does not match the bundle hash pinned for version {version} "
+                f"(registered {pinned[:12]}…, found {total[:12]}…)"
+            )
+        bundle_hash.verify(jobset.jobset_file_name(job_set), body, files)
+        pin = {"sha256": total, "files": files, "pinned": bool(pinned)}
+    jobs = jobset.normalize(json.loads(body))
+    for items in jobs.values():
+        for job in items:
+            job["bundleSha256"] = pin["sha256"] if pin else None
+    return jobs, pin
 
 
 FARGATE_ABOVE_TABLES = 500
@@ -256,7 +309,11 @@ def build(request: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
     jobs_cfg = reg.get("jobs") or {}
     jobs_prefix = jobs_cfg.get("s3Prefix") or f"jobs/{req['project']}"
     jobs_version = req.get("jobsVersion") or jobs_cfg.get("defaultVersion")
-    jobs = load_jobs(bucket, jobs_prefix, jobs_version, req["jobSet"]) if jobs_version else jobset.empty_jobs()
+    jobs, jobs_bundle = (
+        load_jobs(bucket, jobs_prefix, jobs_version, req["jobSet"], jobs_cfg)
+        if jobs_version
+        else (jobset.empty_jobs(), None)
+    )
     options = req.get("preflight") or {}
     baseline = Store(aws.table()).get_target_baseline(f"{req['project']}/{req['taskKey']}")
     images = json.loads(aws.env("FARGATE_IMAGES", "[]"))
@@ -283,6 +340,7 @@ def build(request: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
         "jobsVersion": jobs_version,
         "jobsS3Prefix": f"s3://{bucket}/{jobs_prefix.strip('/')}/{jobs_version}/" if jobs_version else None,
         "jobs": jobs,
+        "jobsBundle": jobs_bundle,
         "runTimeoutSeconds": int(defaults.get("runTimeoutSeconds", 604800)),
         "executionArn": execution.get("arn"),
         "assessment": assessment_settings(reg.get("assessment"), req.get("assessment") or {}),
@@ -384,8 +442,12 @@ def repeat_post(data: dict[str, Any], saved: dict[str, Any], execution: dict[str
         prefix = f"jobs/{ctx['project']}"
         if ctx.get("jobsS3Prefix"):
             prefix = ctx["jobsS3Prefix"].removeprefix(f"s3://{bucket}/").rstrip("/").rsplit("/", 1)[0]
-        fresh = load_jobs(bucket, prefix, version, (saved.get("request") or {}).get("jobSet", "default"))
+        jobs_cfg = load_registration(ctx["project"], ctx["taskKey"]).get("jobs") or {}
+        fresh, fresh_bundle = load_jobs(
+            bucket, prefix, version, (saved.get("request") or {}).get("jobSet", "default"), jobs_cfg
+        )
         ctx["jobs"] = {**(ctx.get("jobs") or {}), "post": fresh["post"], "on_failure": fresh["on_failure"]}
+        ctx["jobsBundle"] = fresh_bundle
         ctx["jobsVersion"] = version
         ctx["jobsS3Prefix"] = f"s3://{bucket}/{prefix}/{version}/"
     jobs = (ctx.get("jobs") or {}).get("post") or []
