@@ -177,6 +177,7 @@ Pre-flight verdicts on top of this table (dirty target → `manual`, `allowReset
 | DMS | Result |
 |---|---|
 | stopped, `FULL_LOAD_ONLY_FINISHED` | `COMPLETED` (or `COMPLETED_WITH_TABLE_ERRORS`; fails `DmsTableErrors` with `failOnTableErrors`, the default) |
+| load finished, a table not validated (validation on), `ValidationFailedRecords > 0` or `FullLoadErrorRows > 0` | fails `DmsValidationErrors` with `failOnValidationErrors` (the default, `defaults.fail_on_validation_errors`); with it off `COMPLETED_WITH_VALIDATION_ERRORS`, a success that lists the tables |
 | stopped, `STOPPED_AFTER_FULL_LOAD` / `CACHED_EVENTS` / `DDL_APPLY` / `AT_SERVER_TIME` / `AT_COMMIT_TIME` | `STOPPED_AT_CHECKPOINT` |
 | stopped, `NORMAL` (not requested) | `DmsTaskStoppedUnexpectedly` |
 | stopped, `RECOVERABLE_ERROR` / `FATAL_ERROR` / low memory / low disk | `DmsTaskFailed` |
@@ -198,9 +199,13 @@ Init ─► PrepareJob ──error──► JobFailed
           │
 CheckSkip ── when false ──► RecordJob (skipped)
           │
-CheckRuntime ── lambda ──► InvokeLambdaJob ─────────────────────────────┐
-             └─ fargate ─► RunFargateJob ─► FetchFargateResult ─► Normalize ─┤
-                                                                          ▼
+CheckRuntime ── lambda ──► InvokeLambdaJob (built-in or sql_jobs) ─────────────────────┐
+             ── ssm ─────► FindSsmRunner ─► CheckSsmRunner ── none online ──────────────┤
+             │             ─► RunSsmJob (sendCommand, module document) ─► WaitSsm (30 s)  │
+             │             ─► GetSsmInvocation ─► CheckSsmStatus ── pending ─► WaitSsm    │
+             │                                    ── terminal or poll limit ─► FetchSsmResult ─► Normalize ─┤
+             └─ fargate ─► RunFargateJob ─► FetchFargateResult ─► Normalize ──────────────┤
+                                                                                        ▼
                                                   RecordJob (JOB# item) ─► CheckStatus
 CheckStatus ── ok | warn | skipped ─────────────────► JobSucceeded
             ── fail, attempt < max, idempotent ─────► WaitBeforeRetry (backoff) ─► CheckRuntime
@@ -209,7 +214,11 @@ CheckStatus ── ok | warn | skipped ─────────────�
 ```
 
 A Fargate job is `fail` when the container exit code is non-zero or ECS failed, whatever
-`result.json` says; no `result.json` is also a failure.
+`result.json` says; no `result.json` is also a failure. An SSM job is the same: the invocation
+status and `result.json` from S3 decide; the poll stops at the job timeout plus 900 s, and a
+retry takes the next online runner. `sql` jobs run in the `sql_jobs` Lambda (pg8000 over
+verified TLS, read-only sessions in a dry run); routing and runtimes:
+[job contract](job-contract.md), [ADR 0011](adr/0011-job-runtimes.md).
 
 ## Testing
 

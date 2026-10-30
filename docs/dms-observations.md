@@ -226,9 +226,13 @@ input and must take the "already started" branch (`WriteReport`, `RESUMED`), not
   posts came from `event-handler`.
 * **PostgreSQL 17 client, Aurora 16 server:** `pg_restore` writes `\restrict <key>` and
   `SET transaction_timeout = 0;` in the SQL header; Aurora 16 refuses the parameter. The restore
-  pipes `pg_restore -f -` into `psql --single-transaction` and drops that header line.
-* **Every `terraform apply` resets the target's `MaxFileSize` to 0** (the upstream dms module, contract 2.6)
-  and with it the connection status: `sbx test-connections` after each apply.
+  drops that header line. `psql --single-transaction` does not wrap a script read from stdin,
+  so the restore sends `BEGIN;` first and `COMMIT;` only after `pg_restore` exited 0
+  (`ROLLBACK;` otherwise).
+* **`terraform apply` reset the target's `MaxFileSize` to 0** with upstream dms modules before
+  commit `08def61` (contract 2.6), and with it the connection status; from that commit on an
+  apply keeps the setting. The orchestrator still refuses a PostgreSQL target endpoint with
+  `MaxFileSize = 0` before the start (outside `plan`), as a safety check.
 * **TestState** against AWS: 25/25 cases (AWS refuses a `context` without a mock). The
   error name `StepFunctions.ExecutionAlreadyExistsException` is only mocked in those cases, not
   seen from a real call.
