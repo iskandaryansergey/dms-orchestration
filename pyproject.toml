@@ -1,6 +1,6 @@
 [project]
 name = "dms-orchestration"
-version = "0.1.0"
+version = "0.2.0"
 description = "AWS DMS orchestration on Step Functions: Lambda code, job runner, CLI"
 license = "MIT"
 license-files = ["LICENSE"]

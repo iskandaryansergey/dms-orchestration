@@ -28,6 +28,35 @@ def matrix_scenarios() -> list[str]:
     return [re.match(r"\| `([^`]+)`", ln).group(1) for ln in rows]
 
 
+def planned_scenarios() -> list[str]:
+    """First cells of the table under '## Planned scenarios': named, not yet in e2e.py."""
+    text = TESTING.read_text(encoding="utf-8")
+    section = text.split("## Planned scenarios", 1)[1].split("\n## ", 1)[0]
+    rows = [ln for ln in section.splitlines() if ln.startswith("| `")]
+    return [re.match(r"\| `([^`]+)`", ln).group(1) for ln in rows]
+
+
+# Scenarios the 0.2 changes call for; each is either in e2e.py (and the matrix) or planned.
+SCENARIOS_0_2 = {
+    "s1ssm",
+    "dry-ro",
+    "s4big",
+    "s17-lock-lost",
+    "s18-recheck",
+    "s19-chain-dump",
+    "s20-tampered-jobset",
+    "s21-validation",
+}
+
+
+def test_planned_scenarios_are_not_in_e2e_and_cover_the_0_2_changes():
+    planned = planned_scenarios()
+    assert len(planned) == len(set(planned)), "a scenario is planned twice"
+    names = e2e_scenarios()
+    assert set(planned) & names == set(), "implemented scenarios belong in the matrix, not the plan"
+    assert SCENARIOS_0_2 - names - set(planned) == set(), "a 0.2 scenario is neither run nor planned"
+
+
 def test_e2e_parser_finds_the_known_scenarios():
     names = e2e_scenarios()
     assert {"s1", "s1p", "idem-sfn", "s10snap", "s8fargate", "s1iam", "postdie", "s16"} <= names
