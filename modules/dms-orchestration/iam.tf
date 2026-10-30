@@ -367,12 +367,6 @@ locals {
         Resource = ["${aws_cloudwatch_log_group.lambda["builtin_jobs"].arn}:*"]
       },
       {
-        Sid      = "WriteJobArtifacts"
-        Effect   = "Allow"
-        Action   = ["s3:PutObject"]
-        Resource = ["${local.bucket_arn}/runs/*"]
-      },
-      {
         # checks/target_verify after orch.py restore records the target baseline (ADR 0006);
         # TARGET# items only, nothing else in the table.
         Sid      = "RecordRestoreBaseline"
@@ -426,11 +420,13 @@ locals {
   ecs_task_policy = {
     Version = "2012-10-17"
     Statement = concat([
+      # Default task role only: the job-runner always overrides it with the project's job
+      # role (Overrides.TaskRoleArn), which alone reaches runs/<project>/*/jobs/*.
       {
         Sid      = "ReadJobBundles"
         Effect   = "Allow"
         Action   = ["s3:GetObject"]
-        Resource = ["${local.bucket_arn}/jobs/*", "${local.bucket_arn}/runs/*"]
+        Resource = ["${local.bucket_arn}/jobs/*"]
       },
       {
         Sid       = "ListJobBundles"
@@ -438,12 +434,6 @@ locals {
         Action    = ["s3:ListBucket"]
         Resource  = [local.bucket_arn]
         Condition = { StringLike = { "s3:prefix" = ["jobs/*"] } }
-      },
-      {
-        Sid      = "WriteJobResults"
-        Effect   = "Allow"
-        Action   = ["s3:PutObject"]
-        Resource = ["${local.bucket_arn}/runs/*"]
       },
     ], local.kms_statements)
   }
@@ -458,7 +448,8 @@ locals {
     }]
   }
 
-  # Not attached: for the caller's operator role (CLI / CI) in each environment.
+  # Not attached: for the caller's operator role (CLI / CI) in each environment. It runs
+  # migrations; publishing job sets is jobset_publisher_policies (review finding 2).
   operator_policy = {
     Version = "2012-10-17"
     Statement = concat([
@@ -475,16 +466,11 @@ locals {
         Resource = [local.migrate_executions_arn, local.post_executions_arn, local.job_runner_executions_arn]
       },
       {
+        # runs/<project>/<runId>/report.json|md (orch.py report)
         Sid      = "ReadReports"
         Effect   = "Allow"
         Action   = ["s3:GetObject"]
-        Resource = ["${local.bucket_arn}/runs/*"]
-      },
-      {
-        Sid      = "SyncJobSets"
-        Effect   = "Allow"
-        Action   = ["s3:PutObject", "s3:ListBucket"]
-        Resource = [local.bucket_arn, "${local.bucket_arn}/jobs/*"]
+        Resource = ["${local.bucket_arn}/runs/*/report.json", "${local.bucket_arn}/runs/*/report.md"]
       },
       {
         # orch.py dumps: manifests only; the dumps themselves are read by the project job role
@@ -513,6 +499,14 @@ locals {
         Resource = local.table_arns
       },
       {
+        # orch.py restore holds the task lock (LOCK#<taskArn>) like a run; no other item.
+        Sid       = "TaskLock"
+        Effect    = "Allow"
+        Action    = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+        Resource  = [local.table_arn]
+        Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["LOCK#*"] } }
+      },
+      {
         Sid      = "StopDmsTasks"
         Effect   = "Allow"
         Action   = ["dms:StopReplicationTask"]
@@ -525,6 +519,32 @@ locals {
         Resource = "*"
       },
     ], local.kms_statements)
+  }
+}
+
+locals {
+  # Not attached: one policy per project for whoever publishes that project's job sets
+  # (scripts/sync-jobs.sh). Job set code runs with the project's job role, so uploading it
+  # is a separate grant from running migrations (review finding 2).
+  jobset_publisher_policies = {
+    for p in keys(var.projects) : p => {
+      Version = "2012-10-17"
+      Statement = concat([
+        {
+          Sid      = "PublishJobSets"
+          Effect   = "Allow"
+          Action   = ["s3:PutObject"]
+          Resource = [for prefix in local.project_job_prefixes[p] : "${local.bucket_arn}/${prefix}/*"]
+        },
+        {
+          Sid       = "ListJobSets"
+          Effect    = "Allow"
+          Action    = ["s3:ListBucket"]
+          Resource  = [local.bucket_arn]
+          Condition = { StringLike = { "s3:prefix" = [for prefix in local.project_job_prefixes[p] : "${prefix}/*"] } }
+        },
+      ], local.kms_statements)
+    }
   }
 }
 

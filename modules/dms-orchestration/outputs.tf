@@ -18,7 +18,7 @@ output "table_arn" {
 }
 
 output "artifacts_bucket" {
-  description = "Bucket for job sets (jobs/<project>/<version>/) and run reports (runs/<runId>/)."
+  description = "Bucket for job sets (jobs/<project>/<version>/) and run artifacts (runs/<project>/<runId>/)."
   value       = local.bucket_name
 }
 
@@ -53,8 +53,13 @@ output "ssm_parameter_names" {
 }
 
 output "operator_policy_json" {
-  description = "IAM policy for the operator role (CLI / CI): start, watch and stop runs, read reports, sync job sets. Not attached by the module."
+  description = "IAM policy for the operator role (CLI / CI): start, watch and stop runs, read reports, restore under the task lock. No job set uploads (jobset_publisher_policy_json). Not attached by the module."
   value       = jsonencode(local.operator_policy)
+}
+
+output "jobset_publisher_policy_json" {
+  description = "IAM policy per project for whoever publishes that project's job sets (scripts/sync-jobs.sh): write and list jobs/<project>/ only. Not attached by the module."
+  value       = { for p, pol in local.jobset_publisher_policies : p => jsonencode(pol) }
 }
 
 output "kms_key_policy_requirements" {

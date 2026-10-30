@@ -6,7 +6,7 @@
 # clusters and job-set prefixes live on a role per project:
 #   * Fargate jobs get it as the task role (RunTask Overrides.TaskRoleArn);
 #   * built-in Lambda jobs assume it (sts:AssumeRole) for their database calls.
-# The shared ecs_task and lambda_jobs roles keep no secret access.
+# The shared ecs_task and lambda_jobs roles keep no secret access and no run artifacts.
 # ARNs are built from names (like the state machine ARNs) so policies can refer
 # to them before the roles exist.
 ############################################
@@ -85,10 +85,12 @@ locals {
           Condition = { StringLike = { "s3:prefix" = [for prefix in local.project_job_prefixes[p] : "${prefix}/*"] } }
         },
         {
+          # Specs, results and artifacts of this project's jobs only: runs/<project>/<runId>/jobs/.
+          # context.json and reports (runs/<project>/<runId>/) are not reachable from a job.
           Sid      = "RunSpecsAndResults"
           Effect   = "Allow"
           Action   = ["s3:GetObject", "s3:PutObject"]
-          Resource = ["${local.bucket_arn}/runs/*"]
+          Resource = ["${local.bucket_arn}/runs/${p}/*/jobs/*"]
         },
         {
           # pg-dump-s3 / pg-restore-s3: only this project's dumps
