@@ -64,6 +64,30 @@ run "bring_your_own_bucket_topic_cluster_sg" {
   }
 
   assert {
+    condition     = jsonencode([for c in jsondecode(output.bucket_requirements) : c.Control]) == jsonencode(["Versioning", "DefaultEncryption", "DenyInsecureTransport", "DenyDumpsWithoutKms", "Lifecycle"])
+    error_message = "bucket_requirements lists the five controls a brought bucket must have"
+  }
+
+  assert {
+    condition = alltrue([
+      one([for c in jsondecode(output.bucket_requirements) : c.Status if c.Control == "Versioning"]) == "Enabled",
+      one([for c in jsondecode(output.bucket_requirements) : c.SSEAlgorithm if c.Control == "DefaultEncryption"]) == "aws:kms",
+      one([for c in jsondecode(output.bucket_requirements) : c.Statement.Condition.Bool["aws:SecureTransport"] if c.Control == "DenyInsecureTransport"]) == "false",
+      jsonencode(one([for c in jsondecode(output.bucket_requirements) : c.Statement.Resource if c.Control == "DenyDumpsWithoutKms"])) == jsonencode(["arn:aws:s3:::platform-dms-artifacts/dumps/*"]),
+    ])
+    error_message = "the controls name the caller's bucket: versioning on, SSE-KMS, TLS only, dumps only with SSE-KMS"
+  }
+
+  assert {
+    condition = alltrue([
+      one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.Expiration.Days if r.Filter.Prefix == "runs/"]) == 365,
+      one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.Expiration.Days if r.Filter.Prefix == "dumps/"]) == 14,
+      one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.NoncurrentVersionExpiration.NoncurrentDays if r.Filter.Prefix == "jobs/"]) == 90,
+    ])
+    error_message = "lifecycle rules carry the module's retention values for runs/, dumps/ and jobs/"
+  }
+
+  assert {
     condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).defaults.runTimeoutSeconds == 1209600 && jsondecode(aws_sfn_state_machine.run["migrate"].definition).TimeoutSeconds == 604800
     error_message = "the per-task run timeout goes to the registration (MigrationOverdue), not to the execution timeout"
   }

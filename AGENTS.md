@@ -10,6 +10,7 @@ them: [`docs/ai-assisted-development.md`](docs/ai-assisted-development.md).
 | [`modules/dms-orchestration/`](modules/dms-orchestration/) | the Terraform module: state machines, Lambdas, IAM, storage, checks |
 | [`modules/dms-orchestration/asl/`](modules/dms-orchestration/asl/) | state machine definitions (ASL, JSONata): `migrate`, `post`, `job-runner` |
 | [`modules/dms-orchestration/tests/`](modules/dms-orchestration/tests/) | `terraform test` with a mock provider (no AWS) |
+| [`modules/artifacts-bucket/`](modules/artifacts-bucket/) | optional artifacts bucket for a long-lived workspace, with the controls of `bucket_requirements` |
 | [`src/lambdas/`](src/lambdas/) | Lambda handlers, one directory each |
 | [`src/shared/`](src/shared/) | shared library: store, DMS outcome, pre-flight, job sets, schemas |
 | [`src/jobs/sql-runner/`](src/jobs/sql-runner/) | Fargate job image (psql, mysql, python, bash, pwsh) |

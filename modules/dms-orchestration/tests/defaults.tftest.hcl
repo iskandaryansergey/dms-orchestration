@@ -351,3 +351,42 @@ run "dumps_are_kms_only_and_expire" {
     error_message = "dumps/ accept only SSE-KMS"
   }
 }
+
+run "network_contract_without_snapshot_dumps" {
+  command = plan
+
+  assert {
+    condition     = !contains(output.network_contract.required_vpc_endpoints, "rds")
+    error_message = "no rds endpoint while no task has snapshot_dumps"
+  }
+}
+
+# dump.method = snapshot calls the RDS API from the jobs: the rds interface endpoint becomes required.
+run "network_contract_with_snapshot_dumps" {
+  command = plan
+
+  variables {
+    job_secret_arns = ["arn:aws:secretsmanager:eu-west-2:111122223333:secret:dms/ledger/target/runner-XyZ123"]
+    projects = {
+      ledger = {
+        tasks = {
+          core = {
+            connections = {
+              target = {
+                engine               = "postgresql"
+                secret_arn           = "arn:aws:secretsmanager:eu-west-2:111122223333:secret:dms/ledger/target/runner-XyZ123"
+                data_api_cluster_arn = "arn:aws:rds:eu-west-2:111122223333:cluster:ledger-target"
+              }
+            }
+            defaults = { snapshot_dumps = true }
+          }
+        }
+      }
+    }
+  }
+
+  assert {
+    condition     = contains(output.network_contract.required_vpc_endpoints, "rds")
+    error_message = "a task with snapshot_dumps makes the rds endpoint required"
+  }
+}

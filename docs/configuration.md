@@ -88,7 +88,20 @@ sandbox).
 
 - `network_contract`: what the network must provide; the module creates no VPC endpoints.
   Required and optional interface endpoints, egress rules, the jobs security group to allow on
-  the databases.
+  the databases. `rds` is required as soon as one task has `defaults.snapshot_dumps = true`.
+- `bucket_requirements`: JSON list of the controls the artifacts bucket must have when it is
+  brought through `artifacts_bucket_name` (the module manages only a bucket it creates):
+  - `Versioning` enabled — required: `post` loads `context.json` by the version id `migrate`
+    recorded and refuses a run whose context was overwritten (`ContextNotPinned`);
+  - `DefaultEncryption`: SSE-KMS with `kms_key_arn` (or the AWS managed key `aws/s3`), bucket key on;
+  - `DenyInsecureTransport` and `DenyDumpsWithoutKms`: the bucket policy statements, with the
+    bucket ARN filled in;
+  - `Lifecycle`: rules for `runs/` (`report_retention_days`), `jobs/` (old versions after 90 days)
+    and `dumps/` (`dump_retention_days`, incomplete uploads after one day), in the S3 API shape.
+
+  Job sets are published create-only (`jobset_publisher_policy_json`), so the bucket needs no
+  object lock for them. `modules/artifacts-bucket` creates a bucket with all five controls for a
+  long-lived workspace; pass its `bucket_name` output as `artifacts_bucket_name`.
 - `kms_key_policy_requirements`: JSON list of key policy statements a customer managed key
   needs when `kms_key_arn` is set; the module does not manage the key policy.
 - `operator_policy_json`: IAM policy for the operator role (CLI or CI): start, watch and stop
@@ -166,6 +179,7 @@ sandbox).
 | Name | Description |
 |------|-------------|
 | <a name="output_artifacts_bucket"></a> [artifacts\_bucket](#output\_artifacts\_bucket) | Bucket for job sets (jobs/<project>/<version>/) and run artifacts (runs/<project>/<runId>/). |
+| <a name="output_bucket_requirements"></a> [bucket\_requirements](#output\_bucket\_requirements) | JSON list of the controls the artifacts bucket must have when artifacts\_bucket\_name is set (the module does not manage a brought bucket): versioning, SSE-KMS default encryption, TLS only, DenyDumpsWithoutKms, lifecycle of runs/, jobs/ and dumps/. modules/artifacts-bucket creates a bucket that has them. |
 | <a name="output_ecs_cluster_arn"></a> [ecs\_cluster\_arn](#output\_ecs\_cluster\_arn) | ECS cluster used for Fargate jobs. |
 | <a name="output_jobs_security_group_id"></a> [jobs\_security\_group\_id](#output\_jobs\_security\_group\_id) | Security group of Lambda and Fargate jobs. Add it to the Aurora ingress rules (upstream aurora module: ingress\_rules.referenced\_security\_group\_id). |
 | <a name="output_jobset_publisher_policy_json"></a> [jobset\_publisher\_policy\_json](#output\_jobset\_publisher\_policy\_json) | IAM policy per project for whoever publishes that project's job sets (scripts/sync-jobs.sh): write and list jobs/<project>/ only. Not attached by the module. |

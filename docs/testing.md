@@ -10,7 +10,7 @@ runs offline, without AWS credentials, and is what `make lint test` and CI run.
 | Unit | pytest (`tests/python/`) | decision logic (`src/shared/dms_outcome.py`, `src/shared/preflight.py`, handoff), schemas, job set rules, the CLI with fake clients | `make py-test` |
 | Lambdas against fake AWS | pytest + moto | handlers with DynamoDB, S3, SSM, Secrets Manager, RDS snapshots, IAM tokens; the DMS and Step Functions calls through stubs | `make py-test` |
 | State machine paths | local ASL runner (`tests/python/asl_runner.py`) | walks the real `migrate`/`post`/`job-runner` definitions and evaluates their real JSONata, state by state | `make py-test` |
-| Terraform | `terraform test` with a mock provider (`modules/dms-orchestration/tests/*.tftest.hcl`) | IAM least privilege, per-project roles, validations, advisory checks, the upstream module contract | `make tf-test` |
+| Terraform | `terraform test` with a mock provider (`modules/dms-orchestration/tests/*.tftest.hcl`, `modules/artifacts-bucket/tests/*.tftest.hcl`) | IAM least privilege, per-project roles, validations, advisory checks, the upstream module contract, the bucket controls | `make tf-test` |
 | State machine cases | AWS TestState (`tests/sfn/cases/`, `tests/sfn/run_teststate.py`) | every case against the real Step Functions service; `--dry` builds the requests offline | `make teststate-dry`; with credentials `uv run python tests/sfn/run_teststate.py` |
 | Image | `docker build` + trivy | the `sql-runner` image builds, starts, and has no fixable HIGH/CRITICAL CVE | `make image`, CI job `image` |
 | Content | denylist gate (`scripts/check_denylist.py`) | no denied term in files, paths, commit messages or authors | `make denylist` |

@@ -60,6 +60,20 @@ module "dms_orchestration" {
 Every field is explained in the [configuration reference](configuration.md). Outside a sandbox
 also pass `sns_topic_arn`, `table_name` and `artifacts_bucket_name` from a long-lived workspace,
 so locks, runs and baselines outlive the DMS workspace ([`RUNBOOK.md`](../RUNBOOK.md) §10).
+The brought bucket must have the controls of the `bucket_requirements` output: versioning
+(required: `post` loads the run context by the version `migrate` recorded), SSE-KMS default
+encryption, TLS only, SSE-KMS only under `dumps/`, and the lifecycle of `runs/`, `jobs/` and
+`dumps/`. The `modules/artifacts-bucket` module creates such a bucket in the long-lived workspace:
+
+```hcl
+module "artifacts_bucket" {
+  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/artifacts-bucket?ref=v0.1.0"
+
+  name        = "dms-dev-artifacts-<account-id>"
+  kms_key_arn = var.kms_key_arn
+}
+# in the DMS workspace: artifacts_bucket_name = <its bucket_name output>
+```
 
 Let the jobs reach the databases: add the `jobs_security_group_id` output to the ingress of both
 clusters (with the upstream aurora module: `ingress_rules = { orch = { referenced_security_group_id
@@ -71,6 +85,7 @@ clusters (with the upstream aurora module: `ingress_rules = { orch = { reference
 terraform init
 terraform apply
 terraform output -json dms_orchestration | jq .network_contract     # endpoints the VPC must have
+terraform output -json dms_orchestration | jq -r .bucket_requirements | jq .  # controls of a brought bucket
 terraform output -json dms_orchestration | jq -r '.verify_commands[]' # a plan run without DMS
 ```
 
@@ -78,7 +93,9 @@ The commands read a root output `output "dms_orchestration" { value = module.dms
 `apply` never starts a migration. Attach `operator_policy_json` to the role operators (or the
 pipeline) use, and `jobset_publisher_policy_json["<project>"]` to whoever uploads that project's
 job sets (`sync-jobs.sh`); the operator policy cannot upload them. The module creates no VPC endpoints, KMS key policies or operator roles; it
-publishes what they must allow (`network_contract`, `kms_key_policy_requirements`).
+publishes what they must allow (`network_contract`, `kms_key_policy_requirements`,
+`bucket_requirements`). The `rds` endpoint is in `network_contract` only when a task has
+`defaults.snapshot_dumps = true`.
 
 ## 4. Upload a job set
 

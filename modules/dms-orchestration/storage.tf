@@ -75,6 +75,54 @@ resource "aws_dynamodb_table" "this" {
 # post loads context.json by the version migrate recorded
 ############################################
 
+locals {
+  # One source for the created bucket and for the bucket_requirements output (a brought bucket).
+  bucket_policy_statements = {
+    DenyInsecureTransport = {
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource  = [local.bucket_arn, "${local.bucket_arn}/*"]
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }
+    # Target dumps hold data: SSE-KMS only.
+    DenyDumpsWithoutKms = {
+      Sid       = "DenyDumpsWithoutKms"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:PutObject"
+      Resource  = ["${local.bucket_arn}/dumps/*"]
+      Condition = { StringNotEquals = { "s3:x-amz-server-side-encryption" = "aws:kms" } }
+    }
+  }
+
+  # S3 API shape (put-bucket-lifecycle-configuration), in rule order of the resource below.
+  bucket_lifecycle_rules = [
+    {
+      ID                          = "expire-run-artifacts"
+      Status                      = "Enabled"
+      Filter                      = { Prefix = "runs/" }
+      Expiration                  = { Days = var.report_retention_days }
+      NoncurrentVersionExpiration = { NoncurrentDays = 30 }
+    },
+    {
+      ID                          = "old-job-set-versions"
+      Status                      = "Enabled"
+      Filter                      = { Prefix = "jobs/" }
+      NoncurrentVersionExpiration = { NoncurrentDays = 90 }
+    },
+    {
+      ID                             = "target-dumps"
+      Status                         = "Enabled"
+      Filter                         = { Prefix = "dumps/" }
+      Expiration                     = { Days = var.dump_retention_days }
+      NoncurrentVersionExpiration    = { NoncurrentDays = 1 }
+      AbortIncompleteMultipartUpload = { DaysAfterInitiation = 1 }
+    },
+  ]
+}
+
 resource "aws_s3_bucket" "artifacts" {
   count         = local.create_bucket ? 1 : 0
   bucket        = local.bucket_name
@@ -124,44 +172,44 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
   bucket = aws_s3_bucket.artifacts[0].id
 
   rule {
-    id     = "expire-run-artifacts"
+    id     = local.bucket_lifecycle_rules[0].ID
     status = "Enabled"
     filter {
-      prefix = "runs/"
+      prefix = local.bucket_lifecycle_rules[0].Filter.Prefix
     }
     expiration {
-      days = var.report_retention_days
+      days = local.bucket_lifecycle_rules[0].Expiration.Days
     }
     noncurrent_version_expiration {
-      noncurrent_days = 30
+      noncurrent_days = local.bucket_lifecycle_rules[0].NoncurrentVersionExpiration.NoncurrentDays
     }
   }
 
   rule {
-    id     = "old-job-set-versions"
+    id     = local.bucket_lifecycle_rules[1].ID
     status = "Enabled"
     filter {
-      prefix = "jobs/"
+      prefix = local.bucket_lifecycle_rules[1].Filter.Prefix
     }
     noncurrent_version_expiration {
-      noncurrent_days = 90
+      noncurrent_days = local.bucket_lifecycle_rules[1].NoncurrentVersionExpiration.NoncurrentDays
     }
   }
 
   rule {
-    id     = "target-dumps"
+    id     = local.bucket_lifecycle_rules[2].ID
     status = "Enabled"
     filter {
-      prefix = "dumps/"
+      prefix = local.bucket_lifecycle_rules[2].Filter.Prefix
     }
     expiration {
-      days = var.dump_retention_days
+      days = local.bucket_lifecycle_rules[2].Expiration.Days
     }
     noncurrent_version_expiration {
-      noncurrent_days = 1
+      noncurrent_days = local.bucket_lifecycle_rules[2].NoncurrentVersionExpiration.NoncurrentDays
     }
     abort_incomplete_multipart_upload {
-      days_after_initiation = 1
+      days_after_initiation = local.bucket_lifecycle_rules[2].AbortIncompleteMultipartUpload.DaysAfterInitiation
     }
   }
 }
@@ -170,23 +218,8 @@ resource "aws_s3_bucket_policy" "artifacts" {
   count  = local.create_bucket ? 1 : 0
   bucket = aws_s3_bucket.artifacts[0].id
   policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "DenyInsecureTransport"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = "s3:*"
-      Resource  = [local.bucket_arn, "${local.bucket_arn}/*"]
-      Condition = { Bool = { "aws:SecureTransport" = "false" } }
-      }, {
-      # Target dumps hold data: SSE-KMS only.
-      Sid       = "DenyDumpsWithoutKms"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = "s3:PutObject"
-      Resource  = ["${local.bucket_arn}/dumps/*"]
-      Condition = { StringNotEquals = { "s3:x-amz-server-side-encryption" = "aws:kms" } }
-    }]
+    Version   = "2012-10-17"
+    Statement = [local.bucket_policy_statements.DenyInsecureTransport, local.bucket_policy_statements.DenyDumpsWithoutKms]
   })
   depends_on = [aws_s3_bucket_public_access_block.artifacts]
 }
