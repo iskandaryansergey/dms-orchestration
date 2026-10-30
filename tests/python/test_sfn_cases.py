@@ -51,6 +51,10 @@ def test_there_are_cases_for_the_risky_states():
         ("post.asl.json", "CheckAutoResume"),
         ("post.asl.json", "StartResume"),
         ("job-runner.asl.json", "CheckStatus"),
+        ("job-runner.asl.json", "RunSsmJob"),
+        ("job-runner.asl.json", "GetSsmInvocation"),
+        ("job-runner.asl.json", "CheckSsmStatus"),
+        ("job-runner.asl.json", "NormalizeSsmResult"),
     } <= states
 
 
