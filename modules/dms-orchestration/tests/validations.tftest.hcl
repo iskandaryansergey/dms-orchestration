@@ -159,3 +159,36 @@ run "unknown_auth_is_refused" {
   }
   expect_failures = [var.projects]
 }
+
+# Names built from a project key (snapshot identifiers, prefixes) must not reach into another
+# project's: no project key may be a prefix of another.
+run "project_key_prefix_of_another_is_refused" {
+  command = plan
+  variables {
+    dms = {
+      replication_instance_arn = "arn:aws:dms:eu-west-2:111122223333:rep:RI1"
+      replication_instance_id  = "dms-dev-ri"
+      task_arns                = { core = "arn:aws:dms:eu-west-2:111122223333:task:CORE1", extra = "arn:aws:dms:eu-west-2:111122223333:task:EXTRA1" }
+    }
+    projects = {
+      ledger      = { tasks = { core = {} } }
+      ledger-prod = { tasks = { extra = {} } }
+    }
+  }
+  expect_failures = [var.projects]
+}
+
+run "project_keys_that_are_not_prefixes_plan" {
+  command = plan
+  variables {
+    dms = {
+      replication_instance_arn = "arn:aws:dms:eu-west-2:111122223333:rep:RI1"
+      replication_instance_id  = "dms-dev-ri"
+      task_arns                = { core = "arn:aws:dms:eu-west-2:111122223333:task:CORE1", extra = "arn:aws:dms:eu-west-2:111122223333:task:EXTRA1" }
+    }
+    projects = {
+      ledger = { tasks = { core = {} } }
+      cards  = { tasks = { extra = {} } }
+    }
+  }
+}

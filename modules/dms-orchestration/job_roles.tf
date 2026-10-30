@@ -115,12 +115,39 @@ locals {
           Action   = ["rds:CreateDBClusterSnapshot", "rds:DescribeDBClusterSnapshots"]
           Resource = local.project_snapshot_clusters[p]
           }], length(local.project_snapshot_clusters[p]) == 0 ? [] : [{
-          # A new snapshot must carry the project tag (builtin dump/cluster_snapshot tags it).
-          Sid       = "CreateProjectSnapshots"
-          Effect    = "Allow"
-          Action    = ["rds:CreateDBClusterSnapshot", "rds:AddTagsToResource"]
-          Resource  = ["arn:${local.partition}:rds:${local.region}:${local.account_id}:cluster-snapshot:${p}-*"]
-          Condition = { StringEquals = { "aws:RequestTag/dms-orch:project" = p } }
+          # Snapshots are scoped by the project tag, not by the identifier: a new snapshot must
+          # carry this project's tag (builtin dump/cluster_snapshot tags it on create). Both keys
+          # are required; RDS evaluation on CreateDBClusterSnapshot is proven by e2e s10snap.
+          Sid      = "CreateProjectSnapshots"
+          Effect   = "Allow"
+          Action   = ["rds:CreateDBClusterSnapshot"]
+          Resource = ["arn:${local.partition}:rds:${local.region}:${local.account_id}:cluster-snapshot:*"]
+          Condition = { StringEquals = {
+            "rds:req-tag/dms-orch:project"    = p
+            "aws:RequestTag/dms-orch:project" = p
+          } }
+          }], length(local.project_snapshot_clusters[p]) == 0 ? [] : [{
+          # Tags on this project's snapshots; the project tag itself cannot be moved to another project.
+          Sid      = "TagOwnSnapshots"
+          Effect   = "Allow"
+          Action   = ["rds:AddTagsToResource"]
+          Resource = ["arn:${local.partition}:rds:${local.region}:${local.account_id}:cluster-snapshot:*"]
+          Condition = {
+            StringEquals         = { "rds:cluster-snapshot-tag/dms-orch:project" = p }
+            StringEqualsIfExists = { "aws:RequestTag/dms-orch:project" = p }
+          }
+          }], length(local.project_snapshot_clusters[p]) == 0 ? [] : [{
+          # Tag on create: a snapshot without the project tag key, named like this project's
+          # (no project key is a prefix of another), gets only this project's tag. Another
+          # project's snapshot carries its tag and is out of reach for retag-and-delete.
+          Sid      = "TagNewSnapshots"
+          Effect   = "Allow"
+          Action   = ["rds:AddTagsToResource"]
+          Resource = ["arn:${local.partition}:rds:${local.region}:${local.account_id}:cluster-snapshot:${p}-*"]
+          Condition = {
+            Null         = { "rds:cluster-snapshot-tag/dms-orch:project" = "true" }
+            StringEquals = { "aws:RequestTag/dms-orch:project" = p }
+          }
           }], length(local.project_snapshot_clusters[p]) == 0 ? [] : [{
           # Retention (cleanup/cluster_snapshots): only snapshots tagged with this project.
           Sid       = "ManageProjectSnapshots"

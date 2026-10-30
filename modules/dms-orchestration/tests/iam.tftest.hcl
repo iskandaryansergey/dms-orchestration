@@ -465,10 +465,37 @@ run "snapshot_dumps_are_scoped_by_the_project_tag" {
   assert {
     condition = alltrue([
       for st in jsondecode(aws_iam_role_policy.job["ledger"].policy).Statement : (
-        st.Sid == "CreateProjectSnapshots" ? st.Resource == ["arn:aws:rds:eu-west-2:111122223333:cluster-snapshot:ledger-*"] && st.Condition.StringEquals["aws:RequestTag/dms-orch:project"] == "ledger" && toset(st.Action) == toset(["rds:CreateDBClusterSnapshot", "rds:AddTagsToResource"]) : true
+        st.Sid == "CreateProjectSnapshots" ? st.Resource == ["arn:aws:rds:eu-west-2:111122223333:cluster-snapshot:*"] && st.Condition.StringEquals["rds:req-tag/dms-orch:project"] == "ledger" && st.Condition.StringEquals["aws:RequestTag/dms-orch:project"] == "ledger" && toset(flatten([st.Action])) == toset(["rds:CreateDBClusterSnapshot"]) : true
       )
     ]) && length([for st in jsondecode(aws_iam_role_policy.job["ledger"].policy).Statement : st if st.Sid == "CreateProjectSnapshots"]) == 1
-    error_message = "a new snapshot must carry the project tag and the project prefix"
+    error_message = "a new snapshot must carry the project tag; the name is not the boundary"
+  }
+
+  assert {
+    condition = alltrue([
+      for st in jsondecode(aws_iam_role_policy.job["ledger"].policy).Statement : (
+        st.Sid == "TagOwnSnapshots" ? st.Resource == ["arn:aws:rds:eu-west-2:111122223333:cluster-snapshot:*"] && st.Condition.StringEquals["rds:cluster-snapshot-tag/dms-orch:project"] == "ledger" && st.Condition.StringEqualsIfExists["aws:RequestTag/dms-orch:project"] == "ledger" && toset(flatten([st.Action])) == toset(["rds:AddTagsToResource"]) : true
+      )
+    ]) && length([for st in jsondecode(aws_iam_role_policy.job["ledger"].policy).Statement : st if st.Sid == "TagOwnSnapshots"]) == 1
+    error_message = "tags on snapshots already tagged with the project, and the project tag cannot be changed to another project"
+  }
+
+  assert {
+    condition = alltrue([
+      for st in jsondecode(aws_iam_role_policy.job["ledger"].policy).Statement : (
+        st.Sid == "TagNewSnapshots" ? st.Resource == ["arn:aws:rds:eu-west-2:111122223333:cluster-snapshot:ledger-*"] && st.Condition.Null["rds:cluster-snapshot-tag/dms-orch:project"] == "true" && st.Condition.StringEquals["aws:RequestTag/dms-orch:project"] == "ledger" && toset(flatten([st.Action])) == toset(["rds:AddTagsToResource"]) : true
+      )
+    ]) && length([for st in jsondecode(aws_iam_role_policy.job["ledger"].policy).Statement : st if st.Sid == "TagNewSnapshots"]) == 1
+    error_message = "a snapshot without the project tag key gets only this project's tag (tag on create)"
+  }
+
+  assert {
+    condition = alltrue([
+      for st in jsondecode(aws_iam_role_policy.job["ledger"].policy).Statement : (
+        length([for r in flatten([st.Resource]) : r if strcontains(r, ":cluster-snapshot:")]) == 0 || can(st.Condition)
+      )
+    ])
+    error_message = "no snapshot right without a project tag condition: another project's snapshot cannot be retagged or deleted"
   }
 
   assert {
