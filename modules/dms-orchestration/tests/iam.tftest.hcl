@@ -64,7 +64,7 @@ run "least_privilege" {
             "dms:DescribeReplicationTasks", "dms:DescribeTableStatistics", "dms:DescribeConnections", "dms:DescribeEvents", "dms:DescribeEndpoints", "dms:DescribeReplicationTaskAssessmentRuns",
             "ec2:CreateNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DeleteNetworkInterface", "ec2:AssignPrivateIpAddresses", "ec2:UnassignPrivateIpAddresses", "ec2:DescribeSubnets", "ec2:DescribeVpcs",
             "logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery", "logs:DeleteLogDelivery", "logs:ListLogDeliveries", "logs:PutResourcePolicy", "logs:DescribeResourcePolicies", "logs:DescribeLogGroups",
-            "ecr:GetAuthorizationToken", "ecs:StopTask", "ecs:DescribeTasks",
+            "ecr:GetAuthorizationToken", "ecs:StopTask", "ecs:DescribeTasks", "ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation",
             "xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules", "xray:GetSamplingTargets",
           ], a)
         ]) if st.Resource == "*"
@@ -602,5 +602,157 @@ run "iam_database_auth_for_fargate_jobs" {
   assert {
     condition     = one([for st in jsondecode(aws_iam_role_policy.job["ledger"].policy).Statement : st.Resource if st.Sid == "ReadProjectSecrets"]) == ["arn:aws:secretsmanager:eu-west-2:111122223333:secret:dms/ledger/target/runner-XyZ123"]
     error_message = "secrets only of the secret connections"
+  }
+}
+
+# SSM runtime: the job-runner sends only the module document, only to the configured runners;
+# the runner instance role may assume the project job roles and is never passed to ECS.
+run "ssm_runtime_least_privilege" {
+  command = apply
+
+  variables {
+    ssm = {
+      enabled           = true
+      instance_ids      = ["i-0123456789abcdef0"]
+      instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner"
+    }
+  }
+
+  assert {
+    condition = toset(flatten([
+      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : flatten([st.Resource]) if contains(flatten([st.Action]), "ssm:SendCommand")
+      ])) == toset([
+      "arn:aws:ssm:eu-west-2:111122223333:document/dms-orch-dev-orch-job",
+      "arn:aws:ec2:eu-west-2:111122223333:instance/i-0123456789abcdef0",
+    ])
+    error_message = "ssm:SendCommand only on the module document and the configured runner instances"
+  }
+
+  assert {
+    condition = alltrue([
+      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : alltrue([for a in flatten([st.Action]) : contains(["ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation"], a)])
+      if startswith(jsonencode(st.Action), "[\"ssm:") || startswith(jsonencode(st.Action), "\"ssm:") ? st.Resource == "*" : false
+    ])
+    error_message = "only DescribeInstanceInformation and GetCommandInvocation (no resource-level permissions) run on Resource '*'"
+  }
+
+  assert {
+    condition = length([
+      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st
+      if length(setintersection(toset(flatten([st.Action])), toset(["ssm:CancelCommand", "ssm:StartSession", "ssm:SendCommand*", "ssm:UpdateDocument", "ssm:CreateDocument"]))) > 0
+    ]) == 0
+    error_message = "the job-runner neither cancels commands nor opens sessions nor edits documents"
+  }
+
+  assert {
+    condition = alltrue([
+      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution, aws_iam_role_policy.ecs_task], values(aws_iam_role_policy.job)) :
+      !strcontains(p.policy, "ssm:SendCommand")
+    ])
+    error_message = "only the job-runner sends SSM commands"
+  }
+
+  assert {
+    condition = alltrue([
+      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement :
+      !contains(flatten([st.Resource]), var.ssm.instance_role_arn) if contains(flatten([st.Action]), "iam:PassRole")
+    ])
+    error_message = "the runner instance role is never passed (to ECS or anything else)"
+  }
+
+  assert {
+    condition = one([
+      for st in jsondecode(aws_iam_role.job["ledger"].assume_role_policy).Statement : st if st.Sid == "SsmRunnerInstances"
+    ]) == { Sid = "SsmRunnerInstances", Effect = "Allow", Principal = { AWS = "arn:aws:iam::111122223333:role/team-dms-runner" }, Action = "sts:AssumeRole" }
+    error_message = "every project job role trusts the runner instance role for sts:AssumeRole only"
+  }
+
+  assert {
+    condition = toset(flatten([
+      for st in jsondecode(output.ssm_runner_policy_json).Statement : flatten([st.Resource]) if contains(flatten([st.Action]), "sts:AssumeRole")
+    ])) == toset(values(local.job_role_arns))
+    error_message = "the runner instance profile may assume the project job roles only"
+  }
+
+  assert {
+    condition = one([
+      for st in jsondecode(output.ssm_runner_policy_json).Statement : st.Resource if contains(flatten([st.Action]), "s3:GetObject")
+    ]) == ["arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runtime/*"]
+    error_message = "the runner instance profile reads the runtime zip only, nothing under runs/, jobs/ or dumps/"
+  }
+
+  assert {
+    condition     = !strcontains(output.ssm_runner_policy_json, "secretsmanager") && !strcontains(output.ssm_runner_policy_json, "rds-data")
+    error_message = "the instance profile reads no secret: only the job role does"
+  }
+
+  assert {
+    condition     = jsondecode(aws_ssm_document.orch_job[0].content).parameters.jobRoleArn.allowedPattern == "^arn:aws:iam::111122223333:role/dms-orch-dev-job-[a-z][a-z0-9-]{0,39}$"
+    error_message = "the document accepts only this module's job roles"
+  }
+
+  assert {
+    condition     = startswith(jsondecode(aws_ssm_document.orch_job[0].content).parameters.specS3Uri.allowedPattern, "^s3://dms-orch-dev-artifacts-111122223333/runs/")
+    error_message = "the document reads job specs only from this module's runs/"
+  }
+
+  assert {
+    condition     = strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "sha256sum --check") && strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), aws_s3_object.ssm_runtime[0].key)
+    error_message = "the document checks the sha256 of the runtime zip it downloads"
+  }
+
+  assert {
+    condition     = strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "runuser -u \"$runner_user\"") && strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "runner_user='orch'")
+    error_message = "the job runs as ssm.runner_user, not as root"
+  }
+
+  assert {
+    condition     = aws_s3_object.ssm_runtime[0].key == "runtime/${data.archive_file.ssm_runtime[0].output_sha256}/sql-runner.zip"
+    error_message = "the runtime zip is stored under its own sha256"
+  }
+
+  assert {
+    condition     = contains(output.network_contract.required_vpc_endpoints, "ec2messages") && contains(output.network_contract.required_vpc_endpoints, "ssmmessages")
+    error_message = "the SSM runtime needs the ssm, ec2messages and ssmmessages endpoints"
+  }
+
+  assert {
+    condition     = jsondecode(aws_lambda_function.this["prepare_job"].environment[0].variables.SSM_JOBS) == 1 && jsondecode(aws_lambda_function.this["resolve_context"].environment[0].variables.SSM_JOBS) == 1
+    error_message = "prepare_job and resolve_context know the SSM runtime is on"
+  }
+
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).runtimes.ssm == true
+    error_message = "orch.py restore reads from the registration that it runs on SSM by default"
+  }
+}
+
+run "ssm_runtime_with_target_tags" {
+  command = apply
+
+  variables {
+    ssm = {
+      enabled           = true
+      target_tags       = { "dms-orch:runner" = "dev" }
+      instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner"
+    }
+  }
+
+  assert {
+    condition = one([
+      for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st if st.Sid == "SendToTaggedRunners"
+      ]) == {
+      Sid       = "SendToTaggedRunners"
+      Effect    = "Allow"
+      Action    = ["ssm:SendCommand"]
+      Resource  = ["arn:aws:ec2:eu-west-2:111122223333:instance/*"]
+      Condition = { StringEquals = { "ssm:resourceTag/dms-orch:runner" = "dev" } }
+    }
+    error_message = "with target_tags, SendCommand reaches only instances carrying every tag"
+  }
+
+  assert {
+    condition     = strcontains(aws_sfn_state_machine.job_runner.definition, "\"tag:dms-orch:runner\"")
+    error_message = "FindSsmRunner filters the runners by the same tags"
   }
 }

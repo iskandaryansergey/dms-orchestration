@@ -458,6 +458,7 @@ def cmd_restore(args: argparse.Namespace, c: Clients, out: Any) -> int:
         raise SystemExit("restore needs --table, --ssm-prefix and --state-machine-arn (or the ORCH_* variables)")
     name = f"{args.ssm_prefix.rstrip('/')}/{args.project}/{args.task}"
     reg = json.loads(c.get("ssm").get_parameter(Name=name)["Parameter"]["Value"])
+    runtime = restore_runtime(args.runtime, reg)
     lock = (
         c.get("dynamodb")
         .get_item(TableName=args.table, Key={"pk": {"S": f"LOCK#{reg['taskArn']}"}, "sk": {"S": "LOCK"}})
@@ -475,9 +476,24 @@ def cmd_restore(args: argparse.Namespace, c: Clients, out: Any) -> int:
     lock = TaskLock(c.get("dynamodb"), args.table, reg["taskArn"], run_id, args.project, args.task)
     lock.hold(execution_arn(job_runner, run_id), first=True)
     try:
-        return _restore_locked(args, c, out, reg, job_runner, run_id, record, dump_run, lock)
+        return _restore_locked(args, c, out, reg, job_runner, run_id, record, dump_run, lock, runtime)
     finally:
         lock.release(out)
+
+
+def restore_runtime(asked: str | None, reg: dict[str, Any]) -> str:
+    """Where pg-restore-s3 runs: ``--runtime``, else SSM when the module has it, else Fargate.
+
+    The registration says which runtimes the module has (``runtimes``); one it lacks is refused
+    before the task lock is taken. An older registration without ``runtimes`` is not checked."""
+    have = reg.get("runtimes") or {}
+    runtime = asked or ("ssm" if have.get("ssm") else "fargate")
+    if have and not have.get(runtime):
+        raise SystemExit(
+            f"restore --runtime {runtime}: the module has no {runtime} runtime "
+            "(ssm.enabled, or fargate.images with sql-runner)"
+        )
+    return runtime
 
 
 def _restore_locked(
@@ -490,13 +506,14 @@ def _restore_locked(
     record: bool,
     dump_run: str | None,
     lock: TaskLock,
+    runtime: str,
 ) -> int:
     connections = reg.get("connections") or {}
+    where = {"runtime": "ssm"} if runtime == "ssm" else {"runtime": "fargate", "image": "sql-runner"}
     job = {
         "name": "restore-target",
         "index": 0,
-        "runtime": "fargate",
-        "image": "sql-runner",
+        **where,
         "command": ["pg-restore-s3", "--connection", "target", "--from", args.dump, "--confirm"],
         "timeoutSeconds": 21600,
         "retry": {"maxAttempts": 1, "backoffSeconds": 60},
@@ -637,9 +654,12 @@ def parser() -> argparse.ArgumentParser:
     d.add_argument("--task", required=True)
     d.set_defaults(func=cmd_dumps)
 
-    r = sub.add_parser("restore", help="restore a target dump (pg-restore-s3 on Fargate)")
+    r = sub.add_parser("restore", help="restore a target dump (pg-restore-s3 on an SSM runner or Fargate)")
     r.add_argument("--project", required=True)
     r.add_argument("--task", required=True)
+    r.add_argument(
+        "--runtime", choices=["ssm", "fargate"], help="where pg-restore-s3 runs (default: ssm when the module has it)"
+    )
     r.add_argument("--dump", required=True, help="s3://<bucket>/dumps/<project>/<taskKey>/<ts>-<runId>/")
     r.add_argument("--confirm", action="store_true", help="required: pg_restore --clean drops objects first")
     r.add_argument("--dry-run", action="store_true")

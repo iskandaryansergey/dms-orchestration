@@ -102,6 +102,11 @@ locals {
         snapshotDumps          = t.defaults.snapshot_dumps
         dumpRetentionDays      = var.dump_retention_days
       }
+      # Command runtimes the module has (orch.py restore picks ssm when present).
+      runtimes = {
+        ssm     = var.ssm.enabled
+        fargate = contains(keys(var.fargate.images), "sql-runner")
+      }
       assessment = var.assessment == null ? null : {
         roleArn       = var.assessment.role_arn
         bucket        = var.assessment.bucket

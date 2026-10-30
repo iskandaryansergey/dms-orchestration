@@ -224,6 +224,40 @@ def test_e2e_has_the_live_checks_of_the_run6_fixes_by_name_only():
     assert 'pf.get("error") == "RestoredTarget"' in text  # S10: a plan after the restore never resumes
 
 
+def test_e2e_has_s1ssm_by_name_only_and_s10_restores_on_the_runtime_of_the_sandbox():
+    text = E2E.read_text(encoding="utf-8")
+    assert "e2e.py s1ssm" in text and 'scenarios["s1ssm"] = s1ssm' in text
+    assert '"s1ssm": s1ssm' not in text  # needs ssm_runner = true
+    assert '"--runtime"' in text and '"e2e-ssm" if on_ssm else "e2e-fargate"' in text  # S10 on SSM
+
+
+def test_the_sandbox_runner_instance_is_a_stand_in_for_the_team_ami():
+    tf = re.sub(r"[ ]+", " ", (SANDBOX / "ssm_runner.tf").read_text(encoding="utf-8"))
+    assert tf.count("count = var.ssm_runner ? 1 : 0") >= 4  # role, profile, instance, policy
+    assert "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64" in tf
+    assert 'var.runner_ami_id != "" ? var.runner_ami_id' in tf
+    assert 'http_tokens = "required"' in tf and "associate_public_ip_address = false" in tf
+    assert "encrypted = true" in tf
+    assert "module.dms_orchestration.ssm_runner_policy_json" in tf
+    assert "AmazonSSMManagedInstanceCore" in tf
+    variables = (SANDBOX / "variables.tf").read_text(encoding="utf-8")
+    for name in ("ssm_runner", "runner_ami_id"):
+        assert f'variable "{name}"' in variables
+    assert "default = false" in re.sub(
+        r"[ ]+", " ", variables[variables.index('variable "ssm_runner"') :].split("}")[0]
+    )
+    main = re.sub(r"\s+", " ", (SANDBOX / "main.tf").read_text(encoding="utf-8"))
+    assert "enabled = var.ssm_runner" in main and "instance_ids = aws_instance.ssm_runner[*].id" in main
+    assert '"ec2messages", "ssmmessages"' in main  # agent endpoints from the network contract
+
+
+def test_the_ssm_job_set_runs_its_command_jobs_on_ssm():
+    text = (SANDBOX / "jobs" / "jobset-ssm.yaml.tmpl").read_text(encoding="utf-8")
+    assert "runtime: ssm" in text and "image:" not in text
+    helper = (SANDBOX / "scripts" / "sandbox.py").read_text(encoding="utf-8")
+    assert 'cmd_sync_jobs(out, "jobset-ssm.yaml.tmpl", "e2e-ssm")' in helper
+
+
 def test_the_sandbox_wires_the_queue_only_behind_the_variable():
     tf = re.sub(r"[ ]+", " ", (SANDBOX / "fanout.tf").read_text(encoding="utf-8"))
     assert 'file("${path.module}/fanout-filter-policy.json")' in tf

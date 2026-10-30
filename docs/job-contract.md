@@ -66,8 +66,11 @@ phases:
 * `post` runs after a successful load; `on_failure` after a failure that is not resumed.
 * **Runtime.** `handler:` and `sql:` jobs run in Lambda (up to 840 s; pg8000 with TLS
   verify-full when the connection has a host, the Data API otherwise). A job with `command:`
-  runs in a command runtime: Fargate in the image named by `image` (psql, mysql, python,
-  bash, pwsh), optional ([ADR 0011](adr/0011-job-runtimes.md)).
+  runs in a command runtime: `runtime: ssm` on an SSM runner instance from the team AMI
+  (psql, pg_dump, pg_restore, bash, python3; pwsh optional; module input `ssm`, RUNBOOK
+  section 16), or Fargate in the image named by `image` (psql, mysql, python, bash, pwsh),
+  optional ([ADR 0011](adr/0011-job-runtimes.md)). Both run the same wrapper (orch-job) with
+  the project's job role, the same environment and the same result contract.
 * **Conditions.** Add `when: "<expression>"` to run a job only sometimes, for example
   `when: "ctx.startType == 'reload-target'"` ([Conditions and templates](#conditions-and-templates)).
 * **SQL.** `sql: {file: ...}` runs files from the bundle, each file as one transaction;
@@ -199,8 +202,10 @@ phases:
 ```
 
 JSON Schema: [`src/shared/schemas/jobset.schema.json`](../src/shared/schemas/jobset.schema.json).
-`runtime: ssm` is part of the schema; a module that does not configure it refuses such jobs
-when they are prepared (`InvalidJobSet`).
+`runtime: ssm` jobs need the module's SSM runtime (`ssm.enabled`); a module without it refuses
+them when they are prepared (`InvalidJobSet`). On a runner the command comes from `spec.json`,
+never from the SSM document, and runs as `ssm.runner_user` with the AMI's `python3` (3.9 or
+later).
 
 ## SQL jobs (Lambda SQL runtime)
 

@@ -5,6 +5,7 @@
     e2e.py s1p  # S1 after both Aurora clusters auto-paused (min 0 ACU): pre-flight and the Data API jobs wake them
     e2e.py s1f  # S1 with the reset and post jobs in the Fargate sql-runner image (sql_runner.tf)
     e2e.py s1iam # S1 with a Fargate post job logged in by IAM token as orch_iam (iam_auth)
+    e2e.py s1ssm # S1 with the reset and post jobs on the SSM runner instance (ssm_runner, sync-jobs-ssm)
     e2e.py s7   # dry run: nothing started, nothing written
     e2e.py s2   # interrupt a load from outside, then resume without duplicate rows
     e2e.py s3   # revoke SELECT from the DMS user: DMS fails, classified PERMISSIONS
@@ -18,7 +19,7 @@
     e2e.py s9   # S2 through two machines: the resume verdict sees the baseline of the interrupted run
     e2e.py s13  # a post job fails; orch.py post --from-job with the fixed job set skips the jobs already ok
     e2e.py s15  # DMS task replaced by terraform between runs -> MANUAL, then allowReset recovers
-    e2e.py s10  # dump before a reload that fails half-way, restore: counts as before, restore baseline (Fargate)
+    e2e.py s10  # dump before a reload that fails half-way, restore: counts as before, restore baseline (SSM or Fargate)
     e2e.py s10snap # dump.method = snapshot before a reload: tagged cluster snapshot, dump.json, retention job
     e2e.py s14  # premigration assessment with fail_on_warning: stops before DMS (variable assessment)
     e2e.py guard   # an armed MIGRATION# of another run refuses before the reset: target untouched
@@ -159,7 +160,9 @@ def jobs(run_id: str) -> dict[str, dict[str, Any]]:
     out = {}
     for i in timeline(run_id):
         if str(i.get("sk", "")).startswith("JOB#"):
-            out[i["sk"].split("#", 3)[-1]] = {k: i.get(k) for k in ("status", "message", "startedAt", "finishedAt")}
+            out[i["sk"].split("#", 3)[-1]] = {
+                k: i.get(k) for k in ("status", "message", "runtime", "startedAt", "finishedAt")
+            }
     return out
 
 
@@ -203,6 +206,34 @@ def s1f() -> bool:
             "row-counts-data-api ok": (j.get("row-counts-data-api") or {}).get("status") == "ok",
             "lock released": lock() is None,
         },
+        output=json.loads(d.get("output") or "{}"),
+        cause=cause(d) if d["status"] != "SUCCEEDED" else None,
+        jobs=j,
+        counts=c,
+        seconds=(d["stopDate"] - d["startDate"]).total_seconds(),
+    )
+
+
+def s1ssm() -> bool:
+    """S1 with the reset and post command jobs on the SSM runner (module runtime ssm)."""
+    kind = load_type()
+    run = start(operation="migrate", startType=kind, targetReset={"policy": "always"}, jobsVersion="e2e-ssm")
+    d = wait(run, timeout=2400)
+    j = jobs(run["runId"])
+    c = counts()
+    tls = j.get("tls-target") or {}
+    reset_ok = (j.get("truncate-tables") or {}).get("status") == "ok" if kind == "reload-target" else True
+    return verdict(
+        "S1-ssm",
+        {
+            "run succeeded": d["status"] == "SUCCEEDED",
+            "counts match": all(s == t for s, t in c.values()),
+            "truncate-tables (SSM) ok, if reload-target": reset_ok,
+            "tls-target ok on SSM": tls.get("status") == "ok" and tls.get("runtime") == "ssm",
+            "row-counts-data-api ok": (j.get("row-counts-data-api") or {}).get("status") == "ok",
+            "lock released": lock() is None,
+        },
+        runner=OUT.get("ssm_runner"),
         output=json.loads(d.get("output") or "{}"),
         cause=cause(d) if d["status"] != "SUCCEEDED" else None,
         jobs=j,
@@ -693,7 +724,11 @@ def s15() -> bool:
 def s10() -> bool:
     """Dump and restore: a reload-target with a dump fails half-way (SELECT
     revoked on the source), then the dump is restored: target counts are back to before the run.
-    Needs the Fargate image (sql_runner.tf) and the jobsVersion e2e-fargate."""
+    With ssm_runner the dump, the reset job and the restore run on the SSM runner (lock, scoped
+    TOC and manifest check of pg-restore-s3 there); otherwise on Fargate (sql_runner.tf,
+    jobsVersion e2e-fargate)."""
+    on_ssm = bool(OUT.get("ssm_runner"))
+    runtime = "ssm" if on_ssm else "fargate"
     before = {t: tgt for t, (_src, tgt) in counts().items()}
     sandbox.data_api(OUT, "source", "REVOKE SELECT ON app.transactions FROM dms_source")
     try:
@@ -701,7 +736,7 @@ def s10() -> bool:
             operation="migrate",
             startType="reload-target",
             targetReset={"policy": "always"},
-            jobsVersion="e2e-fargate",
+            jobsVersion="e2e-ssm" if on_ssm else "e2e-fargate",
             dump={"enabled": True},
             autoResume={"maxAttempts": 0},
         )
@@ -733,6 +768,8 @@ def s10() -> bool:
             "core",
             "--dump",
             uri,
+            "--runtime",
+            runtime,
             "--confirm",
             "--wait",
         ],
@@ -749,6 +786,7 @@ def s10() -> bool:
         "S10",
         {
             "dump ok before the reset": dumps.get("status") == "ok",
+            f"dump ran on {runtime}": dumps.get("runtime") == runtime,
             "dump key holds no host": bool(uri) and "rds.amazonaws.com" not in uri,
             "run failed half-way": d["status"] == "FAILED",
             "restore succeeded": restored == 0,
@@ -1192,7 +1230,8 @@ def main(argv: list[str]) -> int:
     scenarios["s1f"] = s1f  # only by name: needs the Fargate image (sql_runner.tf)
     scenarios["s1iam"] = s1iam  # only by name: needs iam_auth = true, the image, sync-jobs-iam
     scenarios["s15"] = s15  # only by name: replaces the DMS task with terraform apply
-    scenarios["s10"] = s10  # only by name: needs the Fargate image (dump and restore)
+    scenarios["s1ssm"] = s1ssm  # only by name: needs ssm_runner = true and sync-jobs-ssm
+    scenarios["s10"] = s10  # only by name: needs the SSM runner or the Fargate image (dump and restore)
     scenarios["s10snap"] = s10snap  # only by name: needs snapshot_dumps = true
     scenarios["s8fargate"] = s8fargate  # only by name: needs the Fargate image (verify-target)
     scenarios["s14"] = s14  # only by name: needs the module variable assessment

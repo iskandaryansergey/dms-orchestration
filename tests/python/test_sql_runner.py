@@ -675,3 +675,180 @@ def test_tampered_bundle_fails_the_job_without_running_the_command(job_env):
     assert code == 1 and not marker.exists()
     result = result_of(job_env)
     assert result["status"] == "fail" and result["message"].startswith("JobSetTampered:")
+
+
+# --- SSM runtime: orch-job on a runner instance with the project's job role ----------
+
+JOB_ROLE = "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"
+SSM_SPEC_URI = f"s3://{BUCKET}/runs/ledger/run-1/jobs/post/00-indexes/spec.json"
+
+
+class FakeSts:
+    def __init__(self, arn: str):
+        self.arn = arn
+
+    def get_caller_identity(self) -> dict[str, str]:
+        return {"Arn": self.arn}
+
+
+class FakeSessions:
+    """boto3.Session stand-in: records the profile and the config file it was created with."""
+
+    def __init__(self, clients: dict[str, Any], identity: str):
+        self.clients = {**clients, "sts": FakeSts(identity)}
+        self.created: list[dict[str, Any]] = []
+
+    def __call__(self, profile_name: str | None = None) -> FakeSessions:
+        import os
+
+        config = Path(os.environ["AWS_CONFIG_FILE"])
+        self.created.append(
+            {
+                "profile": profile_name,
+                "env_profile": os.environ.get("AWS_PROFILE"),
+                "config": config.read_text(),
+                "mode": config.stat().st_mode & 0o777,
+                "static_keys": "AWS_ACCESS_KEY_ID" in os.environ,
+            }
+        )
+        return self
+
+    def client(self, name: str, **_kw: Any) -> Any:
+        return self.clients[name]
+
+
+@pytest.fixture
+def ssm_env(job_env, monkeypatch):
+    # assume_role_session changes the process environment: let monkeypatch restore it.
+    for name in ("AWS_CONFIG_FILE", "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_SESSION_TOKEN"):
+        monkeypatch.setenv(name, "unset")
+        monkeypatch.delenv(name)
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.setenv(name, "testing")
+    return job_env
+
+
+def test_assume_role_session_writes_a_private_profile_and_checks_the_identity(ssm_env):
+    sessions = FakeSessions({}, "arn:aws:sts::111122223333:assumed-role/dms-orch-test-job-ledger/orch-ledger-run-1")
+    tmp = ssm_env.tmp / "t"
+    tmp.mkdir()
+    orch_job.assume_role_session(JOB_ROLE, "orch-ledger-run-1", tmp, sessions)
+    made = sessions.created[0]
+    assert made["profile"] == made["env_profile"] == "orch-job" and not made["static_keys"]
+    assert f"role_arn = {JOB_ROLE}" in made["config"]
+    assert "credential_source = Ec2InstanceMetadata" in made["config"]
+    assert "role_session_name = orch-ledger-run-1" in made["config"]
+    if sys.platform != "win32":
+        assert made["mode"] == 0o600
+
+
+def test_assume_role_session_refuses_another_identity(ssm_env):
+    sessions = FakeSessions({}, "arn:aws:sts::111122223333:assumed-role/runner-instance/i-0aaa")
+    tmp = ssm_env.tmp / "t"
+    tmp.mkdir()
+    with pytest.raises(ValueError, match="not the job role"):
+        orch_job.assume_role_session(JOB_ROLE, "orch-ledger-run-1", tmp, sessions)
+
+
+@pytest.mark.parametrize(
+    "uri,name",
+    [
+        (SSM_SPEC_URI, "orch-ledger-run-1"),
+        (f"s3://{BUCKET}/runs/ledger/{'r' * 80}/jobs/post/00-x/spec.json", ("orch-ledger-" + "r" * 80)[:64]),
+    ],
+)
+def test_session_name_comes_from_the_spec_uri(uri, name):
+    assert orch_job.session_name(uri) == name
+
+
+SSM_SCRIPT = """
+import json, os, pathlib
+conns = pathlib.Path(os.environ['ORCH_CONNECTIONS_FILE'])
+assert json.loads(conns.read_text())['target']['password'] == 'pw'
+out = pathlib.Path(os.environ['ORCH_OUT_DIR'])
+summary = {k: os.environ.get(k) for k in ('AWS_PROFILE', 'AWS_ACCESS_KEY_ID')}
+summary['config'] = pathlib.Path(os.environ['AWS_CONFIG_FILE']).exists()
+(out / 'result.json').write_text(json.dumps({'status': 'ok', 'summary': summary}))
+"""
+
+
+def test_orch_job_on_ssm_runs_the_spec_command_with_the_job_role(ssm_env):
+    ssm_env.put_spec(command=[sys.executable, "-c", SSM_SCRIPT])
+    identity = "arn:aws:sts::111122223333:assumed-role/dms-orch-test-job-ledger/orch-ledger-run-1"
+    sessions = FakeSessions({"s3": ssm_env.s3, "secretsmanager": ssm_env.sm}, identity)
+    code = orch_job.main(["--assume-role", JOB_ROLE, "--command-from-spec"], session_factory=sessions)
+    assert code == 0
+    result = result_of(ssm_env)
+    # The command saw the job role profile, never static keys of the instance.
+    assert result["summary"] == {"AWS_PROFILE": "orch-job", "AWS_ACCESS_KEY_ID": None, "config": True}
+    tmp = ssm_env.tmp / "tmp"
+    assert not (tmp / "connections.json").exists() and not (tmp / "aws-config").exists()
+
+
+def test_orch_job_on_ssm_refuses_a_role_that_is_not_an_iam_role(ssm_env):
+    ssm_env.put_spec(command=[sys.executable, "-c", "raise SystemExit(0)"])
+    sessions = FakeSessions({}, "x")
+    code = orch_job.main(
+        ["--assume-role", "arn:aws:iam::111122223333:user/me", "--command-from-spec"], session_factory=sessions
+    )
+    assert code == 2 and sessions.created == []
+
+
+def test_orch_job_on_ssm_without_the_job_role_runs_nothing(ssm_env, capsys):
+    ssm_env.put_spec(command=[sys.executable, "-c", "raise SystemExit(0)"])
+    sessions = FakeSessions({"s3": ssm_env.s3}, "arn:aws:sts::111122223333:assumed-role/other/x")
+    code = orch_job.main(["--assume-role", JOB_ROLE, "--command-from-spec"], session_factory=sessions)
+    assert code == 2 and "cannot use the job role" in capsys.readouterr().out
+    assert not (ssm_env.tmp / "tmp" / "aws-config").exists()
+
+
+@pytest.mark.parametrize("command", [None, "psql-run -f x", [1, 2], []])
+def test_command_from_spec_must_be_a_list_of_strings(ssm_env, command):
+    ssm_env.put_spec(command=command)
+    identity = "arn:aws:sts::111122223333:assumed-role/dms-orch-test-job-ledger/orch-ledger-run-1"
+    sessions = FakeSessions({"s3": ssm_env.s3, "secretsmanager": ssm_env.sm}, identity)
+    assert orch_job.main(["--assume-role", JOB_ROLE, "--command-from-spec"], session_factory=sessions) == 2
+    assert result_of(ssm_env)["status"] == "fail"
+
+
+def test_connections_file_is_removed_when_the_job_wrapper_fails(job_env, monkeypatch):
+    job_env.put_spec()
+
+    def boom(*_a: Any, **_k: Any) -> list[str]:
+        raise RuntimeError("upload failed")
+
+    monkeypatch.setattr(orch_job, "upload_artifacts", boom)
+    with pytest.raises(RuntimeError):
+        orch_job.main([sys.executable, "-c", "pass"], s3=job_env.s3, secrets=job_env.sm)
+    assert not (job_env.tmp / "tmp" / "connections.json").exists()
+
+
+RUNTIME_SHARED = Path(__file__).resolve().parents[2] / "src" / "shared"
+RUNTIME_DIR = Path(__file__).resolve().parents[2] / "src" / "jobs" / "sql-runner"
+SSM_TF = Path(__file__).resolve().parents[2] / "modules" / "dms-orchestration" / "ssm.tf"
+
+
+def _ssm_shared_files() -> list[str]:
+    match = re.search(r"ssm_runtime_shared\s*=\s*\[([^\]]*)\]", SSM_TF.read_text(encoding="utf-8"))
+    assert match, "ssm.tf lists the shared modules of the runtime zip in ssm_runtime_shared"
+    return re.findall(r'"([^"]+)"', match.group(1))
+
+
+def test_ssm_runtime_zip_holds_the_shared_modules_the_image_copies():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    copy_lines = "\n".join(line for line in dockerfile.splitlines() if line.startswith("COPY "))
+    copied = sorted(Path(src).name for src in re.findall(r"src/shared/[a-z_]+\.py", copy_lines))
+    assert sorted(_ssm_shared_files()) == copied
+
+
+def test_ssm_runtime_code_runs_on_the_python3_of_the_ami():
+    """The runner instance runs the AMI's python3 (3.9 on Amazon Linux 2023), not the image's 3.13."""
+    import ast
+
+    files = sorted(RUNTIME_DIR.glob("*.py")) + [RUNTIME_SHARED / f for f in _ssm_shared_files()]
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        ast.parse(text, filename=str(path), feature_version=(3, 9))
+        assert not re.search(r"from datetime import [^\n]*\bUTC\b|datetime\.UTC", text), path.name
+        if re.search(r"\w+ \| None|list\[|dict\[", text):
+            assert "from __future__ import annotations" in text, path.name

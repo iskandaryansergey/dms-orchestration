@@ -34,6 +34,7 @@ prints a JSON verdict per check; the exit code is 0 only if every check passed.
 | `s1p` | S1 after both clusters auto-paused (0 ACU): pre-flight and the Data API jobs wake them | **default** | changes to timeouts, retries or the Data API jobs |
 | `s1f` | S1 with the reset and post jobs in the Fargate `sql-runner` image (psql over TLS) | `sql_runner`, image | changes to Fargate jobs or the image |
 | `s1iam` | a Fargate post job logs in with an IAM token, without a secret, over TLS | `iam_auth`, image, `sync-jobs-iam` | changes to IAM database authentication |
+| `s1ssm` | S1 with the reset and post jobs on the SSM runner (document, sha256 of the runtime zip, job role assumed by orch-job, psql over TLS) | `ssm_runner`, `sync-jobs-ssm` | changes to the SSM runtime, orch-job or the runner document |
 | `s7` | dry run: nothing started, nothing written | **default** | changes to the dry-run path |
 | `s2` | a load interrupted from outside resumes without duplicate rows | **default** | changes to resume or reset |
 | `s3` | a revoked grant: the pre-check or DMS fails, classified `PERMISSIONS` | **default** | changes to classification or the grants check |
@@ -47,7 +48,7 @@ prints a JSON verdict per check; the exit code is 0 only if every check passed.
 | `s9` | S2 through two machines: the resume verdict sees the baseline of the interrupted run | **default** | changes to baselines |
 | `s13` | a post job fails; `orch.py post --from-job` with a fixed job set skips the jobs already ok | **default** | changes to repeat post |
 | `s15` | the DMS task replaced by Terraform between runs: `MANUAL`, then `allowReset` recovers | `TF_VAR_*` of the stack | changes to `TABLE#` copies or registration |
-| `s10` | dump before a reload that fails half-way, restore: counts as before, restore baseline | image | changes to dumps, restore or baselines |
+| `s10` | dump before a reload that fails half-way, restore: counts as before, restore baseline; on the SSM runner when the sandbox has one (lock, scoped TOC, manifest check there) | `ssm_runner` and `sync-jobs-ssm`, or image | changes to dumps, restore, baselines or the SSM runtime |
 | `s10snap` | `dump.method = snapshot`: tagged cluster snapshot, `dump.json`, retention job | `snapshot_dumps` | changes to snapshot dumps |
 | `s14` | premigration assessment with `fail_on_warning`: stops before DMS, target untouched | `assessment` | changes to the assessment step or its order |
 | `guard` | an armed `MIGRATION#` of another run refuses before the reset: target untouched | plants a `MIGRATION#` item | changes to the Arm guard |

@@ -231,9 +231,13 @@ def test_sandbox_walkthrough_names_every_scenario_variable_and_mask():
     )
     assert not missing, f"scenarios without a command in the sandbox README: {missing}"
     variables = re.findall(r'^variable "([a-z_]+)"', read("examples/sandbox/variables.tf"), re.MULTILINE)
-    toggles = [v for v in variables if v in ("sql_runner", "assessment", "snapshot_dumps", "iam_auth", "sqs_fanout")]
-    assert len(toggles) == 5
-    for v in [*toggles, "operator_cidr", "sql_runner_image_tag"]:
+    toggles = [
+        v
+        for v in variables
+        if v in ("sql_runner", "ssm_runner", "assessment", "snapshot_dumps", "iam_auth", "sqs_fanout")
+    ]
+    assert len(toggles) == 6
+    for v in [*toggles, "operator_cidr", "sql_runner_image_tag", "runner_ami_id"]:
         assert f"TF_VAR_{v}" in text, v
     name = re.search(r'variable "name" \{[^}]*default\s*=\s*"([^"]+)"', read("examples/sandbox/variables.tf"), re.S)
     assert f"verify_destroyed.py --match {name.group(1)}" in text

@@ -6,6 +6,7 @@
     sandbox.py sync-jobs                  # jobs/jobset*.yaml.tmpl as jobs/ledger/e2e/, e2e-dms-only/
     sandbox.py build-image <git-sha>      # CodeBuild: sql-runner image -> ECR; fails on HIGH/CRITICAL
     sandbox.py sync-jobs-fargate          # jobs/jobset-fargate.yaml.tmpl as jobs/ledger/e2e-fargate/
+    sandbox.py sync-jobs-ssm              # jobs/jobset-ssm.yaml.tmpl as jobs/ledger/e2e-ssm/ (ssm_runner)
     sandbox.py sync-jobs-iam              # jobs/jobset-iam.yaml.tmpl as jobs/ledger/e2e-iam/ (iam_auth)
     sandbox.py counts                     # row counts source vs target
     sandbox.py sql <source|target> "SQL"  # one statement
@@ -513,6 +514,8 @@ def main(argv: list[str]) -> int:
         cmd_sync_jobs(out, "jobset-postfail.yaml.tmpl", "e2e-postfail")
     elif cmd == "sync-jobs-fargate":
         cmd_sync_jobs(out, "jobset-fargate.yaml.tmpl", "e2e-fargate")
+    elif cmd == "sync-jobs-ssm":
+        cmd_sync_jobs(out, "jobset-ssm.yaml.tmpl", "e2e-ssm")
     elif cmd == "sync-jobs-iam":
         cmd_sync_jobs(out, "jobset-iam.yaml.tmpl", "e2e-iam")
     elif cmd == "build-image":

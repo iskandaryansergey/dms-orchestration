@@ -103,6 +103,9 @@ def test_template_only_uses_known_placeholders(name):
         "security_groups_json",
         "assign_public_ip",
         "artifacts_bucket",
+        "ssm_document_name",
+        "ssm_instance_filters_json",
+        "jobs_log_group_name",
     }
     assert template_variables(name) <= known
 
@@ -117,9 +120,11 @@ def test_no_machine_waits_for_dms():
                 if "describeReplicationTasks" in resource:
                     # One read before the dump and the reset, never in a loop (review finding 6).
                     assert (name, state_name) == (MIGRATE, "RecheckTask"), f"{name}:{state_name} polls DMS"
-                # Only the job-runner retry backoff and the assessment poll (minutes) wait; never DMS.
+                # Only the job-runner retry backoff, the SSM command poll and the assessment poll
+                # (minutes) wait; never DMS.
                 if state["Type"] == "Wait":
-                    assert (name, state_name) in {(JOB_RUNNER, "WaitBeforeRetry"), (MIGRATE, "WaitAssessment")}
+                    allowed = {(JOB_RUNNER, "WaitBeforeRetry"), (JOB_RUNNER, "WaitSsm"), (MIGRATE, "WaitAssessment")}
+                    assert (name, state_name) in allowed
 
 
 def test_migrate_releases_the_lock_on_every_path_that_ends_before_the_dms_start():
@@ -1008,6 +1013,99 @@ def test_fargate_without_result_file_fails():
     )
     run = run_job(mocks)
     assert run.status == "FAILED" and "no result.json" in json.loads(run.cause)["message"]
+
+
+# --- SSM Run Command runtime (runner instance from the team AMI) ---------------------
+
+SSM_SPEC = {"runtime": "ssm", "jobRoleArn": "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"}
+
+
+def ssm_mocks(job_spec: dict[str, Any], **over: Any) -> dict[str, Any]:
+    mocks = job_mocks(
+        job_spec,
+        FindSsmRunner=lambda _a: {"InstanceInformationList": [{"InstanceId": "i-0aaa"}]},
+        RunSsmJob=lambda a: {"Command": {"CommandId": "cmd-1", "InstanceIds": a["InstanceIds"]}},
+        GetSsmInvocation=sequence({"Status": "InProgress"}, {"Status": "Success", "ResponseCode": 0}),
+        FetchSsmResult=lambda _a: {"Body": json.dumps({"status": "ok", "summary": {"restored": 4}})},
+    )
+    mocks.update(over)
+    return mocks
+
+
+def test_ssm_job_sends_the_module_document_and_polls_until_terminal():
+    run = run_job(ssm_mocks(spec(**SSM_SPEC, timeoutSeconds=7200)), {**JOB_INPUT, "dryRun": True})
+    assert run.status == "SUCCEEDED" and run.output["summary"] == {"restored": 4}
+    assert run.called("RunFargateJob") == [] and run.called("InvokeLambdaJob") == []
+    assert run.called("FindSsmRunner")[0]["Filters"] == [{"Key": "PingStatus", "Values": ["Online"]}]
+    send = run.called("RunSsmJob")[0]
+    assert send["DocumentName"] == "dms-orch-test-orch-job" and send["InstanceIds"] == ["i-0aaa"]
+    # The command itself is never a parameter: orch-job reads it from spec.json.
+    assert send["Parameters"] == {
+        "specS3Uri": ["s3://b/runs/r/jobs/pre/00-x/spec.json"],
+        "jobRoleArn": ["arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"],
+        "attempt": ["1"],
+        "dryRun": ["1"],
+        "executionTimeout": ["7200"],
+    }
+    assert send["CloudWatchOutputConfig"] == {
+        "CloudWatchOutputEnabled": True,
+        "CloudWatchLogGroupName": "/dms-orch/test/jobs",
+    }
+    assert run.called("GetSsmInvocation")[0] == {"CommandId": "cmd-1", "InstanceId": "i-0aaa"}
+    assert run.path.count("WaitSsm") == 2
+    assert run.called("FetchSsmResult")[0]["Key"] == "runs/r/jobs/pre/00-x/result.json"
+    assert run.called("RecordJob")[0]["Item"]["runtime"] == {"S": "ssm"}
+
+
+@pytest.mark.parametrize("status", ["Failed", "TimedOut", "Cancelled"])
+def test_ssm_terminal_failure_is_a_job_failure_even_if_result_says_ok(status):
+    inv = sequence({"Status": status, "ResponseCode": 3})
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), GetSsmInvocation=inv))
+    assert (run.status, run.error) == ("FAILED", "JobFailed")
+    message = json.loads(run.cause)["message"]
+    assert f"SSM command cmd-1 {status}" in message and "exit code 3" in message
+
+
+def test_ssm_without_a_runner_online_fails_without_sending():
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), FindSsmRunner=lambda _a: {"InstanceInformationList": []}))
+    assert run.status == "FAILED" and run.called("RunSsmJob") == []
+    assert "no SSM runner instance online" in json.loads(run.cause)["message"]
+
+
+def test_ssm_send_failure_is_a_job_failure():
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), RunSsmJob=raises("Ssm.InvalidInstanceIdException", "not managed")))
+    assert run.status == "FAILED" and "not managed" in json.loads(run.cause)["message"]
+    assert run.called("GetSsmInvocation") == []
+
+
+def test_ssm_retry_takes_the_next_runner():
+    runners = lambda _a: {"InstanceInformationList": [{"InstanceId": "i-0bbb"}, {"InstanceId": "i-0aaa"}]}  # noqa: E731
+    inv = sequence({"Status": "Failed", "ResponseCode": 1}, {"Status": "Success", "ResponseCode": 0})
+    run = run_job(ssm_mocks(spec(**SSM_SPEC, maxAttempts=2), FindSsmRunner=runners, GetSsmInvocation=inv))
+    assert run.status == "SUCCEEDED" and run.output["attempt"] == 2
+    assert [c["InstanceIds"] for c in run.called("RunSsmJob")] == [["i-0aaa"], ["i-0bbb"]]
+
+
+def test_ssm_wait_gives_up_after_the_job_timeout():
+    run = run_job(ssm_mocks(spec(**SSM_SPEC, timeoutSeconds=60), GetSsmInvocation=lambda _a: {"Status": "InProgress"}))
+    assert run.status == "FAILED" and "did not finish" in json.loads(run.cause)["message"]
+    # timeout + 900 s of delivery and shutdown margin, 30 s per poll
+    assert run.path.count("WaitSsm") == (60 + 900) // 30
+
+
+def test_ssm_lookup_errors_keep_polling_until_the_invocation_is_seen():
+    inv = sequence(
+        TaskError("Ssm.InvocationDoesNotExistException", "not yet"), {"Status": "Success", "ResponseCode": 0}
+    )
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), GetSsmInvocation=inv))
+    assert run.status == "SUCCEEDED" and run.path.count("WaitSsm") == 2
+
+
+def test_ssm_without_result_file_names_the_command():
+    inv = sequence({"Status": "Failed", "ResponseCode": 97})
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), GetSsmInvocation=inv, FetchSsmResult=raises("S3.NoSuchKey")))
+    message = json.loads(run.cause)["message"]
+    assert "no result.json from SSM command cmd-1 on i-0aaa" in message and "exit code 97" in message
 
 
 def test_idempotent_job_is_retried_up_to_max_attempts():

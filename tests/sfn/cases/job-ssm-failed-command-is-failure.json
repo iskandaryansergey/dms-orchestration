@@ -1,0 +1,29 @@
+{
+  "definition": "job-runner.asl.json",
+  "state": "NormalizeSsmResult",
+  "variables": {
+    "input": {},
+    "attempt": 1,
+    "spec": {},
+    "result": {
+      "status": "ok"
+    },
+    "exitCode": 2,
+    "ecsError": null,
+    "ssmRunners": ["i-0aaa"],
+    "ssmInstanceId": "i-0aaa",
+    "ssmCommandId": "cmd-1",
+    "ssmStatus": "Failed",
+    "ssmPolls": 4
+  },
+  "expect": {
+    "status": "SUCCEEDED",
+    "nextState": "RecordJob",
+    "variables": {
+      "result": {
+        "status": "fail",
+        "message": "SSM command cmd-1 Failed, exit code 2"
+      }
+    }
+  }
+}

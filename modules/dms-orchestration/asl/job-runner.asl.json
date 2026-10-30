@@ -1,5 +1,5 @@
 {
-  "Comment": "DMS orchestration: run one pre/reset/post/on_failure job (Lambda or Fargate) with retries and onError policy from the job set.",
+  "Comment": "DMS orchestration: run one pre/reset/post/on_failure job (Lambda, SSM Run Command on a runner instance, or Fargate) with retries and onError policy from the job set.",
   "QueryLanguage": "JSONata",
   "TimeoutSeconds": ${state_machine_timeout_seconds},
   "StartAt": "Init",
@@ -12,7 +12,12 @@
         "spec": null,
         "result": null,
         "exitCode": 0,
-        "ecsError": null
+        "ecsError": null,
+        "ssmRunners": [],
+        "ssmInstanceId": null,
+        "ssmCommandId": null,
+        "ssmStatus": null,
+        "ssmPolls": 0
       },
       "Next": "PrepareJob"
     },
@@ -64,8 +69,164 @@
     },
     "CheckRuntime": {
       "Type": "Choice",
-      "Choices": [{ "Condition": "{% $spec.runtime = 'lambda' %}", "Next": "InvokeLambdaJob" }],
+      "Choices": [
+        { "Condition": "{% $spec.runtime = 'lambda' %}", "Next": "InvokeLambdaJob" },
+        { "Condition": "{% $spec.runtime = 'ssm' %}", "Next": "FindSsmRunner" }
+      ],
       "Default": "RunFargateJob"
+    },
+    "FindSsmRunner": {
+      "Type": "Task",
+      "Comment": "Online runner instances among the configured ones (ssm.instance_ids or ssm.target_tags).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
+      "Arguments": { "Filters": ${ssm_instance_filters_json}, "MaxResults": 50 },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        { "ErrorEquals": ["Ssm.SsmException", "Ssm.InternalServerErrorException"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2, "JitterStrategy": "FULL" }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RecordJob",
+          "Assign": {
+            "result": {
+              "status": "fail",
+              "message": "{% 'SSM runner lookup failed: ' & $string($states.errorOutput.Error) & ': ' & $string($states.errorOutput.Cause) %}",
+              "summary": {}
+            }
+          }
+        }
+      ],
+      "Assign": { "ssmRunners": "{% $sort([$states.result.InstanceInformationList.InstanceId]) %}" },
+      "Next": "CheckSsmRunner"
+    },
+    "CheckSsmRunner": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $count($ssmRunners) = 0 %}",
+          "Next": "RecordJob",
+          "Assign": {
+            "result": { "status": "fail", "message": "no SSM runner instance online (module variable ssm: instance_ids or target_tags)", "summary": {} }
+          }
+        }
+      ],
+      "Default": "RunSsmJob"
+    },
+    "RunSsmJob": {
+      "Type": "Task",
+      "Comment": "The module document on one runner; a retry takes the next one. orch-job reads the command from spec.json: it is never a parameter. No Retry: a repeated send could run the job twice.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Arguments": {
+        "DocumentName": "${ssm_document_name}",
+        "InstanceIds": ["{% $ssmRunners[($attempt - 1) % $count($ssmRunners)] %}"],
+        "TimeoutSeconds": 600,
+        "Comment": "{% $substring('job ' & $input.phase & '/' & $input.job.name & ' run ' & $input.runId, 0, 100) %}",
+        "Parameters": {
+          "specS3Uri": ["{% $spec.specS3Uri %}"],
+          "jobRoleArn": ["{% $spec.jobRoleArn %}"],
+          "attempt": ["{% $string($attempt) %}"],
+          "dryRun": ["{% $input.dryRun = true ? '1' : '0' %}"],
+          "executionTimeout": ["{% $string($spec.timeoutSeconds) %}"]
+        },
+        "CloudWatchOutputConfig": { "CloudWatchOutputEnabled": true, "CloudWatchLogGroupName": "${jobs_log_group_name}" }
+      },
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RecordJob",
+          "Assign": {
+            "result": {
+              "status": "fail",
+              "message": "{% 'SSM sendCommand failed: ' & $string($states.errorOutput.Error) & ': ' & $string($states.errorOutput.Cause) %}",
+              "summary": {}
+            }
+          }
+        }
+      ],
+      "Assign": {
+        "ssmCommandId": "{% $states.result.Command.CommandId %}",
+        "ssmInstanceId": "{% $ssmRunners[($attempt - 1) % $count($ssmRunners)] %}",
+        "ssmStatus": "Pending",
+        "ssmPolls": 0,
+        "exitCode": -1
+      },
+      "Next": "WaitSsm"
+    },
+    "WaitSsm": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Assign": { "ssmPolls": "{% $ssmPolls + 1 %}" },
+      "Next": "GetSsmInvocation"
+    },
+    "GetSsmInvocation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Arguments": { "CommandId": "{% $ssmCommandId %}", "InstanceId": "{% $ssmInstanceId %}" },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        { "ErrorEquals": ["Ssm.InvocationDoesNotExistException"], "IntervalSeconds": 5, "MaxAttempts": 6, "BackoffRate": 2 },
+        { "ErrorEquals": ["Ssm.SsmException", "Ssm.InternalServerErrorException"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2, "JitterStrategy": "FULL" }
+      ],
+      "Catch": [
+        {
+          "Comment": "The command may still run: keep polling (the status is unchanged) until the deadline.",
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CheckSsmStatus"
+        }
+      ],
+      "Assign": {
+        "ssmStatus": "{% $states.result.Status %}",
+        "exitCode": "{% $exists($states.result.ResponseCode) ? $states.result.ResponseCode : -1 %}"
+      },
+      "Next": "CheckSsmStatus"
+    },
+    "CheckSsmStatus": {
+      "Type": "Choice",
+      "Comment": "Poll every 30 s until a terminal status; give up after the job timeout + 900 s (the document stops the script at the job timeout).",
+      "Choices": [
+        {
+          "Condition": "{% $ssmStatus in ['Pending', 'InProgress', 'Delayed', 'Cancelling'] and $ssmPolls * 30 < $spec.timeoutSeconds + 900 %}",
+          "Next": "WaitSsm"
+        },
+        {
+          "Condition": "{% $ssmStatus in ['Pending', 'InProgress', 'Delayed', 'Cancelling'] %}",
+          "Next": "FetchSsmResult",
+          "Assign": { "ssmStatus": "{% $ssmStatus & ' (did not finish in time)' %}" }
+        }
+      ],
+      "Default": "FetchSsmResult"
+    },
+    "FetchSsmResult": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Arguments": { "Bucket": "${artifacts_bucket}", "Key": "{% $spec.resultKey %}" },
+      "TimeoutSeconds": 30,
+      "Retry": [{ "ErrorEquals": ["S3.InternalError", "S3.SlowDown"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RecordJob",
+          "Assign": {
+            "result": {
+              "status": "fail",
+              "message": "{% 'no result.json from SSM command ' & $ssmCommandId & ' on ' & $ssmInstanceId & ' (status ' & $string($ssmStatus) & ', exit code ' & $string($exitCode) & ')' %}",
+              "summary": {}
+            }
+          }
+        }
+      ],
+      "Assign": { "result": "{% $parse($states.result.Body) %}" },
+      "Next": "NormalizeSsmResult"
+    },
+    "NormalizeSsmResult": {
+      "Type": "Pass",
+      "Comment": "A status other than Success or a non-zero exit code is a failure whatever result.json says.",
+      "Assign": {
+        "result": "{% ($ssmStatus != 'Success' or $exitCode != 0) and $result.status != 'fail' ? $merge([$result, {'status': 'fail', 'message': 'SSM command ' & $ssmCommandId & ' ' & $ssmStatus & ', exit code ' & $string($exitCode)}]) : $result %}"
+      },
+      "Next": "RecordJob"
     },
     "InvokeLambdaJob": {
       "Type": "Task",

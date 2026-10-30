@@ -176,7 +176,8 @@ log group used to survive destroy.
 ## 11. Dump before a reset, restore
 
 With `dump.enabled` in the request (or `dump_before_reset = true` in the task defaults) every
-run that resets the target first dumps the scope with `pg-dump-s3` (Fargate `sql-runner`):
+run that resets the target first dumps the scope with `pg-dump-s3` (on the SSM runner when
+`ssm.enabled`, section 16; otherwise in the Fargate `sql-runner`):
 the target's tables that the selection rules of the table mapping select (the tables a reset
 truncates) — `pg_dump -Fc --no-owner --no-privileges -t <table>…`, with their indexes,
 constraints, defaults, triggers and owned sequences — streamed into
@@ -197,7 +198,9 @@ itself (`LOCK#<taskArn>`, written only if none exists, `runId` `restore-<project
 `executionArn` of its job-runner execution) before it starts anything and deletes it when it
 ends, whatever the outcome; no run can start during a restore. If the CLI is killed, the
 watchdog releases the lock once the execution ended and `lock_grace_seconds` passed. It always
-waits (`--wait` is accepted and changes nothing).
+waits (`--wait` is accepted and changes nothing). `pg-restore-s3` runs on the SSM runner when the
+module has it (`ssm.enabled`, the registration says so), otherwise in the Fargate image;
+`--runtime ssm|fargate` picks one, and a runtime the module lacks is refused before the lock.
 
 The job (`pg-restore-s3`) then, in this order, and stops with nothing changed at the first
 failure:
@@ -326,3 +329,61 @@ paused cluster starts slower: the first Data API call of pre-flight wakes it
 about 3.5 minutes per call); psql and DMS connections wake it too. Nothing to do. A target check
 that still fails with one of those errors means the cluster did not resume: check it in the RDS
 console and start again. The e2e scenario `s1p` proves this path ([docs/testing.md](docs/testing.md)).
+
+## 16. SSM runner instance (runtime `ssm`)
+
+Long jobs — `pg-dump-s3`, `orch.py restore`, long DDL, bash or pwsh scripts — run with SSM Run
+Command on a runner instance built from the team AMI, not in Lambda (15 minutes) and without a
+container image. Turn it on with the module input `ssm`:
+
+```hcl
+ssm = {
+  enabled           = true
+  instance_ids      = ["i-0123456789abcdef0"]           # or target_tags = { Role = "dms-runner" }
+  instance_role_arn = "arn:aws:iam::<account>:role/<runner-role>"
+  runner_user       = "orch"                            # default; never root
+}
+```
+
+The runner instance needs:
+
+* the AMI's tools: `psql`, `pg_dump` and `pg_restore` (major version ≥ the target's), `bash`,
+  `python3` (3.9 or later) with `boto3`, `runuser`, `sha256sum`; `pwsh` only for pwsh jobs.
+  Nothing is downloaded from the internet at run time;
+* the SSM agent online, with the `ssm`, `ec2messages` and `ssmmessages` endpoints
+  (`network_contract`), STS, Secrets Manager, logs, KMS and the S3 gateway endpoint, and a
+  security group that reaches the databases (the module's jobs security group fits);
+* an instance profile role (`ssm.instance_role_arn`) with SSM management
+  (`AmazonSSMManagedInstanceCore` or the platform's equivalent) plus the module output
+  `ssm_runner_policy_json`: read `runtime/*` of the artifacts bucket, assume the project job
+  roles, write command output to the jobs log group. Every project job role trusts this role.
+
+How a job runs: the job-runner picks an online runner among the configured ones (a retry takes
+the next one), sends the document `<name>-<environment>-orch-job` (or
+`ssm.document_name_override`, registered from the output `ssm_document_content`) with the spec
+URI and the project's job role, and polls the invocation every 30 s. The document, as root,
+downloads `runtime/<sha256>/sql-runner.zip` (the module uploads it on apply), checks its SHA-256,
+unpacks it into a fresh `/var/tmp/orch-job.*` directory and starts `orch_job.py --assume-role
+<job role> --command-from-spec` as `runner_user` (created as a system user if missing). orch-job
+assumes the job role through a profile that renews it for jobs longer than an hour, reads the
+command from `spec.json`, writes the connections file (0600, `runner_user`) and removes it and
+the whole directory at the end, whatever the outcome. The result comes from S3 as for Fargate.
+
+Where to look when a job fails:
+
+| Message in the report | Meaning |
+|---|---|
+| `no SSM runner instance online` | no configured instance has `PingStatus = Online`: check the agent, the endpoints, `instance_ids` / `target_tags` |
+| `SSM sendCommand failed: …` | the document or the instance is refused (wrong name, instance not managed, IAM) |
+| `no result.json from SSM command <id> on <instance> (status …, exit code 96)` | a tool is missing on the AMI (`psql`, `python3` with `boto3`, …); the command output says which |
+| `… exit code 97` | the runtime zip does not match its SHA-256: apply the module again |
+| `… exit code 2` | orch-job could not use the job role (trust of `ssm.instance_role_arn`, STS endpoint) |
+| `SSM command <id> Failed, exit code N` | the job command failed: command output in the jobs log group, stream `<command id>/<instance id>/orchJob/stdout` |
+| `… (did not finish in time)` | no terminal status within the job timeout + 15 minutes: check the instance |
+
+Anyone who can open an SSM session on the runner or run commands on it sees the job files and the
+connections file while a job runs, and can use the instance profile (see
+[docs/security.md](docs/security.md)): keep session access to the runners as narrow as access to
+the job roles. The sandbox has a stand-in runner (`TF_VAR_ssm_runner=true`, Amazon Linux 2023
+with the tools installed at boot, or `runner_ami_id` for the team AMI); e2e `s1ssm` runs the
+reset and post jobs on it, `s10` the dump and the restore.

@@ -262,7 +262,40 @@ locals {
           Resource  = concat([aws_iam_role.ecs_execution.arn, aws_iam_role.ecs_task.arn], values(local.job_role_arns))
           Condition = { StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" } }
         },
-        ] : st if length(var.fargate.images) > 0], [{
+        ] : st if length(var.fargate.images) > 0], [for st in [
+        {
+          # FindSsmRunner: no resource-level permissions.
+          Sid      = "FindSsmRunners"
+          Effect   = "Allow"
+          Action   = ["ssm:DescribeInstanceInformation"]
+          Resource = "*"
+        },
+        {
+          Sid      = "SendJobDocument"
+          Effect   = "Allow"
+          Action   = ["ssm:SendCommand"]
+          Resource = [local.ssm_document_arn]
+        },
+        {
+          # GetSsmInvocation: no resource-level permissions.
+          Sid      = "TrackJobCommands"
+          Effect   = "Allow"
+          Action   = ["ssm:GetCommandInvocation"]
+          Resource = "*"
+        },
+        ] : st if local.ssm_enabled], local.ssm_enabled && length(var.ssm.instance_ids) > 0 ? [{
+        Sid      = "SendToRunnerInstances"
+        Effect   = "Allow"
+        Action   = ["ssm:SendCommand"]
+        Resource = [for id in var.ssm.instance_ids : "arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/${id}"]
+        }] : [], local.ssm_enabled && length(var.ssm.target_tags) > 0 ? [{
+        # Only instances that carry every configured tag (the same tags FindSsmRunner filters on).
+        Sid       = "SendToTaggedRunners"
+        Effect    = "Allow"
+        Action    = ["ssm:SendCommand"]
+        Resource  = ["arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*"]
+        Condition = { StringEquals = { for k, v in var.ssm.target_tags : "ssm:resourceTag/${k}" => v } }
+        }] : [], [{
         # Always: CreateStateMachine checks the managed rule of the ecs:runTask.sync
         # state, which is in the definition whether or not images are configured.
         Sid      = "SyncIntegrationRule"

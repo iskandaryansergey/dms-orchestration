@@ -49,7 +49,12 @@ locals {
       timeout     = 60
       role        = "core"
       # FARGATE_IMAGES: preflight.verifyRuntime auto/fargate needs the sql-runner image (verify-target).
-      env = { SSM_PREFIX = local.ssm_prefix, FARGATE_IMAGES = jsonencode(sort(keys(var.fargate.images))) }
+      # SSM_JOBS: pg-dump dumps run on the SSM runtime when it is on.
+      env = {
+        SSM_PREFIX     = local.ssm_prefix
+        FARGATE_IMAGES = jsonencode(sort(keys(var.fargate.images)))
+        SSM_JOBS       = local.ssm_enabled ? "1" : "0"
+      }
     }
     inspect_task = {
       description = "Classify DMS task state and decide start type / target reset"
@@ -79,6 +84,7 @@ locals {
         TASK_DEFINITIONS = jsonencode({ for k, td in aws_ecs_task_definition.job : k => td.arn })
         JOB_LAMBDA_ARNS  = jsonencode(var.job_lambda_arns)
         JOB_ROLE_ARNS    = jsonencode(local.job_role_arns)
+        SSM_JOBS         = local.ssm_enabled ? "1" : "0"
       }
     }
     dms_event_handler = {

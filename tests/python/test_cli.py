@@ -579,6 +579,33 @@ def test_restore_runs_pg_restore_through_the_job_runner_as_the_project():
     assert call["name"].startswith("restore-ledger-core-")
 
 
+SSM_REG = {**REG, "runtimes": {"ssm": True, "fargate": False}}
+
+
+def test_restore_runs_on_ssm_by_default_when_the_module_has_it():
+    code, _out, sfn = _restore("--confirm", reg=SSM_REG)
+    assert code == 0
+    job = json.loads(sfn.started[0]["input"])["job"]
+    assert job["runtime"] == "ssm" and "image" not in job
+    assert job["command"] == ["pg-restore-s3", "--connection", "target", "--from", DUMP_URI, "--confirm"]
+
+
+def test_restore_runtime_flag_picks_the_runtime():
+    reg = {**REG, "runtimes": {"ssm": True, "fargate": True}}
+    _code, _out, sfn = _restore("--confirm", "--runtime", "fargate", reg=reg)
+    job = json.loads(sfn.started[0]["input"])["job"]
+    assert job["runtime"] == "fargate" and job["image"] == "sql-runner"
+    _code, _out, sfn = _restore("--confirm", "--runtime", "ssm")  # older registration: not checked here
+    assert json.loads(sfn.started[0]["input"])["job"]["runtime"] == "ssm"
+
+
+def test_restore_refuses_a_runtime_the_module_does_not_have_before_taking_the_lock():
+    ddb = LockDdb({})
+    with pytest.raises(SystemExit, match="no fargate runtime"):
+        _restore("--confirm", "--runtime", "fargate", reg=SSM_REG, ddb=ddb)
+    assert ddb.puts == [] and ddb.sfn.started == []
+
+
 def test_restore_records_the_target_baseline_marked_as_restore_with_the_dump_run():
     """Seen live: after a restore the next run stopped MANUAL/TargetChanged. The restored target is
     known and intended: a successful restore fingerprints it and records the baseline."""

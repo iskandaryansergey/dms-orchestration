@@ -62,6 +62,21 @@ output "jobset_publisher_policy_json" {
   value       = { for p, pol in local.jobset_publisher_policies : p => jsonencode(pol) }
 }
 
+output "ssm_runner_policy_json" {
+  description = "IAM policy for the instance profile role of the SSM runners (ssm.instance_role_arn), besides SSM management: read the runtime zip, assume the project job roles, write command output to the jobs log group. Not attached by the module. null when ssm.enabled is false."
+  value       = local.ssm_enabled ? jsonencode(local.ssm_runner_policy) : null
+}
+
+output "ssm_document_content" {
+  description = "Content (JSON) of the SSM Command document the job-runner sends; register it under ssm.document_name_override when the module does not create the document. null when ssm.enabled is false."
+  value       = local.ssm_enabled ? jsonencode(local.ssm_document) : null
+}
+
+output "ssm_document_name" {
+  description = "SSM document the job-runner sends for runtime ssm jobs (the module's <name>-<environment>-orch-job or ssm.document_name_override). null when ssm.enabled is false."
+  value       = local.ssm_enabled ? local.ssm_document_name : null
+}
+
 output "kms_key_policy_requirements" {
   description = "JSON list of statements the CMK key policy must allow when kms_key_arn is set (the module does not manage the key policy)."
   value = local.use_cmk ? jsonencode([
@@ -124,6 +139,8 @@ output "network_contract" {
     required_vpc_endpoints = concat(
       ["states", "dms", "secretsmanager", "kms", "logs", "ecr.api", "ecr.dkr", "s3 (gateway)", "dynamodb (gateway)", "ssm", "sns", "sqs", "sts"],
       anytrue([for t in values(local.tasks) : t.defaults.snapshot_dumps]) ? ["rds"] : [],
+      # SSM runtime: the runner instances' agent (ssm is listed above already).
+      local.ssm_enabled ? ["ec2messages", "ssmmessages"] : [],
     )
     optional_vpc_endpoints   = ["rds-data (Data API jobs)", "monitoring", "xray (enable_xray)"]
     not_needed_vpc_endpoints = ["lambda", "events", "ecs", "ecs-agent", "ecs-telemetry"]

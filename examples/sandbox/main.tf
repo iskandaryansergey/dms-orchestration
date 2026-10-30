@@ -102,8 +102,13 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_https" {
 }
 
 resource "aws_vpc_endpoint" "interface" {
-  # rds comes from the module's network_contract (required when a task has snapshot_dumps).
-  for_each            = toset(concat(var.interface_endpoints, local.sql_runner_image != "" ? ["ecr.api", "ecr.dkr"] : [], [for e in module.dms_orchestration.network_contract.required_vpc_endpoints : e if e == "rds"]))
+  # From the module's network_contract: rds (a task with snapshot_dumps), ec2messages and
+  # ssmmessages (the SSM runtime; ssm is in interface_endpoints already).
+  for_each = toset(concat(
+    var.interface_endpoints,
+    local.sql_runner_image != "" ? ["ecr.api", "ecr.dkr"] : [],
+    [for e in module.dms_orchestration.network_contract.required_vpc_endpoints : e if contains(["rds", "ec2messages", "ssmmessages"], e)],
+  ))
   vpc_id              = aws_vpc.this.id
   service_name        = "com.amazonaws.${var.region}.${each.key}"
   vpc_endpoint_type   = "Interface"
@@ -513,6 +518,13 @@ module "dms_orchestration" {
     bucket   = module.dms.premigration_assessment.bucket
     folder   = module.dms.premigration_assessment.folder
   } : null
+
+  # ssm_runner.tf: long jobs (pg-dump, restore, e2e-ssm) on the runner instance.
+  ssm = {
+    enabled           = var.ssm_runner
+    instance_ids      = aws_instance.ssm_runner[*].id
+    instance_role_arn = one(aws_iam_role.ssm_runner[*].arn)
+  }
 
   # sql_runner.tf: the image built by CodeBuild, when its tag is given.
   fargate = {

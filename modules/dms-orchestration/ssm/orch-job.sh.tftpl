@@ -1,0 +1,42 @@
+#!/bin/bash
+# orch-job on an SSM runner instance (document ${document_name}); SSM runs this as root.
+# Fetch the runtime zip from the artifacts bucket, check its sha256, run orch_job.py as
+# ${runner_user} with the project's job role. Nothing is downloaded from the internet.
+set -euo pipefail
+umask 077
+runner_user='${runner_user}'
+bucket='${bucket}'
+runtime_key='${runtime_key}'
+runtime_sha256='${runtime_sha256}'
+export AWS_REGION='${region}' AWS_DEFAULT_REGION='${region}' AWS_STS_REGIONAL_ENDPOINTS=regional
+for tool in python3 sha256sum runuser; do
+  command -v "$tool" >/dev/null || { echo "orch: $tool is missing on the runner instance (team AMI)"; exit 96; }
+done
+python3 -c 'import boto3' 2>/dev/null || { echo "orch: python3 on the runner instance has no boto3 (team AMI)"; exit 96; }
+id -u "$runner_user" >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin "$runner_user"
+base=$(mktemp -d /var/tmp/orch-job.XXXXXXXX)
+trap 'rm -rf "$base"' EXIT
+chmod 0711 "$base"
+python3 -c 'import sys, boto3; boto3.client("s3").download_file(sys.argv[1], sys.argv[2], sys.argv[3])' "$bucket" "$runtime_key" "$base/runtime.zip"
+echo "$runtime_sha256  $base/runtime.zip" | sha256sum --check --status || { echo "orch: s3://$bucket/$runtime_key does not match its sha256"; exit 97; }
+mkdir -m 0755 "$base/rt"
+python3 -m zipfile -e "$base/runtime.zip" "$base/rt"
+chmod -R u=rwX,go=rX "$base/rt"
+chmod 0755 "$base"/rt/bin/*
+for d in out work tmp; do install -d -m 0700 -o "$runner_user" "$base/$d"; done
+command_id=$(basename "$(dirname "$(dirname "$(readlink -f "$0")")")")
+cd "$base/work"
+set +e
+runuser -u "$runner_user" -- env -i \
+  PATH="$base/rt/bin:/usr/local/bin:/usr/bin:/bin" HOME="$base/work" LANG=C.UTF-8 \
+  PYTHONPATH="$base/rt" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+  AWS_REGION='${region}' AWS_DEFAULT_REGION='${region}' AWS_STS_REGIONAL_ENDPOINTS=regional \
+  ORCH_OUT_DIR="$base/out" ORCH_WORK_DIR="$base/work" ORCH_TMP_DIR="$base/tmp" \
+  ORCH_ARTIFACTS_BUCKET="$bucket" ORCH_ENVIRONMENT='${environment}' ORCH_DUMP_KMS_KEY='${dump_kms_key}' \
+  ORCH_JOB_SPEC_S3='{{ specS3Uri }}' ORCH_ATTEMPT='{{ attempt }}' ORCH_DRY_RUN='{{ dryRun }}' \
+  ORCH_LOG_STREAM="${log_group}:$command_id/$${AWS_SSM_INSTANCE_ID:-instance}/orchJob/stdout" \
+  python3 "$base/rt/orch_job.py" --assume-role '{{ jobRoleArn }}' --command-from-spec
+code=$?
+set -e
+echo "orch: exit code $code"
+exit "$code"

@@ -358,6 +358,58 @@ variable "fargate" {
   default = {}
 }
 
+variable "ssm" {
+  description = <<-EOT
+    SSM Run Command runtime (runtime ssm) for long jobs: pg-dump, orch.py restore, long DDL, bash
+    or pwsh scripts. Runner instances come from the team AMI (psql, pg_dump, pg_restore, bash,
+    python3 with boto3; pwsh optional) and are managed by SSM. Select them with instance_ids or
+    target_tags (one of the two). instance_role_arn is the role of their instance profile: every
+    project job role trusts it (output ssm_runner_policy_json lists what it needs).
+    document_name_override names an existing document (content in output ssm_document_content)
+    instead of the module's <name>-<environment>-orch-job. runner_user runs the job, never root.
+    When enabled, pg-dump dumps and orch.py restore run on SSM by default.
+  EOT
+  type = object({
+    enabled                = optional(bool, false)
+    instance_ids           = optional(list(string), [])
+    target_tags            = optional(map(string), {})
+    instance_role_arn      = optional(string)
+    document_name_override = optional(string)
+    runner_user            = optional(string, "orch")
+  })
+  default = {}
+
+  validation {
+    condition     = !var.ssm.enabled || ((length(var.ssm.instance_ids) > 0) != (length(var.ssm.target_tags) > 0))
+    error_message = "ssm.enabled needs exactly one of ssm.instance_ids or ssm.target_tags."
+  }
+
+  validation {
+    condition     = alltrue([for id in var.ssm.instance_ids : can(regex("^i-[0-9a-f]{8,17}$", id))])
+    error_message = "ssm.instance_ids must be EC2 instance ids (i-...)."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.ssm.target_tags : can(regex("^[A-Za-z0-9 _.:/=+@-]{1,128}$", k)) && can(regex("^[A-Za-z0-9 _.:/=+@-]{1,256}$", v))])
+    error_message = "ssm.target_tags keys and values must be plain EC2 tag keys and values."
+  }
+
+  validation {
+    condition     = !var.ssm.enabled || can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$", coalesce(var.ssm.instance_role_arn, "-")))
+    error_message = "ssm.enabled needs ssm.instance_role_arn, the IAM role ARN of the runner instance profile."
+  }
+
+  validation {
+    condition     = var.ssm.document_name_override == null || can(regex("^[A-Za-z0-9_.-]{3,128}$", coalesce(var.ssm.document_name_override, "-")))
+    error_message = "ssm.document_name_override must be an SSM document name in this account (A-Z a-z 0-9 _ . -)."
+  }
+
+  validation {
+    condition     = can(regex("^[a-z_][a-z0-9_-]{0,31}$", var.ssm.runner_user)) && var.ssm.runner_user != "root"
+    error_message = "ssm.runner_user must be a plain local user name, not root."
+  }
+}
+
 variable "job_secret_arns" {
   description = "Secrets Manager ARNs jobs may read (database users for pre/post jobs). Allow-list for IAM."
   type        = list(string)
