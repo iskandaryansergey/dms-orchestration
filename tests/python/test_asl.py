@@ -208,6 +208,23 @@ def test_start_does_not_retry_invalid_state():
     assert start["Retry"][0] == {"ErrorEquals": ["DatabaseMigration.InvalidResourceStateException"], "MaxAttempts": 0}
 
 
+def test_start_retries_only_task_failures_and_leaves_a_timeout_to_the_handoff():
+    """Review finding 13: a start that timed out may have reached DMS; a second start would be a
+    second run of the task. The handoff judges the task with the recorded error instead."""
+    start = render(MIGRATE)["States"]["StartReplicationTask"]
+    retried = {e for r in start["Retry"] if r.get("MaxAttempts", 3) > 0 for e in r["ErrorEquals"]}
+    assert retried == {"States.TaskFailed"}
+    catch = {e: c["Next"] for c in start["Catch"] for e in c["ErrorEquals"]}
+    assert catch["States.Timeout"] == "RecordStartError"
+
+
+def test_migrate_start_timeout_records_the_error_and_keeps_the_lock():
+    run = run_migrate(migrate_mocks(StartReplicationTask=raises("States.Timeout", "Task timed out")))
+    assert run.status == "SUCCEEDED" and run.called("Disarm") == [] and run.called("ReleaseLock") == []
+    err = run.called("RecordStartError")[0]["ExpressionAttributeValues"][":e"]["M"]
+    assert err["Error"] == {"S": "States.Timeout"}
+
+
 DDB_RESERVED = {
     "status",
     "name",

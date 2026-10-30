@@ -228,6 +228,14 @@ CASES: dict[str, dict[str, Any]] = {
         mock=err("DatabaseMigration.ResourceQuotaExceededFault", "slow down"),
         retries=0,
     ),
+    # A start that timed out may have reached DMS: never call it again, let the handoff judge the task.
+    "start-timeout-is-not-retried": case(
+        "migrate",
+        "StartReplicationTask",
+        {"status": "CAUGHT_ERROR", "nextState": "RecordStartError"},
+        mock=err("States.Timeout", "Task timed out"),
+        retries=0,
+    ),
     "migrate-start-rejected-unlocks": case(
         "migrate",
         "StartReplicationTask",

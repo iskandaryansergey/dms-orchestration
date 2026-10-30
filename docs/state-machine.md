@@ -129,7 +129,7 @@ ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock 
 |---|---|---|
 | Lambda tasks | Lambda service errors, 6×, backoff 2, full jitter | ClassifyFailure (report states: still notify and unlock) |
 | AcquireLock / Arm / HandOverLock / ReleaseLock | DynamoDB throttling, 5× | contention → reject / classify; ReleaseLock errors → Done (safety nets clean up) |
-| StartReplicationTask | `InvalidResourceStateException` 0×; other task errors 4×, ≤ 60 s | InvalidResourceState → RecordStartError; else Disarm and classify |
+| StartReplicationTask | `InvalidResourceStateException` 0×; other errors DMS answered (`States.TaskFailed`) 4×, ≤ 60 s; `States.Timeout` never (the start may have reached DMS) | InvalidResourceState or timeout → RecordStartError (the handoff judges the task); else Disarm and classify |
 | StartPostDryRun / StartResume | execution limit, timeout 3× | `ExecutionAlreadyExists` = already started |
 | Notify | 3× | ignored |
 | execution | — | `TimeoutSeconds` = 7 days for jobs; the DMS run itself is limited by `runTimeoutSeconds` → watchdog `MigrationOverdue` |

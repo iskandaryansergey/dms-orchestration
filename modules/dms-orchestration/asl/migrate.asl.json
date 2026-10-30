@@ -696,6 +696,7 @@
     },
     "StartReplicationTask": {
       "Type": "Task",
+      "Comment": "Retried only on errors DMS answered (the start did not happen). A timeout is not retried: the start may have reached DMS, so the handoff judges the task (review finding 13).",
       "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",
       "Arguments": {
         "ReplicationTaskArn": "{% $ctx.taskArn %}",
@@ -705,7 +706,7 @@
       "Retry": [
         { "ErrorEquals": ["DatabaseMigration.InvalidResourceStateException"], "MaxAttempts": 0 },
         {
-          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "ErrorEquals": ["States.TaskFailed"],
           "IntervalSeconds": 5,
           "MaxAttempts": 4,
           "BackoffRate": 2,
@@ -717,6 +718,12 @@
         {
           "Comment": "A retried start after a network timeout finds the task already starting. DMS decides: the handoff judges the task with this error (DmsStartRejected if it never moved).",
           "ErrorEquals": ["DatabaseMigration.InvalidResourceStateException"],
+          "Next": "RecordStartError",
+          "Assign": { "failure": "{% $states.errorOutput %}" }
+        },
+        {
+          "Comment": "No answer from DMS: the start may have happened. Not retried, not disarmed: the handoff judges the task with this error (DmsStartRejected if it never moved).",
+          "ErrorEquals": ["States.Timeout"],
           "Next": "RecordStartError",
           "Assign": { "failure": "{% $states.errorOutput %}" }
         },
