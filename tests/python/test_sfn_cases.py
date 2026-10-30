@@ -39,6 +39,7 @@ def test_there_are_cases_for_the_risky_states():
         ("migrate.asl.json", "ArmGuard"),
         ("migrate.asl.json", "CheckAssessmentStatus"),
         ("migrate.asl.json", "StartReplicationTask"),
+        ("migrate.asl.json", "CheckTaskUnchanged"),
         ("migrate.asl.json", "CheckDryRun"),
         ("migrate.asl.json", "CheckContextVersion"),
         ("migrate.asl.json", "RecordContextVersion"),

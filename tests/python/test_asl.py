@@ -114,7 +114,9 @@ def test_no_machine_waits_for_dms():
                 resource = state.get("Resource", "")
                 assert not resource.endswith(".waitForTaskToken"), f"{name}:{state_name} waits for a token"
                 assert "HeartbeatSeconds" not in state, f"{name}:{state_name}"
-                assert "describeReplicationTasks" not in resource, f"{name}:{state_name} polls DMS"
+                if "describeReplicationTasks" in resource:
+                    # One read before the dump and the reset, never in a loop (review finding 6).
+                    assert (name, state_name) == (MIGRATE, "RecheckTask"), f"{name}:{state_name} polls DMS"
                 # Only the job-runner retry backoff and the assessment poll (minutes) wait; never DMS.
                 if state["Type"] == "Wait":
                     assert (name, state_name) in {(JOB_RUNNER, "WaitBeforeRetry"), (MIGRATE, "WaitAssessment")}
@@ -152,6 +154,17 @@ def test_start_replication_task_is_only_reachable_through_arm():
 
 
 DESTRUCTIVE = ("DumpJobs", "ResetJobs")
+
+
+def test_the_task_is_read_again_right_before_the_dump_and_the_reset():
+    """Review finding 6: the task state was read once, by InspectTask, and the reset ran hours
+    later (after the dump) on that reading."""
+    states = render(MIGRATE)["States"]
+    for target in DESTRUCTIVE:
+        assert [n for n, s in states.items() if target in _edges(s)] == ["CheckTaskUnchanged"], target
+    assert [n for n, s in states.items() if "CheckTaskUnchanged" in _edges(s)] == ["RecheckTask"]
+    assert states["RecheckTask"]["Resource"].endswith("databasemigration:describeReplicationTasks")
+    assert "RecheckTask" in _reachable(states, states["DumpJobs"]["Next"], blocked=frozenset({"ResetJobs"}))
 
 
 def test_nothing_touches_the_target_before_the_assessment_and_the_arm_guard_passed():
@@ -409,6 +422,7 @@ def migrate_mocks(req: dict[str, Any] | None = None, dec: dict[str, Any] | None 
         "SaveContext": lambda _a: {"VersionId": "ctx-v1", "ETag": '"e"'},
         "RecordContextVersion": lambda _a: {},
         "ReadMigration": lambda _a: {},
+        "RecheckTask": lambda _a: {"ReplicationTasks": [{"Status": "ready"}]},
         "StartPostDryRun": lambda a: {"ExecutionArn": "arn:post:" + a["Name"]},
         "Arm": lambda _a: {},
         "StartReplicationTask": lambda _a: {"ReplicationTask": {"Status": "starting"}},
@@ -1241,6 +1255,35 @@ def test_dump_runs_before_the_reset_and_only_when_something_is_reset():
     )
     run = run_migrate(no_reset)
     assert run.status == "SUCCEEDED" and "DumpJobs" not in run.path
+
+
+def test_reset_reads_the_task_before_the_dump_and_again_before_the_reset():
+    run = run_migrate(reset_mocks())
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    order = [n for n in run.path if n in ("RecheckTask", "DumpJobs", "ResetJobs", "Arm")]
+    assert order == ["RecheckTask", "DumpJobs", "RecheckTask", "ResetJobs", "Arm"]
+    assert run.called("RecheckTask")[0]["Filters"] == [{"Name": "replication-task-arn", "Values": [TASK_ARN]}]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "dumped"),
+    [
+        ({"Status": "running"}, None, False),
+        ({"Status": "stopped", "StopReason": "NORMAL"}, None, False),
+        ({"Status": "ready"}, {"Status": "starting"}, True),
+    ],
+)
+def test_a_task_that_moved_since_inspect_stops_the_run_before_the_target_is_touched(first, second, dumped):
+    reads = [{"ReplicationTasks": [first]}, {"ReplicationTasks": [second or first]}]
+    run = run_migrate(reset_mocks(RecheckTask=sequence(*reads)))
+    assert (run.status, run.error) == ("FAILED", "TaskStateChanged"), (run.error, run.path)
+    assert bool(run.called("RunDumpJob")) is dumped
+    assert run.called("RunResetJob") == [] and run.called("Arm") == [] and run.called("ReleaseLock")
+
+
+def test_a_failed_recheck_is_classified_before_the_target_is_touched():
+    run = run_migrate(reset_mocks(RecheckTask=raises("DatabaseMigration.ResourceNotFoundFault", "gone")))
+    assert run.status == "FAILED" and run.called("RunDumpJob") == [] and run.called("RunResetJob") == []
 
 
 def test_failed_dump_stops_before_the_reset():

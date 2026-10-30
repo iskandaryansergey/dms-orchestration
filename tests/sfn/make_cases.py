@@ -43,6 +43,7 @@ MIGRATE_VARS: dict[str, Any] = {
     "assessmentArn": None,
     "assessmentPolls": 0,
     "migration": None,
+    "recheckFor": None,
     "failure": None,
     "classification": None,
     "report": None,
@@ -111,6 +112,33 @@ def err(error: str, cause: str = "x") -> dict[str, Any]:
 
 CONDITIONAL = err("DynamoDb.ConditionalCheckFailedException", "The conditional request failed")
 ARMED = {"status": "armed", "runId": "old"}
+STOPPED_TASK = {
+    "status": "stopped",
+    "stopReason": "FATAL_ERROR",
+    "stats": {"fullLoadProgressPercent": 60, "tablesLoaded": 3, "tablesErrored": 0},
+}
+INTERRUPTED = {"state": "interrupted", "task": STOPPED_TASK, "completionSpec": COMPLETION}
+RESET = {"action": "start", "startType": "resume-processing", "reset": True}
+
+
+def described(status: str, stop_reason: str | None = "FATAL_ERROR") -> dict[str, Any]:
+    task: dict[str, Any] = {
+        "ReplicationTaskArn": TASK,
+        "Status": status,
+        "ReplicationTaskStats": {"FullLoadProgressPercent": 60, "TablesLoaded": 3, "TablesErrored": 0},
+    }
+    if stop_reason:
+        task["StopReason"] = stop_reason
+    return {"ReplicationTasks": [task]}
+
+
+DUMP_JOB = {
+    "name": "dump-target",
+    "index": 0,
+    "runtime": "fargate",
+    "command": ["pg-dump-s3", "--connection", "target"],
+}
+DUMP_CTX = {**CTX, "jobs": {**CTX["jobs"], "dump": [DUMP_JOB]}}
 RESUME_REQ = {
     "project": "ledger",
     "taskKey": "core",
@@ -173,8 +201,27 @@ CASES: dict[str, dict[str, Any]] = {
     "reset-dumps-first": case(
         "migrate",
         "CheckReset",
-        {"status": "SUCCEEDED", "nextState": "DumpJobs"},
+        {"status": "SUCCEEDED", "nextState": "RecheckTask", "variables": {"recheckFor": "dump"}},
         decision={"action": "start", "startType": "reload-target", "reset": True},
+        ctx=DUMP_CTX,
+    ),
+    "recheck-task-unchanged-continues": case(
+        "migrate",
+        "CheckTaskUnchanged",
+        {"status": "SUCCEEDED", "nextState": "DumpJobs"},
+        input_=described("stopped"),
+        inspect=INTERRUPTED,
+        decision=RESET,
+        recheckFor="dump",
+    ),
+    "recheck-task-running-stops": case(
+        "migrate",
+        "CheckTaskUnchanged",
+        {"status": "SUCCEEDED", "nextState": "ClassifyFailure"},
+        input_=described("running", None),
+        inspect=INTERRUPTED,
+        decision=RESET,
+        recheckFor="reset",
     ),
     "dry-run-hands-over-to-post": case(
         "migrate",

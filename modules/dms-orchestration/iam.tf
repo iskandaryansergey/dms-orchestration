@@ -151,6 +151,13 @@ locals {
         Resource = distinct(values(var.dms.task_arns))
       },
       {
+        # RecheckTask: the task is read again right before the dump and the reset.
+        Sid      = "RecheckDmsTasks"
+        Effect   = "Allow"
+        Action   = ["dms:DescribeReplicationTasks"]
+        Resource = "*"
+      },
+      {
         # job-runner (.sync) and post (dry run hands over without DMS)
         Sid      = "StartJobRunnerAndPost"
         Effect   = "Allow"

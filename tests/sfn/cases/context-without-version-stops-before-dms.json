@@ -54,6 +54,7 @@
     "assessmentArn": null,
     "assessmentPolls": 0,
     "migration": null,
+    "recheckFor": null,
     "failure": null,
     "classification": null,
     "report": null,
