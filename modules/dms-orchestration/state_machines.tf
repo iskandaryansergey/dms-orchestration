@@ -88,6 +88,9 @@ resource "aws_sfn_state_machine" "job_runner" {
   }
 
   tags = local.tags
+
+  # CreateStateMachine checks the role for the managed rule of ecs:runTask.sync.
+  depends_on = [aws_iam_role_policy.job_runner]
 }
 
 resource "aws_sfn_state_machine" "run" {
@@ -119,6 +122,9 @@ resource "aws_sfn_state_machine" "run" {
   }
 
   tags = local.tags
+
+  # CreateStateMachine checks the role (StartExecution.sync rule, Lambda invoke): policies first.
+  depends_on = [aws_iam_role_policy.migrate, aws_iam_role_policy.post]
 }
 
 ############################################

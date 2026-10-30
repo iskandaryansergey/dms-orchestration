@@ -174,7 +174,13 @@ resource "aws_lambda_function" "this" {
 
   tags = local.tags
 
-  depends_on = [aws_cloudwatch_log_group.lambda]
+  # CreateFunction in a VPC checks the role for CreateNetworkInterface: policies first.
+  depends_on = [
+    aws_cloudwatch_log_group.lambda,
+    aws_iam_role_policy.lambda_core,
+    aws_iam_role_policy.lambda_waiter,
+    aws_iam_role_policy.lambda_jobs,
+  ]
 }
 
 # DMS events -> handler is asynchronous; failed invocations go to the DLQ.
