@@ -1,0 +1,9 @@
+scramp-1.5.0.dist-info/INSTALLER,sha256=5hhM4Q4mYTT9z6QB6PGpUAW81PGNFrYrdXMj4oM_6ak,2
+scramp-1.5.0.dist-info/METADATA,sha256=og8KXoDJWBkfKhRI_nRDRDRsBjgM7fliMkDXbzUhLhQ,34355
+scramp-1.5.0.dist-info/RECORD,,
+scramp-1.5.0.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+scramp-1.5.0.dist-info/WHEEL,sha256=W3fkpkm7-wf9vBI5Z-7s0eWkeM-spu78I8Neb98DeEg,87
+scramp-1.5.0.dist-info/licenses/LICENSE,sha256=JCmmOL2d8ElJXJ8VPcUExMXJ_aWAPZ-IQ-Ibr10rAKM,906
+scramp/__init__.py,sha256=kqMicxih5zpId_LceVDYVaKRiV1IB3MZuYuvrUHoHJE,228
+scramp/core.py,sha256=8kAXb-HAeGHDftGVsl6bUjVqVFeIirLJQs8wKFQglzo,38673
+scramp/utils.py,sha256=n80KOYq5oJqw5yuBr7Wmon66I5eW0_PqVIZEYathRks,5237

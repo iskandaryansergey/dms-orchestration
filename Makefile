@@ -2,7 +2,7 @@
 TF ?= terraform
 MODULE := modules/dms-orchestration
 
-.PHONY: test lint fmt tf-test py-test teststate-dry image denylist sandbox-validate docs docs-check
+.PHONY: test lint fmt tf-test py-test teststate-dry image denylist sandbox-validate docs docs-check vendor vendor-check
 
 test: py-test tf-test
 
@@ -32,6 +32,15 @@ tf-test:
 
 teststate-dry:
 	uv run python tests/sfn/run_teststate.py --dry
+
+# Lambda SQL runtime: pg8000 and its dependencies vendored into src/lambdas/sql_jobs/vendor from
+# requirements.txt (hashes, wheels only). vendor-check rebuilds into a temporary directory and fails
+# on any difference or on a CA bundle that does not match its pin (needs PyPI, not AWS).
+vendor:
+	uv run python scripts/vendor_sql_jobs.py build
+
+vendor-check:
+	uv run python scripts/vendor_sql_jobs.py check
 
 image:
 	docker build -f src/jobs/sql-runner/Dockerfile -t sql-runner:dev .
