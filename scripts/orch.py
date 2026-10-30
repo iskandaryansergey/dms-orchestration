@@ -390,13 +390,68 @@ def _dump_run_id(c: Clients, dump: str) -> str | None:
     return json.loads(c.get("s3").get_object(Bucket=bucket, Key=key)["Body"].read()).get("runId")
 
 
+def _conditional_failure(err: Exception) -> bool:
+    return getattr(err, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+
+
+class TaskLock:
+    """The task lock (LOCK#<taskArn>) held by orch.py restore like a run holds it (ADR 0004).
+
+    ``executionArn`` is the job-runner execution working at the moment: the watchdog releases
+    the lock once that execution ended and the grace period passed, so a lock left behind by a
+    killed CLI does not block the task for good."""
+
+    def __init__(self, ddb: Any, table: str, task_arn: str, run_id: str, project: str, task: str):
+        self.ddb, self.table, self.run_id = ddb, table, run_id
+        self.key = {"pk": {"S": f"LOCK#{task_arn}"}, "sk": {"S": "LOCK"}}
+        self.attrs = {"entity": {"S": "LOCK"}, "project": {"S": project}, "taskKey": {"S": task}}
+
+    def hold(self, execution_arn: str, *, first: bool) -> None:
+        """First: only if no lock exists. Later: move it to the next execution (or take it back
+        if the watchdog released it between two executions)."""
+        item = {
+            **self.key,
+            **self.attrs,
+            "runId": {"S": self.run_id},
+            "executionArn": {"S": execution_arn},
+            "acquiredAt": {"S": datetime.now(UTC).isoformat()},
+            "gsi2pk": {"S": "LOCK#ACTIVE"},
+            "gsi2sk": {"S": execution_arn},
+        }
+        cond: dict[str, Any] = {"ConditionExpression": "attribute_not_exists(pk)"}
+        if not first:
+            cond = {
+                "ConditionExpression": "attribute_not_exists(pk) OR runId = :me",
+                "ExpressionAttributeValues": {":me": {"S": self.run_id}},
+            }
+        try:
+            self.ddb.put_item(TableName=self.table, Item=item, **cond)
+        except Exception as err:
+            if _conditional_failure(err):
+                raise SystemExit("another run holds the task lock: restore after it ends") from None
+            raise
+
+    def release(self, out: Any) -> None:
+        try:
+            self.ddb.delete_item(
+                TableName=self.table,
+                Key=self.key,
+                ConditionExpression="runId = :me",
+                ExpressionAttributeValues={":me": {"S": self.run_id}},
+            )
+        except Exception as err:  # noqa: BLE001 - report, never mask the restore's own outcome
+            note = "no longer held by this restore" if _conditional_failure(err) else f"not released: {err}"
+            _print({"taskLock": note}, out)
+
+
 def cmd_restore(args: argparse.Namespace, c: Clients, out: Any) -> int:
-    """pg-restore-s3 as a job-runner execution with the project's job role.
+    """pg-restore-s3 as a job-runner execution with the project's job role, under the task lock.
 
     A successful restore puts the target in a known, intended state: the target is then
     fingerprinted (checks/target_verify, phase restore) and the fingerprint becomes the baseline
     with ``source=restore`` and the ``runId`` of the run that took the dump, so the next run does
-    not stop as ``TargetChanged`` (ADR 0006). The command always waits for both."""
+    not stop as ``TargetChanged`` (ADR 0006). The command always waits for both and holds the
+    task lock (``LOCK#<taskArn>``, only if none exists) from before the start to the end."""
     if not args.confirm:
         raise SystemExit("restore drops and recreates the objects of the dump: add --confirm")
     if not (args.table and args.ssm_prefix and args.state_machine_arn):
@@ -417,6 +472,26 @@ def cmd_restore(args: argparse.Namespace, c: Clients, out: Any) -> int:
     record = bool((connections.get("target") or {}).get("dataApiClusterArn")) and not args.dry_run
     dump_run = _dump_run_id(c, args.dump) if record else None
     run_id = f"restore-{args.project}-{args.task}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"[:71]
+    lock = TaskLock(c.get("dynamodb"), args.table, reg["taskArn"], run_id, args.project, args.task)
+    lock.hold(execution_arn(job_runner, run_id), first=True)
+    try:
+        return _restore_locked(args, c, out, reg, job_runner, run_id, record, dump_run, lock)
+    finally:
+        lock.release(out)
+
+
+def _restore_locked(
+    args: argparse.Namespace,
+    c: Clients,
+    out: Any,
+    reg: dict[str, Any],
+    job_runner: str,
+    run_id: str,
+    record: bool,
+    dump_run: str | None,
+    lock: TaskLock,
+) -> int:
+    connections = reg.get("connections") or {}
     job = {
         "name": "restore-target",
         "index": 0,
@@ -467,6 +542,7 @@ def cmd_restore(args: argparse.Namespace, c: Clients, out: Any) -> int:
     }
     vctx = {**ctx, "selectionRules": _selection_rules(task.get("TableMappings"))}
     body = {"job": verify, "phase": "restore", "runId": run_id, "dryRun": False, "ctx": vctx, "failure": None}
+    lock.hold(execution_arn(job_runner, f"{run_id}-baseline"), first=False)
     resp = sfn.start_execution(stateMachineArn=job_runner, name=f"{run_id}-baseline", input=json.dumps(body))
     vdesc = wait_for(sfn, resp["executionArn"], args.poll, out)
     if vdesc["status"] != "SUCCEEDED":

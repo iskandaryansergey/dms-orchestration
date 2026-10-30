@@ -177,11 +177,14 @@ log group used to survive destroy.
 
 With `dump.enabled` in the request (or `dump_before_reset = true` in the task defaults) every
 run that resets the target first dumps the scope with `pg-dump-s3` (Fargate `sql-runner`):
-`pg_dump -Fc --no-owner --no-privileges` of the schemas of the table mapping, streamed into
+the target's tables that the selection rules of the table mapping select (the tables a reset
+truncates) — `pg_dump -Fc --no-owner --no-privileges -t <table>…`, with their indexes,
+constraints, defaults, triggers and owned sequences — streamed into
 `s3://<bucket>/dumps/<project>/<taskKey>/<ts>-<runId>/target.dump` with a `manifest.json`
-(SHA-256, size). SSE-KMS only (bucket policy), kept `dump_retention_days` (14), readable only by
-the project's job role. No roles or passwords are dumped. A failed dump stops the run before
-anything is truncated.
+(SHA-256, size, project, task key, `tables`). SSE-KMS only (bucket policy), kept
+`dump_retention_days` (14), readable only by the project's job role. No roles or passwords are
+dumped. A failed dump stops the run before anything is truncated. A partitioned table in scope
+is refused (`-t` would take it without its partitions): use `"method": "snapshot"` (11.1).
 
 ```bash
 python scripts/orch.py dumps --project ledger --task core
@@ -189,9 +192,29 @@ python scripts/orch.py restore --project ledger --task core \
   --dump s3://<bucket>/dumps/ledger/core/<ts>-<runId>/ --confirm --wait
 ```
 
-`restore` refuses without `--confirm` and while a run holds the task lock; it checks the SHA-256
-and runs `pg_restore --clean --if-exists` on the same schemas in one transaction. It always waits
-(`--wait` is accepted and changes nothing).
+`restore` refuses without `--confirm` and while a run holds the task lock. It takes the task lock
+itself (`LOCK#<taskArn>`, written only if none exists, `runId` `restore-<project>-<task>-<ts>`,
+`executionArn` of its job-runner execution) before it starts anything and deletes it when it
+ends, whatever the outcome; no run can start during a restore. If the CLI is killed, the
+watchdog releases the lock once the execution ended and `lock_grace_seconds` passed. It always
+waits (`--wait` is accepted and changes nothing).
+
+The job (`pg-restore-s3`) then, in this order, and stops with nothing changed at the first
+failure:
+
+1. checks that the manifest's `project` and `taskKey` are those of the restore and the location
+   is under `dumps/<project>/<taskKey>/`; a dump without `tables` in its manifest is refused;
+2. downloads the dump and checks its SHA-256;
+3. lists the archive (`pg_restore -l`) and keeps only the objects of the manifest's tables
+   (never a schema, extension, function or another table): `--clean` drops and recreates
+   exactly those, nothing else in their schemas; a table of the manifest missing from the
+   archive stops it;
+4. streams `pg_restore --clean --if-exists -L <list>` into `psql` (`ON_ERROR_STOP`) inside
+   `BEGIN;` … and sends `COMMIT;` only after pg_restore exited 0, otherwise `ROLLBACK;`. Any
+   failure leaves the target as it was before the restore.
+
+A table of the manifest that an out-of-scope table references by a foreign key cannot be
+dropped: the restore fails and rolls back; drop or defer that constraint with the database team.
 
 After a successful restore the restored target becomes the new baseline (ADR 0006): the target
 is fingerprinted (`checks/target_verify`, Data API) and `TARGET#BASELINE` records
