@@ -63,6 +63,16 @@ def in_scope(rules: list[dict[str, str]], schema: str, table: str) -> bool:
     return selected
 
 
+def reset_scope(fp: dict[str, Any], rules: list[dict[str, str]] | None) -> list[str]:
+    """Tables a reset truncates: those of the fingerprint the selection rules select.
+
+    Never the DMS table statistics or a payload list: only what the target check saw in scope."""
+    tables = (fp.get("tables") or {}).keys()
+    if not rules:
+        return sorted(tables)
+    return sorted(t for t in tables if "." in t and in_scope(rules, *t.split(".", 1)))
+
+
 def scope_schemas(rules: list[dict[str, str]]) -> list[str] | None:
     """Schemas to scan; None when a schema pattern has a wildcard (scan every user schema)."""
     names = {r["schema"] for r in rules if r["action"] != "exclude"}
@@ -170,7 +180,8 @@ def verdict(
     reset_configured: bool,
     iteration: int,
     max_iterations: int,
-    scope_tables: list[str] | None = None,
+    selection_rules: list[dict[str, str]] | None = None,
+    allow_no_fingerprint: bool = False,
     previous_missing: int | None = None,
     restored_from: str | None = None,
     table_stats: list[dict[str, Any]] | None = None,
@@ -178,19 +189,31 @@ def verdict(
     """The pre-flight table of ADR 0006 on top of the DMS decision (``dms_outcome.decide``).
 
     ``restored_from``: the baseline came from ``orch.py restore`` of a dump taken by that run.
-    ``table_stats``: DMS table statistics of the task (``[{"table", "state"}]``)."""
+    ``table_stats``: DMS table statistics of the task (``[{"table", "state"}]``).
+    ``selection_rules``: of the task's table mapping; a reset truncates the fingerprint's tables
+    they select. Without a fingerprint (``current`` None) there is never a reset, and a fresh
+    task is ``ready`` only with ``allow_no_fingerprint`` (``preflight.allowNoFingerprint``)."""
     warnings: list[str] = []
     d = diff(current, baseline) if current is not None else {}
     if d.get("outOfScope"):
         warnings.append(
             f"{len(d['outOfScope'])} object(s) outside the table mapping (left alone): {d['outOfScope'][:5]}"
         )
-    tables = sorted((current or {}).get("tables") or scope_tables or [])
+    tables = reset_scope(current, selection_rules) if current is not None else []
 
     def manual(error: str, reason: str) -> Verdict:
         if not allow_reset:
             return Verdict(
                 "manual", f"{reason}; run again with allowReset to reset the target", decision, error, d, warnings
+            )
+        if current is None:
+            return Verdict(
+                "manual",
+                f"{reason}; no target fingerprint, so no reset: the scope to truncate was not checked",
+                decision,
+                "NoFingerprint",
+                d,
+                warnings,
             )
         if not reset_configured:
             return Verdict(
@@ -253,6 +276,18 @@ def verdict(
             )
         if rows:
             return manual("TargetNotEmpty", f"the DMS task never ran but the target has {rows} row(s) in scope")
+        if current is None:
+            why = "first run, but no target fingerprint: the target may not be empty"
+            if not allow_no_fingerprint:
+                return Verdict(
+                    "manual",
+                    f"{why}; run again with preflight.allowNoFingerprint",
+                    decision,
+                    "NoFingerprint",
+                    d,
+                    warnings,
+                )
+            return Verdict("ready", f"{why}; allowNoFingerprint given", decision, None, d, warnings)
         return Verdict("ready", "first run, target empty in scope", decision, None, d, warnings)  # row 2
 
     if state == "interrupted" or (state == "completed" and decision.get("action") == "start"):

@@ -115,6 +115,11 @@
           "type": "integer",
           "minimum": 0,
           "description": "auto: Fargate when the last baseline's database was larger (default 53687091200, 50 GiB)"
+        },
+        "allowNoFingerprint": {
+          "type": "boolean",
+          "default": false,
+          "description": "A fresh task without a target fingerprint (no target check) is ready instead of manual (NoFingerprint); it is never reset"
         }
       }
     },

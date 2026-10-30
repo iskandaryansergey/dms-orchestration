@@ -262,11 +262,52 @@ def test_reset_without_a_reset_phase_is_manual():
     assert v.verdict == "manual" and v.error == "ResetNotConfigured"
 
 
-def test_without_a_fingerprint_the_dms_state_decides_and_warns():
+def test_without_a_fingerprint_an_interrupted_task_resumes_with_a_warning():
     v = judge(state="interrupted", decision=RESUME, current=None)
     assert v.verdict == "resume" and any("fingerprint" in w for w in v.warnings)
-    v = judge(state="completed", decision=ALREADY, current=None, allow_reset=True, scope_tables=["app.a"])
-    assert v.verdict == "reset" and v.decision["resetTables"] == ["app.a"]
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"state": "completed", "decision": ALREADY},
+        {"state": "fresh", "table_copy": [{"table": "app.tx", "TableState": "Table completed"}]},
+        {
+            "state": "interrupted",
+            "decision": RESUME,
+            "restored_from": "r1",
+            "table_stats": [{"table": "app.tx", "state": "Table error"}],
+        },
+    ],
+)
+def test_without_a_fingerprint_allow_reset_never_resets(kw):
+    """Nothing tells what is in the target: a reset would truncate a scope nobody checked."""
+    v = judge(current=None, allow_reset=True, **kw)
+    assert (v.verdict, v.error) == ("manual", "NoFingerprint"), v
+    assert v.decision == kw.get("decision", START)  # the DMS decision, never a reset decision
+
+
+def test_without_a_fingerprint_a_fresh_task_is_manual_unless_allowed():
+    v = judge(state="fresh", current=None)
+    assert (v.verdict, v.error) == ("manual", "NoFingerprint")
+    v = judge(state="fresh", current=None, allow_no_fingerprint=True)
+    assert v.verdict == "ready" and v.decision == START and any("fingerprint" in w for w in v.warnings)
+    v = judge(state="fresh", current=None, allow_no_fingerprint=True, allow_reset=True)
+    assert v.verdict == "ready" and v.decision["reset"] is False and v.decision["resetTables"] == []
+
+
+def test_reset_scope_is_the_in_scope_tables_of_the_fingerprint():
+    """Not the DMS table statistics: the tables the target has and the selection rules select."""
+    current = fp({"app.accounts": table(3), "app.tmp_load": table(9), "app.tx": table(0)})
+    stats = [{"table": "app.gone", "state": "Table completed"}, {"table": "other.x", "state": "Table completed"}]
+    v = judge(
+        current=current,
+        allow_reset=True,
+        selection_rules=preflight.selection_rules(MAPPING),
+        table_stats=stats,
+    )
+    assert v.verdict == "reset" and v.decision["resetTables"] == ["app.accounts", "app.tx"]
+    assert "truncate 2 table(s)" in v.reason
 
 
 def test_verdict_report_is_json_ready():
