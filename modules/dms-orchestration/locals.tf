@@ -89,15 +89,16 @@ locals {
         defaultVersion = t.jobs.default_version
       }
       defaults = {
-        completion            = t.defaults.completion
-        targetResetPolicy     = t.defaults.target_reset_policy
-        runTimeoutSeconds     = coalesce(t.defaults.run_timeout_seconds, var.run_timeout_seconds)
-        autoResumeMaxAttempts = t.defaults.auto_resume_max_attempts
-        autoResumeCategories  = t.defaults.auto_resume_categories
-        failOnTableErrors     = t.defaults.fail_on_table_errors
-        dumpBeforeReset       = t.defaults.dump_before_reset
-        snapshotDumps         = t.defaults.snapshot_dumps
-        dumpRetentionDays     = var.dump_retention_days
+        completion             = t.defaults.completion
+        targetResetPolicy      = t.defaults.target_reset_policy
+        runTimeoutSeconds      = coalesce(t.defaults.run_timeout_seconds, var.run_timeout_seconds)
+        autoResumeMaxAttempts  = t.defaults.auto_resume_max_attempts
+        autoResumeCategories   = t.defaults.auto_resume_categories
+        failOnTableErrors      = t.defaults.fail_on_table_errors
+        failOnValidationErrors = t.defaults.fail_on_validation_errors
+        dumpBeforeReset        = t.defaults.dump_before_reset
+        snapshotDumps          = t.defaults.snapshot_dumps
+        dumpRetentionDays      = var.dump_retention_days
       }
       assessment = var.assessment == null ? null : {
         roleArn       = var.assessment.role_arn

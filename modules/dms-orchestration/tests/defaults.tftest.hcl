@@ -173,6 +173,12 @@ run "storage_and_registration" {
     error_message = "fail_on_table_errors defaults to true"
   }
 
+  # Tables DMS did not validate fail the run unless the task opts out.
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).defaults.failOnValidationErrors == true
+    error_message = "fail_on_validation_errors defaults to true"
+  }
+
   assert {
     condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).taskArn == var.dms.task_arns.core
     error_message = "registration must carry the task ARN from the DMS module"
