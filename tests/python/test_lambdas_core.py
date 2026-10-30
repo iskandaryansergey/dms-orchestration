@@ -1172,6 +1172,16 @@ def test_resolve_context_adds_the_dump_job_when_asked_or_by_default(env):
     assert handler({"request": req, "execution": {**EXECUTION, "name": "r-d3"}})["ctx"]["jobs"]["dump"] == []
 
 
+def test_resolve_context_dumps_on_ssm_when_the_runtime_is_on(env, monkeypatch):
+    from lambdas.resolve_context.handler import handler
+
+    monkeypatch.setenv("SSM_JOBS", "1")
+    req = {"project": "ledger", "taskKey": "core", "dump": {"enabled": True}}
+    (dump,) = handler({"request": req, "execution": {**EXECUTION, "name": "r-s1"}})["ctx"]["jobs"]["dump"]
+    assert dump["runtime"] == "ssm" and "image" not in dump
+    assert dump["command"][:3] == ["pg-dump-s3", "--connection", "target"] and dump["timeoutSeconds"] == 21600
+
+
 def test_resolve_context_refuses_the_snapshot_method_unless_the_task_allows_it(env):
     from lambdas.resolve_context.handler import handler
     from shared.errors import InvalidRunRequest

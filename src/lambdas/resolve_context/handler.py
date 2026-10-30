@@ -182,7 +182,8 @@ SNAPSHOT_WAIT_SECONDS = 600  # one Lambda polls this long; 3 attempts cover the 
 def dump_jobs(options: dict[str, Any], defaults: dict[str, Any]) -> list[dict[str, Any]]:
     """Dump of the target before a reset.
 
-    ``pg-dump`` (default): pg_dump of the scope streamed to S3 (Fargate sql-runner).
+    ``pg-dump`` (default): pg_dump of the scope streamed to S3, on an SSM runner instance when the
+    module's SSM runtime is on (``SSM_JOBS``), in the Fargate sql-runner otherwise.
     ``snapshot``: an Aurora cluster snapshot (built-in Lambda job, polled until available);
     only for tasks registered with ``snapshot_dumps`` (the project job role has the rights).
     """
@@ -207,12 +208,12 @@ def dump_jobs(options: dict[str, Any], defaults: dict[str, Any]) -> list[dict[st
                 "onError": "fail",
             }
         ]
+    where = {"runtime": "ssm"} if aws.env("SSM_JOBS", "0") == "1" else {"runtime": "fargate", "image": "sql-runner"}
     return [
         {
             "name": "dump-target",
             "index": 0,
-            "runtime": "fargate",
-            "image": "sql-runner",
+            **where,
             "command": ["pg-dump-s3", "--connection", "target"],
             "timeoutSeconds": 21600,
             "retry": {"maxAttempts": 1, "backoffSeconds": 60},

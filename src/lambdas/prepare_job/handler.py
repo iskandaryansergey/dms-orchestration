@@ -4,12 +4,14 @@
   (for on_failure jobs) and the results of earlier jobs of this run;
 * renders ``{{ }}`` templates in ``command`` and ``with``;
 * resolves where the job runs: built-in Lambda, the Lambda SQL runtime (``sql:`` jobs,
-  ``SQL_JOBS_ARN``), a project Lambda from the allow-list, or a Fargate task definition
-  for the job's image;
-* adds the project's job role (``jobRoleArn``): the Fargate task role and the role
-  built-in and sql jobs assume, the only roles that can read the project's secrets;
+  ``SQL_JOBS_ARN``), a project Lambda from the allow-list, the SSM runtime (``SSM_JOBS``:
+  the module document on a runner instance) or a Fargate task definition for the job's image;
+* adds the project's job role (``jobRoleArn``): the Fargate task role, the role orch-job
+  assumes on an SSM runner and the role built-in and sql jobs assume, the only roles that can
+  read the project's secrets;
 * writes the full job spec to ``s3://<bucket>/runs/<project>/<runId>/jobs/<phase>/<nn>-<name>/spec.json``
-  (Fargate jobs read it via ORCH_JOB_SPEC_S3; it never contains secret values);
+  (Fargate and SSM jobs read it via ORCH_JOB_SPEC_S3, with the command; it never contains
+  secret values);
 * expands a reset list kept in S3 (``ctx.resetTablesUri``, above the payload cap) into
   ``spec.json`` only: the state payload keeps ``resetTables`` empty and ``resetTablesCount``.
   Such a job reads the list from its spec (``psql-run --truncate-scope``); a ``{{ ctx.resetTables }}``
@@ -74,7 +76,11 @@ def resolve_target(job: dict[str, Any]) -> dict[str, Any]:
             raise InvalidJobSet(f"job {job['name']}: function {job.get('function')} is not in job_lambda_arns")
         return {"functionArn": job["function"]}
     if job["runtime"] == "ssm":
-        raise InvalidJobSet(f"job {job['name']}: runtime ssm is not configured in this module")
+        if aws.env("SSM_JOBS", "0") != "1":
+            raise InvalidJobSet(
+                f"job {job['name']}: runtime ssm needs the module's SSM runtime (ssm.enabled with runner instances)"
+            )
+        return {}
     task_definitions = json.loads(aws.env("TASK_DEFINITIONS", "{}"))
     image = job.get("image") or "sql-runner"
     if image not in task_definitions:
@@ -148,8 +154,9 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
     except expr.ExprError as err:
         raise InvalidJobSet(f"job {job['name']}: bad template: {err}") from err
     spec.update(resolve_target(job))
-    if job["runtime"] == "fargate" or job.get("handler") or job.get("sql"):
-        # Fargate task role / role assumed by built-in and sql jobs: only this project's secrets.
+    if job["runtime"] in ("fargate", "ssm") or job.get("handler") or job.get("sql"):
+        # Fargate task role / role assumed on the SSM runner and by built-in and sql jobs:
+        # only this project's secrets.
         role = json.loads(aws.env("JOB_ROLE_ARNS", "{}")).get(ctx.get("project"))
         if not role:
             raise InvalidJobSet(f"job {job['name']}: no job role for project {ctx.get('project')!r}")
@@ -187,6 +194,6 @@ def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
     )
     log.info(LOGGER, "job prepared", runId=event["runId"], job=spec["name"], phase=event["phase"], skip=spec["skip"])
     # The state machine only needs the routing fields; the full spec stays in S3.
-    if spec["runtime"] == "fargate" and not spec["skip"]:
+    if spec["runtime"] in ("fargate", "ssm") and not spec["skip"]:
         spec = {k: v for k, v in spec.items() if k not in ("ctx", "previous", "connections", "failure", "with")}
     return {"spec": spec}

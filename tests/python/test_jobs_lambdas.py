@@ -161,6 +161,32 @@ def test_prepare_project_lambda_must_be_allow_listed(jobs_env):
         handler(event(job(runtime="lambda", function="arn:aws:lambda:eu-west-2:1:function:evil", command=[])))
 
 
+def test_prepare_ssm_job_gets_the_job_role_and_only_routing_fields(jobs_env, monkeypatch):
+    from lambdas.prepare_job.handler import handler
+
+    monkeypatch.setenv("SSM_JOBS", "1")
+    j = job(runtime="ssm", image=None, command=["pg-dump-s3", "--connection", "target", "--label", "{{ run.runId }}"])
+    spec = handler(event(j, phase="dump"))["spec"]
+    assert spec["runtime"] == "ssm" and spec["jobRoleArn"] == "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"
+    assert "taskDefinitionArn" not in spec and "functionArn" not in spec
+    assert spec["specS3Uri"] == f"s3://{BUCKET}/runs/ledger/run-1/jobs/dump/01-reset-target/spec.json"
+    assert not {"ctx", "connections", "previous", "with", "failure"} & set(spec)
+    stored = json.loads(
+        jobs_env.get_object(Bucket=BUCKET, Key="runs/ledger/run-1/jobs/dump/01-reset-target/spec.json")["Body"].read()
+    )
+    # orch-job on the runner reads the rendered command from here, never from the document.
+    assert stored["command"] == ["pg-dump-s3", "--connection", "target", "--label", "run-1"]
+
+
+def test_prepare_refuses_an_ssm_job_when_the_runtime_is_off(jobs_env, monkeypatch):
+    from lambdas.prepare_job.handler import handler
+    from shared.errors import InvalidJobSet
+
+    monkeypatch.setenv("SSM_JOBS", "0")
+    with pytest.raises(InvalidJobSet, match=r"ssm\.enabled"):
+        handler(event(job(runtime="ssm", image=None)))
+
+
 def test_prepare_unknown_image(jobs_env):
     from lambdas.prepare_job.handler import handler
     from shared.errors import InvalidJobSet
