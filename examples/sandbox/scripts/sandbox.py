@@ -2,7 +2,7 @@
 """Sandbox helper: seed data, upload the job set, look at DMS and run timelines.
 
     sandbox.py seed                       # schema + data on the source, dms_source password
-    sandbox.py test-connections           # MaxFileSize 0 fix on PG targets, TestConnection of every endpoint
+    sandbox.py test-connections           # TestConnection of every endpoint
     sandbox.py sync-jobs                  # jobs/jobset*.yaml.tmpl as jobs/ledger/e2e/, e2e-dms-only/
     sandbox.py build-image <git-sha>      # sandbox only (sql_runner=true): CodeBuild image -> ECR
     sandbox.py sync-jobs-fargate          # jobs/jobset-fargate.yaml.tmpl as jobs/ledger/e2e-fargate/
@@ -246,32 +246,6 @@ def cmd_build_image(out: dict[str, Any], tag: str) -> int:
     return 0
 
 
-DMS_DEFAULT_MAX_FILE_SIZE_KB = 32768
-
-
-def fix_target_max_file_size(dms: Any, endpoint_arns: list[str]) -> list[str]:
-    """Raise MaxFileSize = 0 on PostgreSQL targets to the DMS default; return the fixed ARNs.
-
-    The upstream dms module always renders postgres_settings for a PostgreSQL target, and the
-    provider then sends max_file_size = 0 (it is in state as 0). DMS 3.5.4 with that loads
-    0 rows into the target and never finishes (seen live, docs/dms-observations.md).
-    The module does not expose the field; until it does, set it through the API. That
-    resets the endpoint's connection test, so run this before TestConnection.
-    """
-    fixed = []
-    for arn in endpoint_arns:
-        for e in dms.describe_endpoints(Filters=[{"Name": "endpoint-arn", "Values": [arn]}])["Endpoints"]:
-            settings = e.get("PostgreSQLSettings") or {}
-            if (
-                e["EndpointType"].upper() == "TARGET"
-                and e["EngineName"] in ("postgres", "aurora-postgresql")
-                and settings.get("MaxFileSize") == 0
-            ):
-                dms.modify_endpoint(EndpointArn=arn, PostgreSQLSettings={"MaxFileSize": DMS_DEFAULT_MAX_FILE_SIZE_KB})
-                fixed.append(arn)
-    return fixed
-
-
 def start_connection_test(dms: Any, ri: str, arn: str) -> bool:
     """TestConnection; False if a test is already running (ModifyEndpoint starts one itself)."""
     try:
@@ -286,8 +260,6 @@ def start_connection_test(dms: Any, ri: str, arn: str) -> bool:
 def cmd_test_connections(out: dict[str, Any]) -> None:
     dms = session(out).client("dms")
     ri = out["replication_instance_arn"]
-    for arn in fix_target_max_file_size(dms, list(out["endpoint_arns"].values())):
-        print(f"MaxFileSize 0 -> {DMS_DEFAULT_MAX_FILE_SIZE_KB} KB on {arn}")
     for arn in out["endpoint_arns"].values():
         start_connection_test(dms, ri, arn)
     deadline = time.monotonic() + 600

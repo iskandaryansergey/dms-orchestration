@@ -1,4 +1,4 @@
-"""examples/sandbox/scripts/sandbox.py: the sandbox-only workaround for MaxFileSize = 0."""
+"""examples/sandbox/scripts/sandbox.py: sandbox-only helpers."""
 
 from __future__ import annotations
 
@@ -16,41 +16,43 @@ spec.loader.exec_module(sandbox)
 
 
 class FakeDms:
-    def __init__(self, endpoints):
-        self.endpoints = endpoints
-        self.modified = []
+    """Only TestConnection and DescribeConnections: any other DMS call fails the test."""
 
-    def describe_endpoints(self, Filters):
-        arn = Filters[0]["Values"][0]
-        return {"Endpoints": [e for e in self.endpoints if e["EndpointArn"] == arn]}
+    def __init__(self):
+        self.tested = []
 
-    def modify_endpoint(self, EndpointArn, PostgreSQLSettings):
-        self.modified.append((EndpointArn, PostgreSQLSettings))
+    def test_connection(self, ReplicationInstanceArn, EndpointArn):  # noqa: N803
+        self.tested.append((ReplicationInstanceArn, EndpointArn))
         return {}
 
-
-def ep(arn, kind, engine="aurora-postgresql", max_file_size=0):
-    settings = {} if max_file_size is None else {"MaxFileSize": max_file_size}
-    return {"EndpointArn": arn, "EndpointType": kind, "EngineName": engine, "PostgreSQLSettings": settings}
+    def describe_connections(self, Filters):  # noqa: N803
+        return {"Connections": [{"EndpointIdentifier": a, "Status": "successful"} for _, a in self.tested]}
 
 
-def test_target_postgres_with_zero_max_file_size_is_raised_to_the_default():
-    # Seen live: the provider sends max_file_size = 0 in postgres_settings (the upstream
-    # dms module), and DMS 3.5.4 then loads 0 rows into a PostgreSQL target and never ends.
-    dms = FakeDms([ep("src", "SOURCE"), ep("tgt", "TARGET"), ep("ok", "TARGET", max_file_size=32768)])
-    fixed = sandbox.fix_target_max_file_size(dms, ["src", "tgt", "ok"])
-    assert fixed == ["tgt"]
-    assert dms.modified == [("tgt", {"MaxFileSize": 32768})]
+def test_the_max_file_size_workaround_is_gone():
+    # Fixed in the upstream dms module from the minimum commit in upstream.env.example (contract 2.6).
+    assert not hasattr(sandbox, "fix_target_max_file_size")
+    assert "MaxFileSize" not in SCRIPT.read_text(encoding="utf-8")
 
 
-def test_other_engines_and_unset_size_are_left_alone():
-    dms = FakeDms([ep("my", "TARGET", engine="mysql"), ep("unset", "TARGET", max_file_size=None)])
-    assert sandbox.fix_target_max_file_size(dms, ["my", "unset"]) == []
-    assert dms.modified == []
+def test_test_connections_only_tests_the_connections(monkeypatch, capsys):
+    dms = FakeDms()
+
+    class Session:
+        def client(self, name):
+            assert name == "dms"
+            return dms
+
+    monkeypatch.setattr(sandbox, "session", lambda out: Session())
+    monkeypatch.setattr(sandbox.time, "sleep", lambda s: pytest.fail("no wait when nothing is testing"))
+    out = {"replication_instance_arn": "ri", "endpoint_arns": {"source": "src", "target": "tgt"}}
+    sandbox.cmd_test_connections(out)
+    assert dms.tested == [("ri", "src"), ("ri", "tgt")]
+    assert "successful" in capsys.readouterr().out
 
 
 def test_connection_test_already_running_is_not_an_error():
-    # Seen live: ModifyEndpoint (the MaxFileSize fix) starts a connection test by itself.
+    # Seen live: ModifyEndpoint starts a connection test by itself, so one can already be running.
     from botocore.exceptions import ClientError
 
     class Busy:
