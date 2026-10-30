@@ -17,16 +17,19 @@ locals {
   kms_key_arns = local.use_cmk ? [var.kms_key_arn] : []
 
   # Storage and notifications: created or brought by the caller.
-  create_table   = var.table_name == ""
-  table_name     = local.create_table ? aws_dynamodb_table.this[0].name : var.table_name
-  table_arn      = "arn:${local.partition}:dynamodb:${local.region}:${local.account_id}:table/${local.table_name}"
-  create_bucket  = var.artifacts_bucket_name == ""
-  bucket_name    = local.create_bucket ? "${local.prefix}-artifacts-${local.account_id}" : var.artifacts_bucket_name
-  bucket_arn     = "arn:${local.partition}:s3:::${local.bucket_name}"
-  create_topic   = var.sns_topic_arn == ""
-  topic_arn      = local.create_topic ? aws_sns_topic.this[0].arn : var.sns_topic_arn
-  create_cluster = var.fargate.cluster_arn == null
-  cluster_arn    = local.create_cluster ? aws_ecs_cluster.this[0].arn : var.fargate.cluster_arn
+  create_table  = var.table_name == ""
+  table_name    = local.create_table ? aws_dynamodb_table.this[0].name : var.table_name
+  table_arn     = "arn:${local.partition}:dynamodb:${local.region}:${local.account_id}:table/${local.table_name}"
+  create_bucket = var.artifacts_bucket_name == ""
+  bucket_name   = local.create_bucket ? "${local.prefix}-artifacts-${local.account_id}" : var.artifacts_bucket_name
+  bucket_arn    = "arn:${local.partition}:s3:::${local.bucket_name}"
+  create_topic  = var.sns_topic_arn == ""
+  topic_arn     = local.create_topic ? aws_sns_topic.this[0].arn : var.sns_topic_arn
+  # Fargate is an optional third runtime (ADR 0011): ECS cluster, task definitions, ECS roles
+  # and the ECR endpoints exist only when fargate.images is non-empty.
+  fargate_enabled = length(var.fargate.images) > 0
+  create_cluster  = local.fargate_enabled && var.fargate.cluster_arn == null
+  cluster_arn     = !local.fargate_enabled ? null : local.create_cluster ? aws_ecs_cluster.this[0].arn : var.fargate.cluster_arn
 
   ssm_prefix = "/${var.name}/${var.environment}"
 

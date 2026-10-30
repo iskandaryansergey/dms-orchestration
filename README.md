@@ -13,7 +13,7 @@ operator / CI ──► migrate: lock ─ inspect task ─ pre-flight verdict �
                            ─ [dump] ─ [reset] ─ arm ─ StartReplicationTask ─ end (no waiting)
 AWS DMS ──event──► dms_event_handler ─ claim ─► post: post-jobs | classify ─ [auto-resume]
                            ─ on-failure jobs ─ baseline ─ report ─ SNS ─ unlock
-jobs:   job-runner ─► built-in Lambda checks | Fargate sql-runner (psql, pg_dump, python, bash, pwsh)
+jobs:   job-runner ─► Lambda (built-ins, SQL) | SSM runner from your AMI (pg_dump, scripts) | [Fargate]
 state:  DynamoDB (locks, runs, baselines) · S3 (job sets, reports, dumps) · SSM (registration)
 safety: watchdog every 5 min (lost events, dead executions, orphaned locks) · release_lock
 ```
@@ -72,7 +72,6 @@ module "dms_orchestration" {
 
   job_secret_arns             = [var.source_runner_secret_arn, var.target_runner_secret_arn]
   kms_key_arn                 = var.kms_key_arn  # null only in a sandbox
-  fargate                     = { images = { sql-runner = "${var.ecr}/dms-orch/sql-runner:${var.jobs_image_tag}" } }
   database_security_group_ids = [var.target_db_security_group_id, var.source_db_security_group_id]
 }
 ```
@@ -82,6 +81,15 @@ pass `sns_topic_arn`, `table_name` and `artifacts_bucket_name` from a long-lived
 (RUNBOOK §9–10). The module creates no VPC endpoints, KMS key policies or operator roles; it
 publishes what they must allow (`network_contract`, `kms_key_policy_requirements`,
 `operator_policy_json`, `jobset_publisher_policy_json`).
+
+Footprint: Lambda functions from zips the module packages (or a prebuilt zip,
+`lambda.artifact_s3_*`), three Step Functions state machines, IAM roles, SSM parameters, alarms
+and, unless you bring them, a DynamoDB table, an S3 bucket and an SNS topic. No ECS cluster, no
+ECR endpoints and no container image by default: SQL jobs run in a Lambda, long jobs
+(`pg_dump`/`pg_restore`, long DDL, scripts) on SSM-managed instances built from your AMI
+(`ssm`), and Fargate is an optional third runtime that appears only with `fargate.images`, a
+pre-pushed image pinned by digest. The module never builds an image
+([ADR 0011](docs/adr/0011-job-runtimes.md)).
 
 ## Run a migration
 
@@ -104,7 +112,7 @@ examples [minimal](examples/jobs/minimal) and [postgres-basic](examples/jobs/pos
 modules/dms-orchestration/   Terraform module (+ asl/ state machines, tests/ terraform test)
 src/shared/                  decision logic, pre-flight, handoff (migrate -> post), DynamoDB store, schemas
 src/lambdas/                 one directory per Lambda handler
-src/jobs/sql-runner/         Fargate image: Dockerfile, orch_job.py entrypoint, psql-run, dumps, verify-target
+src/jobs/sql-runner/         SSM runtime zip and optional Fargate image: orch_job.py, psql-run, dumps, verify-target
 examples/jobs/               example job sets
 examples/sandbox/            throw-away stack and the e2e scenarios
 scripts/                     orch.py (CLI), sync-jobs.sh, jobset_tool.py, verify_destroyed.py, check_denylist.py

@@ -259,7 +259,7 @@ locals {
           Sid       = "PassJobRoles"
           Effect    = "Allow"
           Action    = ["iam:PassRole"]
-          Resource  = concat([aws_iam_role.ecs_execution.arn, aws_iam_role.ecs_task.arn], values(local.job_role_arns))
+          Resource  = concat(aws_iam_role.ecs_execution[*].arn, aws_iam_role.ecs_task[*].arn, values(local.job_role_arns))
           Condition = { StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" } }
         },
         ] : st if length(var.fargate.images) > 0], [for st in [
@@ -671,6 +671,7 @@ resource "aws_iam_role_policy" "lambda_jobs" {
 }
 
 resource "aws_iam_role" "ecs_execution" {
+  count                = local.fargate_enabled ? 1 : 0
   name                 = "${local.prefix}-ecs-execution"
   assume_role_policy   = local.ecs_assume
   permissions_boundary = local.boundary
@@ -678,12 +679,14 @@ resource "aws_iam_role" "ecs_execution" {
 }
 
 resource "aws_iam_role_policy" "ecs_execution" {
+  count  = local.fargate_enabled ? 1 : 0
   name   = "ecs-execution"
-  role   = aws_iam_role.ecs_execution.id
+  role   = aws_iam_role.ecs_execution[0].id
   policy = jsonencode(local.ecs_execution_policy)
 }
 
 resource "aws_iam_role" "ecs_task" {
+  count                = local.fargate_enabled ? 1 : 0
   name                 = "${local.prefix}-ecs-job"
   assume_role_policy   = local.ecs_assume
   permissions_boundary = local.boundary
@@ -691,8 +694,9 @@ resource "aws_iam_role" "ecs_task" {
 }
 
 resource "aws_iam_role_policy" "ecs_task" {
+  count  = local.fargate_enabled ? 1 : 0
   name   = "ecs-job"
-  role   = aws_iam_role.ecs_task.id
+  role   = aws_iam_role.ecs_task[0].id
   policy = jsonencode(local.ecs_task_policy)
 }
 

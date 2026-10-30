@@ -1,32 +1,58 @@
-# sql-runner: Fargate image for long pre/reset/post/on_failure jobs.
-# Tools: psql (PostgreSQL 17 client), mysql client, Python 3.13 + boto3, bash, PowerShell 7.
+# sql-runner: image for the optional Fargate runtime (ADR 0011). The module never builds it:
+# the default path runs SQL jobs in Lambda and long jobs on SSM; whoever wants Fargate builds
+# this image in their own pipeline and passes the pushed URI (by digest) in fargate.images.
+# Tools: psql (PostgreSQL 17 client), mysql client, Python 3.13 + boto3, bash; PowerShell 7
+# with --build-arg INSTALL_POWERSHELL=true.
 #
 # Build from the repository root (the image needs src/shared/expr.py):
 #   docker build -f src/jobs/sql-runner/Dockerfile -t sql-runner:<git-sha> .
-# CI scans it with trivy (fails on HIGH/CRITICAL) and lints it with hadolint.
+# Every source is a build arg, so a platform without internet access builds from its mirrors:
+#   --build-arg BASE_IMAGE=<registry mirror>/python:<tag>@sha256:<digest>
+#   --build-arg PGDG_APT_URL=... PGDG_KEY_URL=... PIP_INDEX_URL=... RDS_CA_URL=... POWERSHELL_DEB_URL=...
+# Every download is checked (sha256 or the signing key fingerprint), Python packages install by
+# hash only (requirements.txt, compiled from requirements.in). Mirrors serve the same bytes,
+# so the checksums stay. CI (only when vars.BUILD_SQL_RUNNER_IMAGE is 'true') lints it with
+# hadolint and scans it with trivy (fails on HIGH/CRITICAL).
 
-# Pin by digest in the target platform's registry mirror (CI resolves the tag to a digest).
-FROM python:3.13.16-slim-bookworm
+# The digest of the official image's index; a mirror keeps it.
+ARG BASE_IMAGE=python:3.13.16-slim-bookworm@sha256:73aa5faee130c60da030e105ec971ccf57473fbd22ce73bd6fc9ba99a40b838d
+FROM ${BASE_IMAGE}
 
-ARG POWERSHELL_VERSION=7.4.6
-ARG INSTALL_POWERSHELL=true
 ARG PG_MAJOR=17
+ARG PGDG_APT_URL=https://apt.postgresql.org/pub/repos/apt
+ARG PGDG_KEY_URL=https://www.postgresql.org/media/keys/ACCC4CF8.asc
+ARG PGDG_KEY_FINGERPRINT=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+# The bundle the Lambda SQL runtime pins too (src/shared/sqlclient.py CA_BUNDLE_SHA256).
+ARG RDS_CA_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+ARG RDS_CA_SHA256=90a6f1a7978a1b1b096dca6c57511ca48d3b8cf052f8e704baf358f34ea2f21b
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG INSTALL_POWERSHELL=false
+ARG POWERSHELL_DEB_URL=https://github.com/PowerShell/PowerShell/releases/download/v7.4.6/powershell_7.4.6-1.deb_amd64.deb
+ARG POWERSHELL_DEB_SHA256=79642721f0bc9baf07dafaab68ece1cbd822f86722492acf9b4031d41029a735
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# PostgreSQL client from the PGDG repository (Aurora PostgreSQL 13-17), MySQL-compatible client,
-# RDS CA bundle for sslmode=verify-full. libssl3/openssl: take the bookworm-security build
-# (the base image can lag behind it; trivy fails on fixed HIGH/CRITICAL CVEs).
+# PostgreSQL client from the PGDG repository (Aurora PostgreSQL 13-17): its signing key is used
+# only when its fingerprint is the pinned one and it is the only key in the file. MySQL-compatible
+# client, RDS CA bundle for sslmode=verify-full (sha256 checked). libssl3/openssl: take the
+# bookworm-security build (the base image can lag behind it; trivy fails on fixed HIGH/CRITICAL).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release libssl3 openssl \
+ && GNUPGHOME="$(mktemp -d)" && export GNUPGHOME \
+ && curl -fsSL -o /tmp/pgdg.asc "${PGDG_KEY_URL}" \
+ && fprs="$(gpg --batch --show-keys --with-colons /tmp/pgdg.asc | awk -F: '$1 == "pub" {getline; print $10}')" \
+ && test "${fprs}" = "${PGDG_KEY_FINGERPRINT}" \
  && install -d /usr/share/postgresql-common/pgdg \
- && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
- && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+ && install -m 0644 /tmp/pgdg.asc /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+ && rm -rf /tmp/pgdg.asc "${GNUPGHOME}" \
+ && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] ${PGDG_APT_URL} $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends "postgresql-client-${PG_MAJOR}" default-mysql-client \
- && curl -fsSL -o /etc/ssl/certs/rds-global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+ && curl -fsSL -o /etc/ssl/certs/rds-global-bundle.pem "${RDS_CA_URL}" \
+ && echo "${RDS_CA_SHA256}  /etc/ssl/certs/rds-global-bundle.pem" | sha256sum -c - \
  && if [ "${INSTALL_POWERSHELL}" = "true" ]; then \
-      curl -fsSL -o /tmp/pwsh.deb "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/powershell_${POWERSHELL_VERSION}-1.deb_amd64.deb" \
+      curl -fsSL -o /tmp/pwsh.deb "${POWERSHELL_DEB_URL}" \
+      && echo "${POWERSHELL_DEB_SHA256}  /tmp/pwsh.deb" | sha256sum -c - \
       && apt-get install -y --no-install-recommends /tmp/pwsh.deb \
       && rm -f /tmp/pwsh.deb; \
     fi \
@@ -34,9 +60,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY src/jobs/sql-runner/requirements.txt /opt/orch/requirements.txt
-# pip is not needed at runtime: remove it with its vendored certifi, msgpack, urllib3 and
-# setuptools (pkg_resources), which trivy reads from pip's SBOM.
-RUN pip install --no-cache-dir -r /opt/orch/requirements.txt \
+# Wheels by hash only. pip is not needed at runtime: remove it with its vendored certifi,
+# msgpack, urllib3 and setuptools (pkg_resources), which trivy reads from pip's SBOM.
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: --index-url "${PIP_INDEX_URL}" -r /opt/orch/requirements.txt \
  && pip uninstall -y pip
 
 COPY src/shared/__init__.py src/shared/expr.py src/shared/preflight.py src/shared/fingerprint.py src/shared/bundle.py src/shared/errors.py /opt/orch/shared/

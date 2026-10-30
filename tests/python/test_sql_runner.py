@@ -478,6 +478,79 @@ def test_dockerfile_removes_pip_from_final_image() -> None:
     assert "pip uninstall -y pip" in text
 
 
+# --- Dockerfile supply chain (review finding 12): whoever builds the optional image ------
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _build_args(text: str) -> dict[str, str]:
+    return dict(re.findall(r"^ARG ([A-Z0-9_]+)=(\S*)$", text, re.M))
+
+
+def test_dockerfile_base_image_is_a_build_arg_pinned_by_digest() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    base = _build_args(text).get("BASE_IMAGE", "")
+    assert re.search(r"@sha256:[0-9a-f]{64}$", base), base
+    froms = [line for line in text.splitlines() if line.startswith("FROM ")]
+    assert froms == ["FROM ${BASE_IMAGE}"]
+    assert text.index("ARG BASE_IMAGE=") < text.index("FROM ")
+
+
+def test_dockerfile_takes_every_source_as_a_build_arg_for_internal_mirrors() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    args = _build_args(text)
+    for arg in ("PGDG_APT_URL", "PGDG_KEY_URL", "PIP_INDEX_URL", "RDS_CA_URL", "POWERSHELL_DEB_URL"):
+        assert args.get(arg, "").startswith("https://"), arg
+        assert "${" + arg + "}" in text, f"{arg} is declared but not used"
+    # No source is hard-coded outside its build arg.
+    code = [line for line in text.splitlines() if not line.startswith(("#", "ARG "))]
+    assert [line for line in code if "https://" in line or "http://" in line] == []
+
+
+def test_dockerfile_checks_every_download() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    args = _build_args(text)
+    assert re.fullmatch(r"[0-9a-f]{64}", args.get("RDS_CA_SHA256", ""))
+    assert re.fullmatch(r"[0-9a-f]{64}", args.get("POWERSHELL_DEB_SHA256", ""))
+    assert re.fullmatch(r"[0-9A-F]{40}", args.get("PGDG_KEY_FINGERPRINT", ""))
+    # Three downloads (PGDG key, RDS CA bundle, PowerShell .deb), each checked before use.
+    assert len(re.findall(r"\bcurl\b[^\n]*-o ", text)) == 3
+    assert "${RDS_CA_SHA256}" in text and "${POWERSHELL_DEB_SHA256}" in text
+    assert text.count("sha256sum -c") == 2
+    assert '"${PGDG_KEY_FINGERPRINT}"' in text
+    # One RDS CA bundle across runtimes: the one the Lambda SQL runtime pins.
+    sqlclient = (REPO_ROOT / "src/shared/sqlclient.py").read_text(encoding="utf-8")
+    assert f'CA_BUNDLE_SHA256 = "{args["RDS_CA_SHA256"]}"' in sqlclient
+
+
+def test_dockerfile_installs_python_packages_by_hash_only() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert "--require-hashes" in text and '--index-url "${PIP_INDEX_URL}"' in text
+    reqs = (REPO_ROOT / "src/jobs/sql-runner/requirements.txt").read_text(encoding="utf-8")
+    pins = re.findall(r"^([A-Za-z0-9_.-]+)==\S+ \\$", reqs, re.M)
+    assert {"boto3", "botocore", "urllib3"} <= set(pins)
+    for block in re.split(r"\n(?=[A-Za-z])", reqs.strip()):
+        if block.startswith("#"):
+            continue
+        assert "--hash=sha256:" in block, block.splitlines()[0]
+
+
+def test_dockerfile_powershell_is_off_by_default() -> None:
+    assert _build_args(DOCKERFILE.read_text(encoding="utf-8"))["INSTALL_POWERSHELL"] == "false"
+
+
+def test_ci_builds_the_image_only_when_asked() -> None:
+    import yaml
+
+    ci = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8"))
+    image = ci["jobs"]["image"]
+    assert image["if"] == "vars.BUILD_SQL_RUNNER_IMAGE == 'true'"
+    steps = " ".join(str(s.get("run", "")) for s in image["steps"])
+    assert "hadolint" in steps
+    static = " ".join(str(s.get("run", "")) for s in ci["jobs"]["static"]["steps"])
+    assert "hadolint" not in static
+
+
 # --- the sandbox CodeBuild context (examples/sandbox/sql_runner.tf) -------------------
 
 
@@ -505,6 +578,15 @@ def test_sandbox_build_context_holds_every_file_the_dockerfile_copies() -> None:
         elif src not in listed:
             missing.append(src)
     assert missing == []
+
+
+def test_sandbox_build_takes_the_pinned_base_through_the_build_arg() -> None:
+    """The sandbox CodeBuild pulls the digest-pinned default of BASE_IMAGE from the ECR Public
+    mirror (Docker Hub rate-limits CodeBuild) and passes it as the build arg."""
+    tf = (REPO_ROOT / "examples/sandbox/sql_runner.tf").read_text(encoding="utf-8")
+    assert "s/^ARG BASE_IMAGE=//p" in tf
+    assert '--build-arg BASE_IMAGE="public.ecr.aws/docker/library/$base"' in tf
+    assert "s/^FROM //p" not in tf
 
 
 # --- IAM database authentication for Fargate jobs --------------------------

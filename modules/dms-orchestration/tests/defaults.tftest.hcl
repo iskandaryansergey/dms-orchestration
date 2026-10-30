@@ -416,6 +416,46 @@ run "network_contract_with_snapshot_dumps" {
   }
 }
 
+# Fargate is an optional third runtime (ADR 0011): with the default fargate = {} the module
+# creates no ECS cluster, no task definitions, no ECS roles and asks for no ECR endpoints.
+run "no_ecs_resources_by_default" {
+  command = apply
+
+  variables {
+    fargate = {}
+  }
+
+  assert {
+    condition     = length(aws_ecs_cluster.this) == 0 && length(aws_ecs_task_definition.job) == 0
+    error_message = "no ECS cluster and no task definitions without fargate.images"
+  }
+
+  assert {
+    condition     = length(aws_iam_role.ecs_execution) == 0 && length(aws_iam_role.ecs_task) == 0 && length(aws_iam_role_policy.ecs_execution) == 0 && length(aws_iam_role_policy.ecs_task) == 0
+    error_message = "no ECS execution or task roles without fargate.images"
+  }
+
+  assert {
+    condition     = output.ecs_cluster_arn == null && output.task_definition_arns == {}
+    error_message = "ecs_cluster_arn is null without fargate.images"
+  }
+
+  assert {
+    condition     = !contains(output.network_contract.required_vpc_endpoints, "ecr.api") && !contains(output.network_contract.required_vpc_endpoints, "ecr.dkr")
+    error_message = "no ECR endpoints in the network contract without fargate.images"
+  }
+
+  assert {
+    condition     = !strcontains(aws_iam_role.job["ledger"].assume_role_policy, "ecs-tasks.amazonaws.com") && !strcontains(aws_iam_role_policy.job_runner.policy, "ecs:RunTask") && !strcontains(aws_iam_role_policy.job_runner.policy, "iam:PassRole")
+    error_message = "no job role trusts ECS tasks and the job-runner neither runs tasks nor passes roles"
+  }
+
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).runtimes.fargate == false && aws_lambda_function.this["prepare_job"].environment[0].variables.TASK_DEFINITIONS == "{}"
+    error_message = "the registration and prepare_job know there is no Fargate runtime"
+  }
+}
+
 # The SSM runtime is opt-in: nothing of it exists and nothing can reach a runner by default.
 run "no_ssm_runtime_by_default" {
   command = apply

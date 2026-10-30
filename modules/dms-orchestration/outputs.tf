@@ -38,7 +38,7 @@ output "lambda_function_arns" {
 }
 
 output "ecs_cluster_arn" {
-  description = "ECS cluster used for Fargate jobs."
+  description = "ECS cluster used for Fargate jobs (the module's or fargate.cluster_arn). null when fargate.images is empty: Fargate is an optional runtime."
   value       = local.cluster_arn
 }
 
@@ -94,7 +94,7 @@ output "kms_key_policy_requirements" {
     },
     {
       Sid       = "ModuleRoles"
-      Principal = { AWS = concat([aws_iam_role.migrate.arn, aws_iam_role.post.arn, aws_iam_role.job_runner.arn, aws_iam_role.lambda_core.arn, aws_iam_role.lambda_waiter.arn, aws_iam_role.lambda_jobs.arn, aws_iam_role.ecs_execution.arn, aws_iam_role.ecs_task.arn, aws_iam_role.scheduler.arn], values(local.job_role_arns)) }
+      Principal = { AWS = concat([aws_iam_role.migrate.arn, aws_iam_role.post.arn, aws_iam_role.job_runner.arn, aws_iam_role.lambda_core.arn, aws_iam_role.lambda_waiter.arn, aws_iam_role.lambda_jobs.arn, aws_iam_role.scheduler.arn], aws_iam_role.ecs_execution[*].arn, aws_iam_role.ecs_task[*].arn, values(local.job_role_arns)) }
       Action    = ["kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"]
     },
   ]) : "[]"
@@ -137,13 +137,15 @@ output "network_contract" {
     egress                 = "443 to the VPC CIDR (interface endpoints) and the S3/DynamoDB prefix lists, or https_egress_*; database_ports to the databases"
     # rds: dump.method = snapshot calls the RDS API from the jobs (defaults.snapshot_dumps).
     required_vpc_endpoints = concat(
-      ["states", "dms", "secretsmanager", "kms", "logs", "ecr.api", "ecr.dkr", "s3 (gateway)", "dynamodb (gateway)", "ssm", "sns", "sqs", "sts"],
+      ["states", "dms", "secretsmanager", "kms", "logs", "s3 (gateway)", "dynamodb (gateway)", "ssm", "sns", "sqs", "sts"],
+      # Fargate runtime (fargate.images): the tasks pull the image through ECR.
+      local.fargate_enabled ? ["ecr.api", "ecr.dkr"] : [],
       anytrue([for t in values(local.tasks) : t.defaults.snapshot_dumps]) ? ["rds"] : [],
       # SSM runtime: the runner instances' agent (ssm is listed above already).
       local.ssm_enabled ? ["ec2messages", "ssmmessages"] : [],
     )
     optional_vpc_endpoints   = ["rds-data (Data API jobs)", "monitoring", "xray (enable_xray)"]
-    not_needed_vpc_endpoints = ["lambda", "events", "ecs", "ecs-agent", "ecs-telemetry"]
+    not_needed_vpc_endpoints = concat(["lambda", "events", "ecs", "ecs-agent", "ecs-telemetry"], local.fargate_enabled ? [] : ["ecr.api", "ecr.dkr"])
   }
 }
 

@@ -49,7 +49,7 @@ run "least_privilege" {
 
   assert {
     condition = alltrue(flatten([
-      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution, aws_iam_role_policy.ecs_task, aws_iam_role_policy.scheduler], values(aws_iam_role_policy.job)) : [
+      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0], aws_iam_role_policy.scheduler], values(aws_iam_role_policy.job)) : [
         for st in jsondecode(p.policy).Statement : alltrue([for a in flatten([st.Action]) : a != "*" && !endswith(a, ":*")])
       ]
     ]))
@@ -58,7 +58,7 @@ run "least_privilege" {
 
   assert {
     condition = alltrue(flatten([
-      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution, aws_iam_role_policy.ecs_task, aws_iam_role_policy.scheduler], values(aws_iam_role_policy.job)) : [
+      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0], aws_iam_role_policy.scheduler], values(aws_iam_role_policy.job)) : [
         for st in jsondecode(p.policy).Statement : alltrue([
           for a in flatten([st.Action]) : contains([
             "dms:DescribeReplicationTasks", "dms:DescribeTableStatistics", "dms:DescribeConnections", "dms:DescribeEvents", "dms:DescribeEndpoints", "dms:DescribeReplicationTaskAssessmentRuns",
@@ -85,7 +85,7 @@ run "least_privilege" {
 
   assert {
     condition = alltrue([
-      for p in [aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution, aws_iam_role_policy.ecs_task] :
+      for p in [aws_iam_role_policy.post, aws_iam_role_policy.job_runner, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0]] :
       length([for st in jsondecode(p.policy).Statement : st if contains(flatten([st.Action]), "dms:StartReplicationTask")]) == 0
     ])
     error_message = "only migrate starts DMS tasks (ADR 0005)"
@@ -108,7 +108,7 @@ run "least_privilege" {
 
   assert {
     condition = alltrue([
-      for p in [aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.ecs_execution] :
+      for p in [aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.ecs_execution[0]] :
       length([for st in jsondecode(p.policy).Statement : st if contains(flatten([st.Action]), "secretsmanager:GetSecretValue")]) == 0
     ])
     error_message = "orchestration roles must not read secrets"
@@ -125,7 +125,7 @@ run "least_privilege" {
   }
 
   assert {
-    condition     = alltrue([for r in [aws_iam_role.migrate, aws_iam_role.post, aws_iam_role.lambda_core, aws_iam_role.ecs_task, aws_iam_role.scheduler] : r.permissions_boundary == var.permissions_boundary_arn])
+    condition     = alltrue([for r in [aws_iam_role.migrate, aws_iam_role.post, aws_iam_role.lambda_core, aws_iam_role.ecs_task[0], aws_iam_role.scheduler] : r.permissions_boundary == var.permissions_boundary_arn])
     error_message = "every role gets the permissions boundary"
   }
 
@@ -249,7 +249,7 @@ run "per_project_job_roles" {
 
   assert {
     condition = alltrue([
-      for p in [aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_task] :
+      for p in [aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_task[0]] :
       length([for st in jsondecode(p.policy).Statement : st if length(setintersection(toset(flatten([st.Action])), toset(["secretsmanager:GetSecretValue", "rds-data:ExecuteStatement"]))) > 0]) == 0
     ])
     error_message = "shared job roles must not read secrets or use the Data API"
@@ -297,7 +297,7 @@ run "per_project_job_roles" {
 
   assert {
     condition = alltrue(flatten([
-      for p in [aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_task] : [
+      for p in [aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_task[0]] : [
         for st in jsondecode(p.policy).Statement : [for r in flatten([st.Resource]) : !strcontains(r, "/runs/")]
       ]
     ]))
@@ -646,7 +646,7 @@ run "ssm_runtime_least_privilege" {
 
   assert {
     condition = alltrue([
-      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution, aws_iam_role_policy.ecs_task], values(aws_iam_role_policy.job)) :
+      for p in concat([aws_iam_role_policy.migrate, aws_iam_role_policy.post, aws_iam_role_policy.lambda_core, aws_iam_role_policy.lambda_waiter, aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_execution[0], aws_iam_role_policy.ecs_task[0]], values(aws_iam_role_policy.job)) :
       !strcontains(p.policy, "ssm:SendCommand")
     ])
     error_message = "only the job-runner sends SSM commands"
