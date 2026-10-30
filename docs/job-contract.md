@@ -220,7 +220,7 @@ token for `auth = iam`) and needs a connection with `host`; PostgreSQL only.
 | `connection` | registered connection (default `target`) |
 | `file` | one bundle file or a list (up to 20), checked against `bundle.sha256` |
 | `inline` | SQL in the job set itself (up to 16 KB) |
-| `truncateScope: true` | `TRUNCATE` of `ctx.resetTables` in one statement, the full list also above the payload cap; `cascade: true` adds `CASCADE` |
+| `truncateScope: true` | `TRUNCATE` of `ctx.resetTables` in one statement, the full list also above the payload cap; `cascade: true` adds `CASCADE`. Tables missing on the target (dropped since the run the DMS statistics come from) are skipped and named in the message (`summary.skippedMissing`) |
 | `vars` | values for `{{ var.<name> }}`; they may use `{{ }}` templates themselves |
 | `singleTransaction` | all files in one transaction (`BEGIN` … `COMMIT`, `ROLLBACK` on the first error) |
 

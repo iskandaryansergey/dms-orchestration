@@ -327,6 +327,7 @@ The stack with `ssm_runner`, `snapshot_dumps`, `assessment`, `sqs_fanout`, no im
   Lambda SQL runtime truncated all of them in one statement, DMS loaded them in about 90 s, and
   DMS validation was still running after 40 minutes. After such a run is stopped and the extra
   tables are dropped on both sides, the next run takes its reset list (604) from the DMS table
-  statistics of the stopped run and its truncate fails on the missing tables (fail-closed).
+  statistics of the stopped run and its truncate failed on the missing tables (fail-closed);
+  since then `truncateScope` skips tables missing on the target and names them.
 * **Bucket controls:** a dump object written without SSE-KMS is denied (`DenyDumpsWithoutKms`),
   also for the operator.
