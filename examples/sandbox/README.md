@@ -44,6 +44,7 @@ Give them as `TF_VAR_*` once per shell, so every `terraform` command (and `e2e s
 |---|---|---|
 | `TF_VAR_operator_cidr` | — (required) | your IP for seeding through the cluster endpoints |
 | `TF_VAR_sql_runner` | `false` | ECR, CodeBuild and the Fargate `sql-runner` task definition (`s1f`, `s10`, `s8fargate`, `s1iam`) |
+| `TF_VAR_ssm_runner` | `false` | the SSM runner instance and the module's SSM runtime (`s1ssm`, `s10` on SSM); `TF_VAR_runner_ami_id` = the team AMI, empty = Amazon Linux 2023 stand-in |
 | `TF_VAR_sql_runner_image_tag` | `""` | the image tag `sbx build-image` printed; the task definition and the ECR endpoints come with it |
 | `TF_VAR_assessment` | `false` | the premigration assessment bucket and role (`s14`) |
 | `TF_VAR_snapshot_dumps` | `false` | job role snapshot rights and the `rds` endpoint (`s10snap`) |
@@ -78,6 +79,7 @@ sbx test-connections  # target MaxFileSize 0 -> 32768 if the dms module left it 
 sbx sync-jobs         # job sets "e2e", "e2e-dms-only", "e2e-postfail"
 sbx sync-jobs-fargate # job set "e2e-fargate"
 sbx sync-jobs-iam     # job set "e2e-iam"
+sbx sync-jobs-ssm     # job set "e2e-ssm" (ssm_runner)
 ```
 
 Run `sbx test-connections` again after every later `terraform apply`: an apply that touches an
@@ -102,9 +104,10 @@ e2e s8 s4 s9             # spoiled target -> MANUAL, allowReset, resume through 
 e2e s13                  # a failed post job, repeated with orch.py post --from-job
 e2e s1f                  # reset and post jobs on Fargate (sql_runner)
 e2e s1iam                # a Fargate post job logged in by IAM token (iam_auth)
+e2e s1ssm                # reset and post jobs on the SSM runner (ssm_runner)
 e2e s8fargate            # the target check through psql on Fargate (sql_runner)
 e2e idem-sfn             # a real ExecutionAlreadyExists from post's StartResume
-e2e s10                  # dump, failed reload, restore, restore baseline (sql_runner)
+e2e s10                  # dump, failed reload, restore, restore baseline (ssm_runner, else sql_runner)
 e2e s10snap              # dump by cluster snapshot, retention (snapshot_dumps)
 e2e s14                  # premigration assessment stops before DMS (assessment)
 e2e guard                # an armed MIGRATION# refuses before the reset

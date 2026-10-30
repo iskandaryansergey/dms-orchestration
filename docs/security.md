@@ -77,6 +77,8 @@ runs the `.tftest.hcl` files with a mock provider; the Python tests run with mot
 | Operator: no job set uploads, reads only reports, writes only `LOCK#` items; job set publishing per project | `iam.tftest.hcl::operator_cannot_publish_job_sets` |
 | Restore baseline: written only in the `restore` phase, through `dynamodb:LeadingKeys` on `TARGET#` | `iam.tftest.hcl::least_privilege`, `test_jobs_lambdas.py::test_only_the_restore_phase_may_record_a_baseline` |
 | Job container: uid 10001, read-only root, the init container gets no input or secrets | `defaults.tftest.hcl::lambda_and_events` |
+| SSM runtime: `SendCommand` only of the module document to the configured runners; the runner role trusted by the job roles, never passed; instance profile reads `runtime/*` only; document parameters pattern-checked; runtime zip checked by SHA-256; jobs as `runner_user`, never root; off by default | `iam.tftest.hcl::ssm_runtime_least_privilege`, `iam.tftest.hcl::ssm_runtime_with_target_tags`, `options.tftest.hcl::ssm_runtime_with_a_platform_document`, `options.tftest.hcl::ssm_runtime_never_runs_jobs_as_root`, `defaults.tftest.hcl::no_ssm_runtime_by_default` |
+| orch-job on SSM: the job role session is checked, no static keys reach the command, the connections and profile files are removed on every exit | `test_sql_runner.py::test_assume_role_session_refuses_another_identity`, `test_sql_runner.py::test_orch_job_on_ssm_runs_the_spec_command_with_the_job_role`, `test_sql_runner.py::test_connections_file_is_removed_when_the_job_wrapper_fails` |
 
 ## Trust model: who can read what
 
@@ -90,12 +92,18 @@ Projects trust the orchestrator, not each other.
 | Orchestration roles (migrate, post, job-runner, core and handoff Lambdas) | DMS describe; DMS start only for migrate on registered tasks; DynamoDB, run artifacts (`runs/`); StartExecution of post (handoff) or migrate (auto-resume) | read any database secret |
 | Job role `<name>-<env>-job-<project>` (one per project, `job_roles.tf`) | that project's secrets (`connections[*].secret_arn`), its Data API clusters, its job sets (`jobs/<project>/`), its runs' job specs, results and artifacts (`runs/<project>/*/jobs/*`) | read another project's secrets, job sets or run artifacts; write `context.json` or reports |
 | Shared `ecs-job` and `lambda-jobs` roles | DMS describe; `ecs-job` (default task role, always overridden by the job role) reads job sets; `lambda-jobs` may assume project job roles and write `TARGET#` items (`dynamodb:LeadingKeys`, the restore baseline) | read secrets or run artifacts themselves; write any other DynamoDB item |
+| SSM runner instance profile (`ssm.instance_role_arn`, caller-owned; `ssm_runner_policy_json`) | read the runtime zip (`runtime/*`); assume **every** project's job role (each job role trusts it); write command output to the jobs log group | read secrets, job sets or run artifacts itself; be passed to ECS or anything else (no `iam:PassRole` names it) |
+| job-runner, SSM runtime | describe SSM instances; `ssm:SendCommand` only of the module's document (or `ssm.document_name_override`) and only to `ssm.instance_ids` or instances with every `ssm.target_tags` tag; read invocations | cancel commands, open sessions, change documents; send the command text (orch-job reads it from `spec.json`) |
 
 How a job gets its project role:
 
 * Fargate: the job-runner passes `Overrides.TaskRoleArn = spec.jobRoleArn` to `ecs:RunTask`
   (it may `iam:PassRole` only the module's roles, only to ECS tasks);
 * built-in Lambda jobs: `sts:AssumeRole` into `spec.jobRoleArn` for every Data API call;
+* SSM runner: the document passes `spec.jobRoleArn` (pattern-checked: only `<name>-<env>-job-*`
+  of this account) and orch-job, as `ssm.runner_user`, assumes it from the instance profile and
+  checks the session identity before it reads the spec; the document runs only a runtime zip
+  whose SHA-256 Terraform recorded in it;
 * `prepare_job` takes `jobRoleArn` from the module's map by `ctx.project`; a project
   without a role fails the job set before anything runs.
 
@@ -121,6 +129,13 @@ Residual risk, stated plainly:
   named `report.json` under `jobs/`). Reports carry job summaries; a job output that prints a
   secret reaches them until job output is kept out of results (a later change). A project that
   needs its own run boundary needs its own operator role per module instance.
+* SSM runtime: the runner instance profile may assume every project's job role, and jobs run
+  under one local user (`ssm.runner_user`) that can reach the instance metadata service. A job of
+  one project running on a runner can therefore act as another project's job role; anyone with
+  an SSM session or `SendCommand` on a runner can do the same and, while a job runs, read its
+  files and its connections file (0600, removed at the end). Projects sharing runners share
+  this trust boundary: give a project that needs its own boundary its own runners and module
+  instance, and keep session access to the runners as narrow as access to the job roles.
 * A project's job can overwrite its own run's job results and artifacts (`runs/<project>/*/jobs/*`),
   so results of one project's jobs are only as trustworthy as that project's job sets. It cannot
   reach `context.json` or reports, and post reads `context.json` by its pinned version.
