@@ -52,10 +52,11 @@ jobs:
           tflint_version: v0.55.0
 
       - name: tflint
-        working-directory: modules/dms-orchestration
         run: |
           tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
-          tflint --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+          for m in modules/dms-orchestration modules/artifacts-bucket; do
+            tflint --chdir "$m" --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+          done
 
       - name: trivy config (IaC misconfiguration)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -126,12 +127,13 @@ jobs:
             coverage.xml
 
   terraform-test:
-    name: terraform test (${{ matrix.terraform }})
+    name: terraform test (${{ matrix.module }}, ${{ matrix.terraform }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         terraform: ["1.9.8", "latest"]
+        module: ["dms-orchestration", "artifacts-bucket"]
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -140,12 +142,12 @@ jobs:
           terraform_wrapper: false
       - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
       - name: init + validate
-        working-directory: modules/dms-orchestration
+        working-directory: modules/${{ matrix.module }}
         run: |
           terraform init -backend=false -input=false
           terraform validate
       - name: terraform test (mock provider, no AWS)
-        working-directory: modules/dms-orchestration
+        working-directory: modules/${{ matrix.module }}
         run: terraform test
 
   # The sandbox needs the upstream aurora/dms modules; the repository names none. With the

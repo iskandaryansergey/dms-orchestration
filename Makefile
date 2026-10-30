@@ -23,8 +23,12 @@ fmt:
 py-test:
 	uv run pytest --cov=src/shared --cov=src/lambdas --cov=src/jobs/sql-runner --cov-report=term
 
+TF_MODULES := $(MODULE) modules/artifacts-bucket
+
 tf-test:
-	cd $(MODULE) && $(TF) init -backend=false -input=false >/dev/null && $(TF) validate && $(TF) test
+	for m in $(TF_MODULES); do \
+	  (cd $$m && $(TF) init -backend=false -input=false $(TF_INIT_ARGS) >/dev/null && $(TF) validate && $(TF) test) || exit 1; \
+	done
 
 teststate-dry:
 	uv run python tests/sfn/run_teststate.py --dry
