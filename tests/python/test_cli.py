@@ -444,14 +444,62 @@ DATA_API_REG = {
 }
 
 
+JOB_RUNNER = SM.replace("-migrate", "-job-runner")
+
+
+def _conditional_failure() -> Exception:
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "x"}}, "PutItem")
+
+
+class LockDdb(KeyedDdb):
+    """get/put/delete of LOCK# items with the two condition forms orch.py restore uses."""
+
+    def __init__(self, items: dict[str, dict[str, Any]], sfn: FakeSfn | None = None):
+        super().__init__(items)
+        self.sfn = sfn
+        self.puts: list[dict[str, Any]] = []
+        self.deletes: list[dict[str, Any]] = []
+        self.started_at_put: list[int] = []
+
+    def put_item(self, **kw: Any) -> dict[str, Any]:
+        pk = kw["Item"]["pk"]["S"]
+        held = self.items.get(pk)
+        me = (kw.get("ExpressionAttributeValues") or {}).get(":me", {}).get("S")
+        cond = kw["ConditionExpression"]
+        allowed = not held or ("runId = :me" in cond and held["runId"]["S"] == me)
+        if not allowed:
+            raise _conditional_failure()
+        self.puts.append(kw)
+        self.started_at_put.append(len(self.sfn.started) if self.sfn else 0)
+        self.items[pk] = kw["Item"]
+        return {}
+
+    def delete_item(self, **kw: Any) -> dict[str, Any]:
+        pk = kw["Key"]["pk"]["S"]
+        held = self.items.get(pk)
+        if not held or held["runId"]["S"] != kw["ExpressionAttributeValues"][":me"]["S"]:
+            raise _conditional_failure()
+        self.deletes.append(kw)
+        del self.items[pk]
+        return {}
+
+
 def _restore(
-    *extra: str, lock: bool = False, sfn: FakeSfn | None = None, reg: dict[str, Any] | None = None
+    *extra: str,
+    lock: bool = False,
+    sfn: FakeSfn | None = None,
+    reg: dict[str, Any] | None = None,
+    ddb: LockDdb | None = None,
 ) -> tuple[int, str, FakeSfn]:
     sfn = sfn or FakeSfn([{"status": "SUCCEEDED"}])
     items = {f"LOCK#{TASK}": {"runId": {"S": "busy"}}} if lock else {}
+    ddb = ddb or LockDdb(items, sfn)
+    ddb.sfn = sfn
     argv = ["--state-machine-arn", SM, "--table", "t", "--ssm-prefix", "/dms-orch/dev"]
     argv += ["restore", "--project", "ledger", "--task", "core", "--dump", DUMP_URI, "--poll", "0", *extra]
-    fakes = {"stepfunctions": sfn, "ssm": RegSsm(reg or REG), "dynamodb": KeyedDdb(items)}
+    fakes = {"stepfunctions": sfn, "ssm": RegSsm(reg or REG), "dynamodb": ddb}
     code, out = run(argv, dms=MappingDms(), s3=DumpS3(), **fakes)
     return code, out, sfn
 
@@ -461,6 +509,58 @@ def test_restore_refuses_without_confirm_and_while_a_run_holds_the_lock():
         _restore()
     with pytest.raises(SystemExit):
         _restore("--confirm", lock=True)
+
+
+def test_restore_holds_the_task_lock_from_before_the_start_to_the_end():
+    """A run starting during a restore would migrate into a target being dropped and recreated."""
+    ddb = LockDdb({})
+    code, _out, sfn = _restore("--confirm", reg=DATA_API_REG, ddb=ddb)
+    assert code == 0 and len(sfn.started) == 2
+    first, handover = ddb.puts
+    assert ddb.started_at_put == [0, 1]  # taken before the restore, moved before the baseline
+    assert first["ConditionExpression"] == "attribute_not_exists(pk)"
+    item = first["Item"]
+    run_id = sfn.started[0]["name"]
+    assert item["pk"] == {"S": f"LOCK#{TASK}"} and item["sk"] == {"S": "LOCK"} and item["runId"] == {"S": run_id}
+    assert item["executionArn"] == {"S": orch.execution_arn(JOB_RUNNER, run_id)}
+    assert item["gsi2pk"] == {"S": "LOCK#ACTIVE"} and item["gsi2sk"] == item["executionArn"]
+    assert item["project"] == {"S": "ledger"} and item["taskKey"] == {"S": "core"} and "acquiredAt" in item
+    assert handover["Item"]["executionArn"] == {"S": orch.execution_arn(JOB_RUNNER, run_id + "-baseline")}
+    assert "runId = :me" in handover["ConditionExpression"]
+    assert len(ddb.deletes) == 1 and ddb.deletes[0]["ExpressionAttributeValues"][":me"] == {"S": run_id}
+    assert ddb.items == {}
+
+
+def test_restore_refuses_when_a_run_takes_the_lock_first():
+    """The read sees no lock, the conditional write loses the race: nothing starts."""
+
+    class Racing(LockDdb):
+        def get_item(self, **kw: Any) -> dict[str, Any]:
+            got = super().get_item(**kw)
+            self.items[f"LOCK#{TASK}"] = {"runId": {"S": "r9"}}
+            return got
+
+    ddb = Racing({})
+    with pytest.raises(SystemExit, match="lock"):
+        _restore("--confirm", ddb=ddb)
+    assert ddb.sfn.started == [] and ddb.deletes == []
+    assert ddb.items[f"LOCK#{TASK}"]["runId"] == {"S": "r9"}
+
+
+def test_restore_releases_the_lock_when_it_fails_or_crashes():
+    ddb = LockDdb({})
+    sfn = FakeSfn([{"status": "FAILED", "error": "JobFailed", "cause": "psql exit 3"}])
+    code, _out, _ = _restore("--confirm", reg=DATA_API_REG, sfn=sfn, ddb=ddb)
+    assert code == 1 and ddb.items == {} and len(ddb.deletes) == 1
+
+    class Crash(FakeSfn):
+        def describe_execution(self, executionArn: str) -> dict[str, Any]:  # noqa: N803
+            raise KeyboardInterrupt
+
+    ddb = LockDdb({})
+    with pytest.raises(KeyboardInterrupt):
+        _restore("--confirm", sfn=Crash(), ddb=ddb)
+    assert ddb.items == {} and len(ddb.deletes) == 1
 
 
 def test_restore_runs_pg_restore_through_the_job_runner_as_the_project():
