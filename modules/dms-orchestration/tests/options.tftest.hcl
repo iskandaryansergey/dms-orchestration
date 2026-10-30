@@ -168,6 +168,25 @@ run "advisory_checks_warn" {
   ]
 }
 
+run "sql_jobs_off_and_no_images_without_warnings" {
+  command = apply
+
+  variables {
+    lambda  = { sql_jobs_enabled = false }
+    fargate = {}
+  }
+
+  # No sql_jobs function, no route to it, nothing to invoke; no image is not a warning any more.
+  assert {
+    condition = (
+      !contains(keys(aws_lambda_function.this), "sql_jobs")
+      && aws_lambda_function.this["prepare_job"].environment[0].variables.SQL_JOBS_ARN == ""
+      && !anytrue([for r in flatten([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st.Resource if st.Sid == "InvokeJobLambdas"]) : strcontains(r, "sql_jobs")])
+    )
+    error_message = "lambda.sql_jobs_enabled = false removes the function and its routes"
+  }
+}
+
 run "platform_checks_outside_the_sandbox" {
   command = plan
 

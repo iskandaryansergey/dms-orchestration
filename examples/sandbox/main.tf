@@ -501,7 +501,7 @@ module "dms_orchestration" {
   table_deletion_protection   = false
   log_retention_days          = 1
   watchdog_interval_minutes   = 5
-  acknowledged_checks         = ["no_cmk", "no_fargate_images", "lambda_reserved_concurrency"]
+  acknowledged_checks         = ["no_cmk", "lambda_reserved_concurrency"]
 
   # Premigration assessment step (S14), from the dms module's output, off by default per run.
   assessment = var.assessment ? {

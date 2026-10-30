@@ -223,6 +223,7 @@ locals {
         Resource = concat(
           [local.function_arns["prepare_job"], "${local.function_arns["prepare_job"]}:*"],
           [local.function_arns["builtin_jobs"], "${local.function_arns["builtin_jobs"]}:*"],
+          var.lambda.sql_jobs_enabled ? [local.function_arns["sql_jobs"], "${local.function_arns["sql_jobs"]}:*"] : [],
           var.job_lambda_arns,
         )
       },
@@ -371,7 +372,7 @@ locals {
         Sid      = "Logs"
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = ["${aws_cloudwatch_log_group.lambda["builtin_jobs"].arn}:*"]
+        Resource = [for k, v in local.lambda_functions : "${aws_cloudwatch_log_group.lambda[k].arn}:*" if v.role == "jobs"]
       },
       {
         # checks/target_verify after orch.py restore records the target baseline (ADR 0006);

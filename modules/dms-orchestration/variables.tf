@@ -329,11 +329,12 @@ variable "table_deletion_protection" {
 ############################################
 
 variable "lambda" {
-  description = "Lambda settings. artifact = prebuilt zip in S3 instead of packaging src/ with archive_file."
+  description = "Lambda settings. artifact = prebuilt zip in S3 instead of packaging src/ with archive_file. sql_jobs_enabled = the Lambda SQL runtime for sql: jobs (pg8000 in the zip, 900 s, 1024 MB; ADR 0011)."
   type = object({
     runtime              = optional(string, "python3.13")
     architecture         = optional(string, "arm64")
     memory_mb            = optional(number, 512)
+    sql_jobs_enabled     = optional(bool, true)
     reserved_concurrency = optional(number)
     artifact_s3_bucket   = optional(string)
     artifact_s3_key      = optional(string)

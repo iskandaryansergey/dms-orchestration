@@ -15,7 +15,7 @@ variables {
   }
   job_secret_arns     = ["arn:aws:secretsmanager:eu-west-2:111122223333:secret:ok-AbCdEf"]
   projects            = { ledger = { tasks = { core = {} } } }
-  acknowledged_checks = ["own_sns_topic_outside_sandbox", "state_in_the_dms_workspace", "dumps_without_cmk", "no_cmk", "include_execution_data", "lambda_reserved_concurrency", "no_fargate_images"]
+  acknowledged_checks = ["own_sns_topic_outside_sandbox", "state_in_the_dms_workspace", "dumps_without_cmk", "no_cmk", "include_execution_data", "lambda_reserved_concurrency"]
 }
 
 run "valid_minimal_input_plans" {

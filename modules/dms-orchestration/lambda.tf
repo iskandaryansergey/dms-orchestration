@@ -1,5 +1,7 @@
 ############################################
-# Lambda code: one zip with src/lambdas and src/shared (pure Python, no dependencies)
+# Lambda code: one zip with src/lambdas and src/shared (pure Python). The only dependency is
+# pg8000 for the Lambda SQL runtime, vendored with hashes in src/lambdas/sql_jobs/vendor
+# together with the pinned RDS CA bundle: nothing is downloaded at build or run time.
 ############################################
 
 data "archive_file" "lambda" {
@@ -26,8 +28,22 @@ locals {
     AWS_STS_REGIONAL_ENDPOINTS = "regional"
   }
 
-  # name => settings; role is one of core | waiter | jobs
-  lambda_functions = {
+  sql_jobs_arn = "arn:${local.partition}:lambda:${local.region}:${local.account_id}:function:${local.prefix}-sql_jobs"
+
+  # Lambda SQL runtime (ADR 0011): sql: jobs of job sets, pg8000 with TLS verify-full, the
+  # project job role for secrets; the full 15 minutes and more memory than the other functions.
+  sql_jobs_function = var.lambda.sql_jobs_enabled ? {
+    sql_jobs = {
+      description = "Lambda SQL runtime: sql jobs of job sets on PostgreSQL connections (pg8000, TLS verify-full)"
+      timeout     = 900
+      memory      = 1024
+      role        = "jobs"
+      env         = {}
+    }
+  } : {}
+
+  # name => settings; role is one of core | waiter | jobs; memory defaults to lambda.memory_mb
+  lambda_functions = merge(local.sql_jobs_function, {
     resolve_context = {
       description = "Validate run request, read task registration and job set"
       timeout     = 60
@@ -59,6 +75,7 @@ locals {
       role        = "core"
       env = {
         BUILTIN_JOBS_ARN = "arn:${local.partition}:lambda:${local.region}:${local.account_id}:function:${local.prefix}-builtin_jobs"
+        SQL_JOBS_ARN     = var.lambda.sql_jobs_enabled ? local.sql_jobs_arn : ""
         TASK_DEFINITIONS = jsonencode({ for k, td in aws_ecs_task_definition.job : k => td.arn })
         JOB_LAMBDA_ARNS  = jsonencode(var.job_lambda_arns)
         JOB_ROLE_ARNS    = jsonencode(local.job_role_arns)
@@ -92,7 +109,7 @@ locals {
       role        = "jobs"
       env         = {}
     }
-  }
+  })
 
   lambda_role_arns = {
     core   = aws_iam_role.lambda_core.arn
@@ -119,7 +136,7 @@ resource "aws_lambda_function" "this" {
   runtime       = var.lambda.runtime
   architectures = [var.lambda.architecture]
   handler       = "lambdas.${each.key}.handler.handler"
-  memory_size   = var.lambda.memory_mb
+  memory_size   = try(each.value.memory, var.lambda.memory_mb)
   timeout       = each.value.timeout
 
   filename         = var.lambda.artifact_s3_bucket == null ? data.archive_file.lambda[0].output_path : null
