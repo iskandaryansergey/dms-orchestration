@@ -439,4 +439,9 @@ run "no_ssm_runtime_by_default" {
     condition     = output.ssm_runner_policy_json == null && output.ssm_document_content == null && !contains(output.network_contract.required_vpc_endpoints, "ec2messages")
     error_message = "no SSM outputs and no SSM agent endpoints by default"
   }
+
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).runtimes == { ssm = false, fargate = true }
+    error_message = "the registration tells orch.py restore which runtimes exist"
+  }
 }

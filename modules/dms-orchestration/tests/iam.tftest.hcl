@@ -720,6 +720,11 @@ run "ssm_runtime_least_privilege" {
     condition     = jsondecode(aws_lambda_function.this["prepare_job"].environment[0].variables.SSM_JOBS) == 1 && jsondecode(aws_lambda_function.this["resolve_context"].environment[0].variables.SSM_JOBS) == 1
     error_message = "prepare_job and resolve_context know the SSM runtime is on"
   }
+
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).runtimes.ssm == true
+    error_message = "orch.py restore reads from the registration that it runs on SSM by default"
+  }
 }
 
 run "ssm_runtime_with_target_tags" {
