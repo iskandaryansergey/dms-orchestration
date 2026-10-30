@@ -246,6 +246,11 @@ Every job ends with a result (Lambda: return value; Fargate: `/out/result.json`)
 * Fargate: a non-zero exit code is `fail` whatever `result.json` says; no
   `result.json` + exit 0 = `ok`. Keep `summary` small (< 16 KB): later jobs read it
   in `when:` conditions and it is stored in DynamoDB and the report.
+* Command output (stdout, stderr) goes to the CloudWatch log only, never into the
+  result. A failed Fargate job's message is `exit code N (see CloudWatch log stream
+  <name>)`, followed by `: <message>` from `result.json` if the job wrote one. The
+  message reaches the report and the execution `Cause`, which operators can read:
+  never put connection details or row data into `message` or `summary`.
 * `warn` lets the run continue and shows up in the report.
 * `skipped` is set by the orchestrator when `when:` is false.
 
@@ -281,3 +286,14 @@ aurora module) and the endpoint `rds-data` in an isolated VPC. Without it, use F
 `ORCH_DRY_RUN=1`**, but never calls `StartReplicationTask`. Jobs must not change
 anything in dry runs: `psql-run` prints the SQL instead of running it, built-in
 checks are read-only, cleanup lists only.
+
+Fargate jobs also get `PGOPTIONS=-c default_transaction_read_only=on` (appended to
+any `PGOPTIONS` already set) for the whole command environment:
+
+* **Enforced for libpq clients** started by the command (`psql`, `pg_dump`, drivers
+  built on libpq): every session starts read-only and a write fails with
+  `cannot execute ... in a read-only transaction`. A guard against accidental writes,
+  not a security boundary: SQL that runs `SET default_transaction_read_only = off`
+  or `SET TRANSACTION READ WRITE` can still write.
+* **Advisory for python and pwsh scripts** that open their own sessions through
+  other drivers, and for `mysql`: they must check `ORCH_DRY_RUN` themselves.
