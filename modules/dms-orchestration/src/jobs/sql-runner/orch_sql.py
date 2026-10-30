@@ -133,7 +133,7 @@ def client_command(conn: dict[str, Any], engine: str, files: list[Path], on_erro
             f"--user={conn['username']}",
             f"--database={conn['database']}",
             "--ssl-mode=VERIFY_IDENTITY",
-            f"--ssl-ca={RDS_CA}",
+            f"--ssl-ca={os.environ.get('ORCH_CA_BUNDLE', RDS_CA)}",
         ]
         if on_error == "continue":
             argv.append("--force")

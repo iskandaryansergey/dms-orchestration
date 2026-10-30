@@ -32,6 +32,7 @@ runuser -u "$runner_user" -- env -i \
   PYTHONPATH="$base/rt" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
   AWS_REGION='${region}' AWS_DEFAULT_REGION='${region}' AWS_STS_REGIONAL_ENDPOINTS=regional \
   ORCH_OUT_DIR="$base/out" ORCH_WORK_DIR="$base/work" ORCH_TMP_DIR="$base/tmp" \
+  ORCH_CA_BUNDLE="$base/rt/rds-global-bundle.pem" \
   ORCH_ARTIFACTS_BUCKET="$bucket" ORCH_ENVIRONMENT='${environment}' ORCH_DUMP_KMS_KEY='${dump_kms_key}' \
   ORCH_JOB_SPEC_S3='{{ specS3Uri }}' ORCH_ATTEMPT='{{ attempt }}' ORCH_DRY_RUN='{{ dryRun }}' \
   ORCH_LOG_STREAM="${log_group}:$command_id/$${AWS_SSM_INSTANCE_ID:-instance}/orchJob/stdout" \

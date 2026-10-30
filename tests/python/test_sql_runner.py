@@ -923,6 +923,24 @@ def test_ssm_runtime_zip_holds_the_shared_modules_the_image_copies():
     assert sorted(_ssm_shared_files()) == copied
 
 
+def test_ssm_runtime_zip_carries_the_pinned_rds_ca_and_the_clients_use_it():
+    """Live sandbox run: psql on the runner instance failed, root certificate file
+    /etc/ssl/certs/rds-global-bundle.pem does not exist (the image installs it, the AMI does not).
+    The zip carries the bundle the Lambda SQL runtime pins and orch-job points the clients at it."""
+    ssm_tf = SSM_TF.read_text(encoding="utf-8")
+    bundle = r'"rds-global-bundle\.pem"\s*=\s*"\$\{path\.module\}/src/lambdas/sql_jobs/rds-global-bundle\.pem"'
+    assert re.search(bundle, ssm_tf)
+    script = (SSM_TF.parent / "ssm" / "orch-job.sh.tftpl").read_text(encoding="utf-8")
+    assert 'ORCH_CA_BUNDLE="$base/rt/rds-global-bundle.pem"' in script
+
+
+def test_mysql_uses_the_ca_bundle_of_the_runtime(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORCH_CA_BUNDLE", "/opt/rt/rds-global-bundle.pem")
+    conn = {"host": "h", "username": "u", "password": "p", "database": "d"}
+    argv, _env = orch_sql.client_command(conn, "mysql", [tmp_path / "a.sql"], on_error="stop", single_tx=False)
+    assert "--ssl-ca=/opt/rt/rds-global-bundle.pem" in argv
+
+
 def test_ssm_runtime_code_runs_on_the_python3_of_the_ami():
     """The runner instance runs the AMI's python3 (3.9 on Amazon Linux 2023), not the image's 3.13."""
     import ast

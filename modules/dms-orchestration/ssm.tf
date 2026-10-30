@@ -28,6 +28,9 @@ locals {
       if f != "Dockerfile" && !strcontains(f, "__pycache__") && !endswith(f, ".pyc")
     },
     { for f in local.ssm_runtime_shared : "shared/${f}" => "${path.module}/src/shared/${f}" },
+    # The RDS CA bundle the Lambda SQL runtime pins (make vendor-check): the image installs one,
+    # an AMI need not; orch-job.sh points psql, pg_dump and mysql at this copy.
+    { "rds-global-bundle.pem" = "${path.module}/src/lambdas/sql_jobs/rds-global-bundle.pem" },
   )
   ssm_runtime_sha256 = local.ssm_enabled ? data.archive_file.ssm_runtime[0].output_sha256 : ""
   ssm_runtime_key    = "runtime/${local.ssm_runtime_sha256}/sql-runner.zip"
