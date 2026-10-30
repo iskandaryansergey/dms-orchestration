@@ -102,7 +102,8 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_https" {
 }
 
 resource "aws_vpc_endpoint" "interface" {
-  for_each            = toset(concat(var.interface_endpoints, local.sql_runner_image != "" ? ["ecr.api", "ecr.dkr"] : [], var.snapshot_dumps ? ["rds"] : []))
+  # rds comes from the module's network_contract (required when a task has snapshot_dumps).
+  for_each            = toset(concat(var.interface_endpoints, local.sql_runner_image != "" ? ["ecr.api", "ecr.dkr"] : [], [for e in module.dms_orchestration.network_contract.required_vpc_endpoints : e if e == "rds"]))
   vpc_id              = aws_vpc.this.id
   service_name        = "com.amazonaws.${var.region}.${each.key}"
   vpc_endpoint_type   = "Interface"
