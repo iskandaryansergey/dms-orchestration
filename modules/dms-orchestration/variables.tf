@@ -116,6 +116,11 @@ variable "projects" {
   }
 
   validation {
+    condition     = alltrue(flatten([for p in keys(var.projects) : [for q in keys(var.projects) : p == q || !startswith(q, p)]]))
+    error_message = "no project name may be a prefix of another (for example ledger and ledger-prod): names built from a project name, such as snapshot identifiers, must not match another project's."
+  }
+
+  validation {
     condition     = alltrue(flatten([for p in values(var.projects) : [for k in keys(p.tasks) : can(regex("^[a-z][a-z0-9_-]{0,39}$", k))]]))
     error_message = "task keys must match ^[a-z][a-z0-9_-]{0,39}$."
   }
