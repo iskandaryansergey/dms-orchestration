@@ -60,7 +60,10 @@ module "dms_orchestration" {
             target = { engine = "postgresql", secret_arn = var.target_runner_secret_arn,
                        data_api_cluster_arn = var.target_cluster_arn }
           }
-          jobs     = { default_version = "3f2c1ab" }       # job set version in S3
+          jobs = {                              # job set version in S3, pinned by its hash
+            default_version = "3f2c1ab"
+            bundles         = { "3f2c1ab" = var.jobs_bundle_sha256 } # sync-jobs.sh prints it
+          }
           defaults = { target_reset_policy = "if-interrupted" }
         }
       }
