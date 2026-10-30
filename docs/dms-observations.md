@@ -311,7 +311,8 @@ The stack with `ssm_runner`, `snapshot_dumps`, `assessment`, `sqs_fanout`, no im
   second completed. Destroy: 181 resources in one pass, `verify_destroyed` empty.
 * **Validation default:** with `fail_on_validation_errors = true` a load of a table without a
   primary key ends `FAILED` `DmsValidationErrors` ("validation state No primary Key"): DMS cannot
-  validate such a table. The sandbox task turns the flag off for that reason. A row changed by a
+  validate such a table. The sandbox task turned the flag off for that reason; since then the
+  state is reported (`validationSkippedTables`), not failed. A row changed by a
   trigger on the target (`e2e.py s21-validation`): `DmsValidationErrors` naming the table with
   the flag on, `COMPLETED_WITH_VALIDATION_ERRORS` with it off.
 * **Pinned context:** reading `context.json` by `VersionId` needs `s3:GetObjectVersion`; without

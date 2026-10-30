@@ -67,7 +67,8 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
 - **Breaking:** `failOnValidationErrors` defaults to `true`
   (`defaults.fail_on_validation_errors`): a table DMS did not validate, failed validation records
   or full-load error rows fail the run `DmsValidationErrors`; off, it succeeds as
-  `COMPLETED_WITH_VALIDATION_ERRORS`.
+  `COMPLETED_WITH_VALIDATION_ERRORS`. A table DMS cannot validate (`No primary key`) never
+  fails the run: the report lists it in `validationSkippedTables` and its warnings.
 - **Breaking:** Fargate is optional: without `fargate.images` the module creates no ECS cluster,
   task definitions, ECS roles or ECR endpoints, `ecs_cluster_arn` is `null` and job roles do not
   trust ECS tasks. SQL jobs run in a Lambda, long jobs on SSM.

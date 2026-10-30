@@ -177,7 +177,7 @@ Pre-flight verdicts on top of this table (dirty target → `manual`, `allowReset
 | DMS | Result |
 |---|---|
 | stopped, `FULL_LOAD_ONLY_FINISHED` | `COMPLETED` (or `COMPLETED_WITH_TABLE_ERRORS`; fails `DmsTableErrors` with `failOnTableErrors`, the default) |
-| load finished, a table not validated (validation on), `ValidationFailedRecords > 0` or `FullLoadErrorRows > 0` | fails `DmsValidationErrors` with `failOnValidationErrors` (the default, `defaults.fail_on_validation_errors`); with it off `COMPLETED_WITH_VALIDATION_ERRORS`, a success that lists the tables |
+| load finished, a table not validated (validation on), `ValidationFailedRecords > 0` or `FullLoadErrorRows > 0` | fails `DmsValidationErrors` with `failOnValidationErrors` (the default, `defaults.fail_on_validation_errors`); with it off `COMPLETED_WITH_VALIDATION_ERRORS`, a success that lists the tables. `No primary key` (DMS cannot validate the table) is no mismatch: the cause names the table as not validated, the report lists it in `validationSkippedTables` |
 | stopped, `STOPPED_AFTER_FULL_LOAD` / `CACHED_EVENTS` / `DDL_APPLY` / `AT_SERVER_TIME` / `AT_COMMIT_TIME` | `STOPPED_AT_CHECKPOINT` |
 | stopped, `NORMAL` (not requested) | `DmsTaskStoppedUnexpectedly` |
 | stopped, `RECOVERABLE_ERROR` / `FATAL_ERROR` / low memory / low disk | `DmsTaskFailed` |

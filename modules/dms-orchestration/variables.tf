@@ -123,7 +123,7 @@ variable "projects" {
         auto_resume_max_attempts  = optional(number, 1)
         auto_resume_categories    = optional(list(string), ["TRANSIENT_SOURCE_CONN", "TRANSIENT_TARGET_CONN", "DMS_RESTART"])
         fail_on_table_errors      = optional(bool, true)
-        fail_on_validation_errors = optional(bool, true) # tables DMS did not validate fail the run
+        fail_on_validation_errors = optional(bool, true) # validation mismatches fail the run; tables without a primary key are reported
         dump_before_reset         = optional(bool, false)
         snapshot_dumps            = optional(bool, false) # allow dump.method = snapshot (job role snapshot rights)
       }), {})

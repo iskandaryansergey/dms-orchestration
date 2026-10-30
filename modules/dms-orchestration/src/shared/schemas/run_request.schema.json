@@ -64,7 +64,7 @@
     },
     "failOnValidationErrors": {
       "type": "boolean",
-      "description": "DMS validation gates the run: a table not validated, with failed validation records or full-load error rows fails DmsValidationErrors; false succeeds as COMPLETED_WITH_VALIDATION_ERRORS. Default: the task's fail_on_validation_errors (true)"
+      "description": "DMS validation gates the run: a table not validated, with failed validation records or full-load error rows fails DmsValidationErrors; false succeeds as COMPLETED_WITH_VALIDATION_ERRORS. A table without a primary key (DMS cannot validate it) never fails the run; the report lists it in validationSkippedTables. Default: the task's fail_on_validation_errors (true)"
     },
     "targetReset": {
       "type": "object",

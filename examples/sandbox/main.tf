@@ -528,6 +528,7 @@ module "dms_orchestration" {
           # snapshot_dumps (s10snap): dump.method = snapshot, the job role may snapshot the target cluster.
           # app.audit_notes has no primary key, so DMS cannot validate it ("No primary Key"):
           # with the module default (true) every load would end FAILED DmsValidationErrors.
+          # No longer needed since such tables are reported, not failed (validationSkippedTables).
           defaults = { target_reset_policy = "if-interrupted", run_timeout_seconds = 7200, fail_on_table_errors = true, fail_on_validation_errors = false, snapshot_dumps = var.snapshot_dumps }
         }
       }
