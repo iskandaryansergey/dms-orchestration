@@ -386,8 +386,12 @@ resource "aws_iam_role_policy" "sql_lambda" {
   name = "db-secrets"
   role = aws_iam_role.sql_lambda.id
   policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = [aws_secretsmanager_secret.db["source"].arn, aws_secretsmanager_secret.db["target"].arn] }]
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = [aws_secretsmanager_secret.db["source"].arn, aws_secretsmanager_secret.db["target"].arn] },
+      # truncate reads the full reset list from the job's spec.json (above the payload cap).
+      { Effect = "Allow", Action = ["s3:GetObject"], Resource = ["arn:aws:s3:::${module.dms_orchestration.artifacts_bucket}/runs/*/jobs/*/spec.json"] },
+    ]
   })
 }
 

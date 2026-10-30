@@ -849,3 +849,51 @@ def test_unknown_connection_and_an_unreadable_spec_are_job_failures(pg, env):
     gone = _prepare(_sql_job({"inline": "SELECT 1"}), runId="run-3")
     env.delete_object(Bucket=BUCKET, Key=gone["specS3Uri"].removeprefix(f"s3://{BUCKET}/"))
     assert _run(gone)["status"] == "fail"
+
+
+# --- sandbox project Lambda: truncate reads the full reset list (above the payload cap) -------
+
+
+@pytest.fixture
+def sandbox_sql(env, monkeypatch):
+    import importlib
+    import sys
+
+    from shared import sqlclient
+
+    monkeypatch.syspath_prepend(str(sqlclient.VENDOR_DIR))
+    monkeypatch.syspath_prepend(str(ROOT / "examples" / "sandbox" / "lambda"))
+    sys.modules.pop("sandbox_sql", None)
+    mod = importlib.import_module("sandbox_sql")
+    sent: list[str] = []
+
+    class Conn:
+        def run(self, sql: str) -> None:
+            sent.append(sql)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(mod, "connect", lambda _which: Conn())
+    monkeypatch.setattr(mod, "s3", env)
+    mod.sent = sent
+    return mod
+
+
+def test_sandbox_truncate_reads_the_full_list_from_the_spec_above_the_cap(sandbox_sql, env):
+    key = "runs/ledger/run-1/inspect/reset-tables.json"
+    env.put_object(Bucket=BUCKET, Key=key, Body=json.dumps({"resetTables": LONG}))
+    ctx = _ctx(resetTables=[], resetTablesCount=600, resetTablesUri=f"s3://{BUCKET}/{key}")
+    spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset", ctx=ctx)
+    spec = {**spec, "with": {"action": "truncate"}}
+    assert spec["ctx"]["resetTables"] == []  # the payload holds the count only
+    out = sandbox_sql.handler({"spec": spec, "attempt": 1})
+    assert out["status"] == "ok" and out["summary"]["tables"] == 600, out
+    (sql,) = sandbox_sql.sent
+    assert sql.count('"app"."t') == 600
+
+
+def test_sandbox_truncate_refuses_a_list_that_does_not_match_its_count(sandbox_sql, env):
+    spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset", ctx=_ctx(resetTablesCount=5))
+    out = sandbox_sql.handler({"spec": {**spec, "with": {"action": "truncate"}}, "attempt": 1})
+    assert out["status"] == "fail" and "5" in out["message"] and sandbox_sql.sent == []

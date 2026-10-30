@@ -4,7 +4,9 @@ Stands in for the Fargate ``sql-runner`` image in the sandbox (no docker build t
 no Aurora Data API: the account only allows RDS instances). Job contract input
 ``{"spec": {...}, "attempt": n}``; ``spec.with.action``:
 
-* ``truncate``   — truncate ``ctx.resetTables`` on the target (reset phase);
+* ``truncate``   — truncate ``ctx.resetTables`` on the target (reset phase). The list comes from
+  the job's ``spec.json`` (``specS3Uri``): above the payload cap the payload carries only
+  ``resetTablesCount``; a list that does not match the count fails the job;
 * ``row_counts`` — compare ``with.tables`` between source and target (post phase).
 
 Output: ``{"status": "ok|fail", "message", "summary"}``. TLS without CA verification
@@ -24,6 +26,7 @@ import pg8000.native
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 secrets = boto3.client("secretsmanager")
+s3 = boto3.client("s3")
 
 
 def quote_table(name: str) -> str:
@@ -49,19 +52,39 @@ def connect(which: str) -> pg8000.native.Connection:
     )
 
 
+def reset_tables(spec: dict[str, Any]) -> list[str]:
+    """The full ``ctx.resetTables`` of the job's spec.json, checked against the decided count."""
+    bucket, _, key = str(spec["specS3Uri"]).removeprefix("s3://").partition("/")
+    full = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+    ctx = full.get("ctx") or {}
+    tables = ctx.get("resetTables") or []
+    count = ctx.get("resetTablesCount")
+    if count is not None and int(count) != len(tables):
+        raise ValueError(f"{len(tables)} table(s) in the spec, the decision says {count}")
+    return tables
+
+
 def truncate(spec: dict[str, Any]) -> dict[str, Any]:
-    tables = (spec.get("ctx") or {}).get("resetTables") or []
+    try:
+        tables = reset_tables(spec)
+    except ValueError as err:
+        return {"status": "fail", "message": str(err), "summary": {}}
+    # The summary keeps the count only: a list of hundreds of tables would not fit the payload.
     if not tables:
-        return {"status": "ok", "message": "nothing to truncate", "summary": {"tables": []}}
+        return {"status": "ok", "message": "nothing to truncate", "summary": {"tables": 0}}
     sql = "TRUNCATE TABLE " + ", ".join(quote_table(t) for t in tables)
     if spec.get("dryRun"):
-        return {"status": "ok", "message": f"dry run: {sql}", "summary": {"tables": tables}}
+        return {
+            "status": "ok",
+            "message": f"dry run: would truncate {len(tables)} table(s)",
+            "summary": {"tables": len(tables)},
+        }
     conn = connect("target")
     try:
         conn.run(sql)
     finally:
         conn.close()
-    return {"status": "ok", "message": f"truncated {len(tables)} table(s)", "summary": {"tables": tables}}
+    return {"status": "ok", "message": f"truncated {len(tables)} table(s)", "summary": {"tables": len(tables)}}
 
 
 def row_counts(spec: dict[str, Any]) -> dict[str, Any]:
