@@ -306,6 +306,11 @@ psql-run --connection target --truncate "app.a,app.b" [--cascade]
 psql-run --connection target --sql "ANALYZE app.accounts"
 ```
 
+On PostgreSQL `--truncate-scope` truncates, in one statement, only the listed tables that exist
+on the target: tables dropped since the run the DMS statistics come from are skipped and named
+in a `NOTICE` in the job output (`psql-run: skipped N table(s) missing on the target: …`); none
+present is no error. `--truncate` keeps its list as given (a missing table fails the job).
+
 ### SQL templates (`--template`)
 
 Values never go into SQL as raw text:

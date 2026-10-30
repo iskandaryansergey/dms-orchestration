@@ -4,7 +4,8 @@
     psql-run --connection target --file ddl/010_tables.sql [--file ...] [--single-transaction]
     psql-run --connection target --template reset/custom.sql --var schema=public
     psql-run --connection target --truncate "{{ ctx.resetTables }}" [--cascade]
-    psql-run --connection target --truncate-scope [--cascade]    # ctx.resetTables of the spec file
+    psql-run --connection target --truncate-scope [--cascade]    # ctx.resetTables of the spec file;
+                                                                 # PostgreSQL skips tables missing on the target
     psql-run --connection target --sql "ANALYZE"
 
 Connections come from ``ORCH_CONNECTIONS_FILE`` (written by orch_job.py, mode
@@ -68,6 +69,42 @@ def truncate_sql(tables: list[str], engine: str, cascade: bool = False) -> str:
         body = "\n".join(f"TRUNCATE TABLE {t};" for t in quoted)
         return f"SET FOREIGN_KEY_CHECKS = 0;\n{body}\nSET FOREIGN_KEY_CHECKS = 1;\n"
     return f"TRUNCATE TABLE {', '.join(quoted)}{' CASCADE' if cascade else ''};\n"
+
+
+def truncate_existing_sql(tables: list[str], cascade: bool = False) -> str:
+    """PostgreSQL: one ``TRUNCATE`` of the listed tables that exist, decided on the server.
+
+    The reset scope comes from DMS table statistics, which keep tables dropped since the run
+    they describe; a missing table has no rows to reset. The check and the ``TRUNCATE`` are one
+    statement; the skipped tables are named in a NOTICE (psql output), none present is no error.
+    Names are checked identifiers (``quote_table``), so the dynamic statement holds no free text.
+    """
+    if not tables:
+        return ""
+    listed = ", ".join(sql_literal(quote_table(t, "postgresql"), "postgresql") for t in tables)
+    tail = " CASCADE" if cascade else ""
+    return (
+        "DO $orch$\n"  # noqa: S608 - names checked by quote_table, passed as literals
+        "DECLARE\n"
+        f"  listed text[] := ARRAY[{listed}];\n"
+        "  present text;\n"
+        "  missing text;\n"
+        "  missing_count int;\n"
+        "BEGIN\n"
+        "  SELECT string_agg(t, ', ' ORDER BY o) FILTER (WHERE to_regclass(t) IS NOT NULL),\n"
+        "         string_agg(t, ', ' ORDER BY o) FILTER (WHERE to_regclass(t) IS NULL),\n"
+        "         count(*) FILTER (WHERE to_regclass(t) IS NULL)\n"
+        "    INTO present, missing, missing_count\n"
+        "    FROM unnest(listed) WITH ORDINALITY AS u(t, o);\n"
+        "  IF missing IS NOT NULL THEN\n"
+        "    RAISE NOTICE 'psql-run: skipped % table(s) missing on the target: %', missing_count, missing;\n"
+        "  END IF;\n"
+        "  IF present IS NOT NULL THEN\n"
+        f"    EXECUTE 'TRUNCATE TABLE ' || present || '{tail}';\n"
+        "  END IF;\n"
+        "END\n"
+        "$orch$;\n"
+    )
 
 
 def sql_literal(value: Any, engine: str) -> str:
@@ -204,7 +241,10 @@ def build_plan(args: argparse.Namespace, spec: dict[str, Any], engine: str, tmp:
         tables = (
             scope_tables(spec) if args.truncate_scope else [t.strip() for t in args.truncate.split(",") if t.strip()]
         )
-        sql = truncate_sql(tables, engine, args.cascade)
+        if args.truncate_scope and engine == "postgresql":
+            sql = truncate_existing_sql(tables, args.cascade)
+        else:
+            sql = truncate_sql(tables, engine, args.cascade)
         if sql:
             gen = tmp / "truncate.sql"
             gen.write_text(sql)

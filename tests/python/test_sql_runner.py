@@ -127,16 +127,42 @@ def test_psql_run_truncate_scope_reads_the_full_list_from_the_spec(sql_env):
     assert orch_sql.main(["--connection", "target", "--truncate-scope", "--cascade"], runner=runner) == 0
     argv, _ = runner.calls[0]
     sql = Path(argv[-1]).read_text()
-    assert sql.startswith('TRUNCATE TABLE "app"."t0000", ') and sql.endswith('"app"."t0599" CASCADE;\n')
+    assert sql.count('"app"."t') == 600
+    assert """'"app"."t0000"', """ in sql and """'"app"."t0599"']""" in sql
+    assert "EXECUTE 'TRUNCATE TABLE ' || present || ' CASCADE';" in sql
     result = json.loads((sql_env / "out" / "result.json").read_text())
     assert result["summary"]["steps"] == ["truncate 600 table(s)"]
+
+
+def test_psql_run_truncate_scope_skips_tables_missing_on_the_target(sql_env):
+    """The reset list comes from DMS statistics that keep tables dropped since (live run): the
+    exists check and the one TRUNCATE of the present tables run as one statement on the server,
+    the skipped tables are named in a NOTICE, none present is no error."""
+    _scope_spec(sql_env, ["app.a", "app.b"], 2)
+    runner = Runner()
+    assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 0
+    sql = Path(runner.calls[0][0][-1]).read_text()
+    assert sql.startswith("DO $orch$") and sql.rstrip().endswith("$orch$;")
+    assert """listed text[] := ARRAY['"app"."a"', '"app"."b"'];""" in sql
+    assert "to_regclass(t) IS NOT NULL" in sql and "to_regclass(t) IS NULL" in sql
+    assert "RAISE NOTICE 'psql-run: skipped % table(s) missing on the target: %'" in sql
+    assert "IF present IS NOT NULL THEN" in sql and "EXECUTE 'TRUNCATE TABLE ' || present || '';" in sql
+    assert 'TRUNCATE TABLE "app"' not in sql  # no static TRUNCATE that fails on a missing table
+
+
+def test_psql_run_truncate_keeps_the_given_list_as_is(sql_env):
+    """--truncate names its tables itself: a missing one is still an error."""
+    runner = Runner()
+    assert orch_sql.main(["--connection", "target", "--truncate", "public.a"], runner=runner) == 0
+    assert Path(runner.calls[0][0][-1]).read_text() == 'TRUNCATE TABLE "public"."a";\n'
 
 
 def test_psql_run_truncate_scope_small_list_and_empty_scope(sql_env):
     _scope_spec(sql_env, ["public.a"], None)
     runner = Runner()
     assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 0
-    assert Path(runner.calls[0][0][-1]).read_text() == 'TRUNCATE TABLE "public"."a";\n'
+    sql = Path(runner.calls[0][0][-1]).read_text()
+    assert """ARRAY['"public"."a"']""" in sql and "EXECUTE 'TRUNCATE TABLE '" in sql
     _scope_spec(sql_env, [], 0)
     runner = Runner()
     assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 0
