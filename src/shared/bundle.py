@@ -76,6 +76,23 @@ def parse(text: str) -> tuple[dict[str, str], str]:
     return files, stated
 
 
+def check_manifest(data: bytes | None, expected: str | None) -> dict[str, str] | None:
+    """The file hashes a runtime checks the bundle against.
+
+    ``expected`` is the total the run pinned (``bundleSha256`` of the job). A pinned run needs a
+    manifest with exactly that total. An unpinned run (``allow_unpinned``) still checks the files
+    against a manifest it finds; without one it gets None (no check).
+    """
+    if data is None:
+        if expected:
+            raise JobSetTampered(f"no {MANIFEST} in the job set bundle, but the run pinned {expected[:12]}…")
+        return None
+    files, found = parse(data.decode("utf-8", errors="replace"))
+    if expected and found != expected:
+        raise JobSetTampered(f"{MANIFEST} does not match the bundle hash the run pinned ({expected[:12]}…)")
+    return files
+
+
 def verify(rel: str, data: bytes, files: Mapping[str, str]) -> bytes:
     """``data`` if it is the file the manifest lists under ``rel``."""
     expected = files.get(rel)

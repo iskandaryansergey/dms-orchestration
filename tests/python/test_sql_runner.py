@@ -589,3 +589,89 @@ def test_iam_connection_is_postgresql_only(sql_env, monkeypatch):
     runner = Runner()
     assert orch_sql.main(["--connection", "shop_iam", "--sql", "SELECT 1"], runner=runner) != 0
     assert runner.calls == []
+
+
+# --- review finding 9: the bundle is checked file by file against the pinned hash ---
+
+V1 = "jobs/ledger/v1/"
+PIN_FILES = {"ddl/020_indexes.sql": b"CREATE INDEX i ON t(x);", "jobset.json": b"{}"}
+
+
+def _manifest(files: dict[str, bytes]) -> tuple[bytes, str]:
+    from shared import bundle
+
+    hashes = {rel: bundle.digest(data) for rel, data in files.items()}
+    return bundle.render(hashes).encode(), bundle.total(hashes)
+
+
+def _pin(job_env) -> str:
+    manifest, total = _manifest(PIN_FILES)
+    job_env.s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/bundle.sha256", Body=manifest)
+    return total
+
+
+def _download(job_env, expected: str | None) -> list[str]:
+    dest = job_env.tmp / "dest"
+    dest.mkdir(exist_ok=True)
+    orch_job.download_bundle(job_env.s3, f"s3://{BUCKET}/jobs/ledger/v1/", dest, expected)
+    return sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
+
+
+def test_pinned_bundle_downloads_when_every_file_matches(job_env):
+    assert _download(job_env, _pin(job_env)) == sorted(PIN_FILES)
+
+
+@pytest.mark.parametrize(
+    "change,fragment",
+    [
+        (lambda s3: s3.put_object(Bucket=BUCKET, Key=f"{V1}ddl/020_indexes.sql", Body=b"DROP TABLE t;"), "hash"),
+        (lambda s3: s3.put_object(Bucket=BUCKET, Key=f"{V1}ddl/zz_extra.sql", Body=b"SELECT 1;"), "not in"),
+        (lambda s3: s3.delete_object(Bucket=BUCKET, Key=f"{V1}ddl/020_indexes.sql"), "missing"),
+    ],
+)
+def test_pinned_bundle_refuses_a_changed_extra_or_missing_file(job_env, change, fragment):
+    from shared.errors import JobSetTampered
+
+    total = _pin(job_env)
+    change(job_env.s3)
+    with pytest.raises(JobSetTampered, match=fragment):
+        _download(job_env, total)
+
+
+def test_rewritten_manifest_does_not_match_the_pin_of_the_run(job_env):
+    from shared.errors import JobSetTampered
+
+    total = _pin(job_env)
+    evil = {**PIN_FILES, "ddl/020_indexes.sql": b"DROP TABLE t;"}
+    for rel, data in evil.items():
+        job_env.s3.put_object(Bucket=BUCKET, Key=f"jobs/ledger/v1/{rel}", Body=data)
+    job_env.s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/bundle.sha256", Body=_manifest(evil)[0])
+    with pytest.raises(JobSetTampered, match="pinned"):
+        _download(job_env, total)
+
+
+def test_pinned_run_without_a_manifest_is_refused(job_env):
+    from shared.errors import JobSetTampered
+
+    with pytest.raises(JobSetTampered, match="bundle.sha256"):
+        _download(job_env, "a" * 64)
+
+
+def test_unpinned_run_still_checks_a_manifest_it_finds(job_env):
+    from shared.errors import JobSetTampered
+
+    _pin(job_env)
+    job_env.s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/jobset.json", Body=b'{"x": 1}')
+    with pytest.raises(JobSetTampered):
+        _download(job_env, None)
+
+
+def test_tampered_bundle_fails_the_job_without_running_the_command(job_env):
+    total = _pin(job_env)
+    job_env.s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/ddl/020_indexes.sql", Body=b"DROP TABLE t;")
+    job_env.put_spec(bundleSha256=total)
+    marker = job_env.tmp / "ran"
+    code = orch_job.main([sys.executable, "-c", f"open({str(marker)!r}, 'w')"], s3=job_env.s3, secrets=job_env.sm)
+    assert code == 1 and not marker.exists()
+    result = result_of(job_env)
+    assert result["status"] == "fail" and result["message"].startswith("JobSetTampered:")
