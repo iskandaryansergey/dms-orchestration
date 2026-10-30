@@ -224,15 +224,12 @@ def test_troubleshooting_names_no_sandbox_workaround():
     assert MIN_UPSTREAM in text
 
 
-def test_the_targeted_apply_and_destroy_are_marked_for_removal():
+def test_the_sandbox_applies_and_destroys_without_target():
+    # A sandbox run on upstream 08def61 applied without -target and destroyed in one pass.
     readme = (SANDBOX / "README.md").read_text(encoding="utf-8")
     assert "MaxFileSize" not in readme
-    lines = readme.splitlines()
-    targeted = [i for i, ln in enumerate(lines) if re.search(r"terraform (apply|destroy).*-target", ln)]
-    assert len(targeted) == 2, targeted
-    for i in targeted:
-        near = " ".join(lines[max(0, i - 6) : i + 1])
-        assert "removed after the next sandbox run" in near, lines[i]
+    assert not re.search(r"terraform (apply|destroy)[^\n]*-target", readme)
+    assert "removed after the next sandbox run" not in readme
 
 
 def test_upstream_patches_stay_local():

@@ -67,9 +67,6 @@ uv run python ../../scripts/verify_destroyed.py --match dms-orch-sbx --profile $
 export TF_VAR_operator_cidr=$(curl -s https://checkip.amazonaws.com)/32
 export TF_VAR_sql_runner=true TF_VAR_assessment=true TF_VAR_snapshot_dumps=true TF_VAR_iam_auth=true TF_VAR_sqs_fanout=true
 terraform init
-# Not needed from upstream 08def61 (contract 2.3); removed after the next sandbox run
-# proves a single apply and a clean destroy.
-terraform apply -target=aws_secretsmanager_secret.db   # secrets first
 terraform apply                                         # if it fails on IAM eventual consistency, run it again
 sbx build-image $(git rev-parse --short HEAD)           # CodeBuild + trivy gate, prints the tag
 export TF_VAR_sql_runner_image_tag=$(git rev-parse --short HEAD)
@@ -148,18 +145,6 @@ Every `verify_destroyed` must print `{}`. `destroy` can wait 20 minutes or more 
 network interfaces. ECS creates the log group `/aws/ecs/containerinsights/<cluster>/performance`
 itself when Container Insights is on (off by default); it is not in the state, `verify_destroyed`
 lists it.
-
-If a second `terraform destroy` (after a partial one) fails with `Invalid for_each argument` in
-the upstream `dms` module (`endpoints_with_secret` cannot be planned once the secrets are gone,
-contract 2.3, a commit before 08def61), destroy what is left by address:
-
-```bash
-# Not needed from upstream 08def61 (contract 2.3); removed after the next sandbox run
-# proves a single apply and a clean destroy.
-terraform state list | while read -r a; do
-  terraform destroy -auto-approve -target="$a"
-done
-```
 
 Observed behaviour behind these steps: [`docs/dms-observations.md`](../../docs/dms-observations.md),
 [`docs/troubleshooting.md`](../../docs/troubleshooting.md).
