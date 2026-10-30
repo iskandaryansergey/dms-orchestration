@@ -117,27 +117,29 @@ FARGATE_ABOVE_BYTES = 50 * 2**30
 def verify_runtime(
     options: dict[str, Any], connections: dict[str, Any], baseline: dict[str, Any] | None, images: list[str]
 ) -> str | None:
-    """Where the target check runs: ``lambda`` (Data API, default for a
-    target that fits a 15-minute Lambda), ``fargate`` (psql in the sql-runner image), or None (no
-    check: no Data API and no image). ``auto`` takes Fargate when the last baseline had more than
-    ``fargateAboveTables`` tables or a database above ``fargateAboveBytes``, or the target has no
-    Data API."""
+    """Where the target check runs: ``lambda`` (``builtin:checks/target_verify``: pg8000 when the
+    target connection has a host, the Data API otherwise; default for a target that fits a
+    15-minute Lambda), ``fargate`` (psql in the sql-runner image), or None (no check: the Lambda
+    cannot reach the target and there is no image). ``auto`` takes Fargate when the last baseline
+    had more than ``fargateAboveTables`` tables or a database above ``fargateAboveBytes``, or the
+    Lambda cannot reach the target."""
     mode = options.get("verifyRuntime", "auto")
-    data_api = bool((connections.get("target") or {}).get("dataApiClusterArn"))
+    target = connections.get("target") or {}
+    reachable = bool(target.get("host") or target.get("dataApiClusterArn"))
     has_image = "sql-runner" in images
     if mode == "fargate":
         if not has_image:
             raise InvalidRunRequest("preflight.verifyRuntime=fargate needs the sql-runner image (fargate.images)")
         return "fargate"
     if mode == "lambda":
-        return "lambda" if data_api else None
+        return "lambda" if reachable else None
     summary = (baseline or {}).get("summary") or {}
     big = int(summary.get("tables") or 0) > int(options.get("fargateAboveTables", FARGATE_ABOVE_TABLES)) or int(
         summary.get("databaseBytes") or 0
     ) > int(options.get("fargateAboveBytes", FARGATE_ABOVE_BYTES))
-    if has_image and (big or not data_api):
+    if has_image and (big or not reachable):
         return "fargate"
-    return "lambda" if data_api else None
+    return "lambda" if reachable else None
 
 
 def preflight_jobs(runtime: str | None, options: dict[str, Any]) -> list[dict[str, Any]]:

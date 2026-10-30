@@ -229,8 +229,33 @@ run "lambda_and_events" {
   command = apply
 
   assert {
-    condition     = length(aws_lambda_function.this) == 9
-    error_message = "9 Lambda functions expected (register_waiter is gone)"
+    condition     = length(aws_lambda_function.this) == 10
+    error_message = "10 Lambda functions expected (register_waiter is gone, sql_jobs on by default)"
+  }
+
+  # Lambda SQL runtime (ADR 0011): the default for sql: jobs, the full Lambda timeout, more memory.
+  assert {
+    condition = (
+      aws_lambda_function.this["sql_jobs"].timeout == 900
+      && aws_lambda_function.this["sql_jobs"].memory_size == 1024
+      && aws_lambda_function.this["sql_jobs"].handler == "lambdas.sql_jobs.handler.handler"
+      && aws_lambda_function.this["sql_jobs"].role == aws_iam_role.lambda_jobs.arn
+      && aws_lambda_function.this["builtin_jobs"].memory_size == 512
+    )
+    error_message = "sql_jobs: 900 s, 1024 MB, the jobs role; the others keep lambda.memory_mb"
+  }
+
+  assert {
+    condition     = endswith(aws_lambda_function.this["prepare_job"].environment[0].variables.SQL_JOBS_ARN, ":function:dms-orch-sandbox-sql_jobs")
+    error_message = "prepare_job routes sql jobs to the sql_jobs function"
+  }
+
+  assert {
+    condition = (
+      contains(flatten([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st.Resource if st.Sid == "InvokeJobLambdas"]), aws_lambda_function.this["sql_jobs"].arn)
+      && contains(flatten([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Resource if st.Sid == "Logs"]), "${aws_cloudwatch_log_group.lambda["sql_jobs"].arn}:*")
+    )
+    error_message = "the job runner invokes sql_jobs; sql_jobs logs to its own group with the jobs role"
   }
 
   assert {

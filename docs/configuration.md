@@ -78,7 +78,6 @@ sandbox).
 | `no_cmk` | `kms_key_arn` is not set: data at rest uses AWS managed keys |
 | `include_execution_data` | `include_execution_data = true`: state input and output go to CloudWatch Logs |
 | `fargate_image_tags` | a `fargate.images` entry has no tag or `:latest` (cannot be acknowledged; use an immutable tag) |
-| `no_fargate_images` | `fargate.images` is empty: only Lambda jobs are possible |
 | `lambda_reserved_concurrency` | `lambda.reserved_concurrency` is not set |
 | `own_sns_topic_outside_sandbox` | `sns_topic_arn` is empty outside `environment = "sandbox"` |
 | `state_in_the_dms_workspace` | `table_name` / `artifacts_bucket_name` are empty outside the sandbox: state would be destroyed with the DMS workspace |
@@ -159,7 +158,7 @@ sandbox).
 | <a name="input_job_lambda_arns"></a> [job\_lambda\_arns](#input\_job\_lambda\_arns) | Project-owned Lambda functions that job sets may call with 'function:'. | `list(string)` | `[]` | no |
 | <a name="input_job_secret_arns"></a> [job\_secret\_arns](#input\_job\_secret\_arns) | Secrets Manager ARNs jobs may read (database users for pre/post jobs). Allow-list for IAM. | `list(string)` | `[]` | no |
 | <a name="input_kms_key_arn"></a> [kms\_key\_arn](#input\_kms\_key\_arn) | Customer managed KMS key for DynamoDB, S3, SNS, SQS, logs, Lambda env and Step Functions. null = AWS managed keys (sandbox only; see check no\_cmk). Key policy requirements are in output kms\_key\_policy\_requirements. | `string` | `null` | no |
-| <a name="input_lambda"></a> [lambda](#input\_lambda) | Lambda settings. artifact = prebuilt zip in S3 instead of packaging src/ with archive\_file. | <pre>object({<br/>    runtime              = optional(string, "python3.13")<br/>    architecture         = optional(string, "arm64")<br/>    memory_mb            = optional(number, 512)<br/>    reserved_concurrency = optional(number)<br/>    artifact_s3_bucket   = optional(string)<br/>    artifact_s3_key      = optional(string)<br/>    artifact_source_hash = optional(string)<br/>  })</pre> | `{}` | no |
+| <a name="input_lambda"></a> [lambda](#input\_lambda) | Lambda settings. artifact = prebuilt zip in S3 instead of packaging src/ with archive\_file. sql\_jobs\_enabled = the Lambda SQL runtime for sql: jobs (pg8000 in the zip, 900 s, 1024 MB; ADR 0011). | <pre>object({<br/>    runtime              = optional(string, "python3.13")<br/>    architecture         = optional(string, "arm64")<br/>    memory_mb            = optional(number, 512)<br/>    sql_jobs_enabled     = optional(bool, true)<br/>    reserved_concurrency = optional(number)<br/>    artifact_s3_bucket   = optional(string)<br/>    artifact_s3_key      = optional(string)<br/>    artifact_source_hash = optional(string)<br/>  })</pre> | `{}` | no |
 | <a name="input_lock_grace_seconds"></a> [lock\_grace\_seconds](#input\_lock\_grace\_seconds) | Age after which the watchdog may remove a lock whose execution is no longer running. | `number` | `300` | no |
 | <a name="input_log_retention_days"></a> [log\_retention\_days](#input\_log\_retention\_days) | Retention of all log groups created by the module. | `number` | `90` | no |
 | <a name="input_name"></a> [name](#input\_name) | Base name for all resources (prefix is <name>-<environment>). | `string` | `"dms-orch"` | no |

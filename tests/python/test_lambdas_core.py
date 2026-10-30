@@ -1562,14 +1562,26 @@ def test_verify_runtime_auto_goes_to_fargate_for_a_big_baseline(env, store, monk
     assert _verify_jobs("r-v7", {"verifyRuntime": "auto", "fargateAboveBytes": 2**40})[0]["runtime"] == "lambda"
 
 
-def test_verify_runtime_auto_without_the_data_api_uses_fargate_or_nothing(env, monkeypatch):
+def test_verify_runtime_with_a_host_runs_in_lambda_through_pg8000(env, monkeypatch):
+    """No Data API, but a host: the Lambda reaches the target through pg8000 (no image needed)."""
     target = {k: v for k, v in DATA_API_TARGET.items() if k != "dataApiClusterArn"}
     _register(env, target)
     monkeypatch.setenv("FARGATE_IMAGES", "[]")
-    assert _verify_jobs("r-v8") == []  # as before: the DMS state decides alone
+    (job,) = _verify_jobs("r-v8")
+    assert job["runtime"] == "lambda" and job["handler"] == "builtin:checks/target_verify"
     monkeypatch.setenv("FARGATE_IMAGES", json.dumps(["sql-runner"]))
-    assert _verify_jobs("r-v9")[0]["runtime"] == "fargate"
-    assert _verify_jobs("r-v10", {"verifyRuntime": "lambda"}) == []
+    assert _verify_jobs("r-v9")[0]["runtime"] == "lambda"
+    assert _verify_jobs("r-v10", {"verifyRuntime": "lambda"})[0]["runtime"] == "lambda"
+
+
+def test_verify_runtime_without_host_or_data_api_uses_fargate_or_nothing(env, monkeypatch):
+    target = {k: v for k, v in DATA_API_TARGET.items() if k not in ("dataApiClusterArn", "host")}
+    _register(env, target)
+    monkeypatch.setenv("FARGATE_IMAGES", "[]")
+    assert _verify_jobs("r-v11") == []  # the DMS state decides alone
+    monkeypatch.setenv("FARGATE_IMAGES", json.dumps(["sql-runner"]))
+    assert _verify_jobs("r-v12")[0]["runtime"] == "fargate"
+    assert _verify_jobs("r-v13", {"verifyRuntime": "lambda"}) == []
 
 
 def test_run_request_accepts_allow_no_fingerprint():

@@ -26,5 +26,5 @@ module "orch" {
   }
   projects                    = { ledger = { tasks = { core = {} } } }
   database_security_group_ids = [aws_security_group.db.id]
-  acknowledged_checks         = ["own_sns_topic_outside_sandbox", "state_in_the_dms_workspace", "dumps_without_cmk", "no_cmk", "lambda_reserved_concurrency", "no_fargate_images"]
+  acknowledged_checks         = ["own_sns_topic_outside_sandbox", "state_in_the_dms_workspace", "dumps_without_cmk", "no_cmk", "lambda_reserved_concurrency"]
 }

@@ -26,13 +26,6 @@ check "fargate_image_tags" {
   }
 }
 
-check "no_fargate_images" {
-  assert {
-    condition     = length(var.fargate.images) > 0 ? true : contains(var.acknowledged_checks, "no_fargate_images")
-    error_message = "fargate.images is empty: job sets can only use Lambda jobs. Acknowledge 'no_fargate_images' if that is intended."
-  }
-}
-
 check "lambda_reserved_concurrency" {
   assert {
     condition     = var.lambda.reserved_concurrency != null ? true : contains(var.acknowledged_checks, "lambda_reserved_concurrency")

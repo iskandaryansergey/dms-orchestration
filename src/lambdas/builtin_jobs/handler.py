@@ -2,19 +2,21 @@
 
 =================================  ==========================================================
 checks/connections                 DMS endpoint connections successful; tests the ones that are not
-checks/postgresql_source_grants    PostgreSQL source user can be used by DMS (Data API)
-checks/row_counts                  row counts match between two connections (Data API)
+checks/postgresql_source_grants    PostgreSQL source user can be used by DMS
+checks/row_counts                  row counts match between two connections
+checks/target_verify               fingerprint of the target in the scope of the selection rules
 diagnostics/dms_dump               DMS task, table statistics and recent events -> S3
 dump/cluster_snapshot              Aurora cluster snapshot of the target before a reset (dump.method=snapshot)
-cleanup/drop_control_tables        drop DMS control tables on the target (Data API)
+cleanup/drop_control_tables        drop DMS control tables on the target
 cleanup/cluster_snapshots          delete this task's snapshots older than the dump retention
 =================================  ==========================================================
 
 Input: ``{"spec": {...from prepare_job...}, "attempt": n}``.
 Output (job result contract): ``{"status": "ok|warn|fail", "summary": {...}, "message": "...", "artifacts": [...]}``.
 
-SQL jobs use the RDS Data API (no drivers in Lambda); databases without Data API
-use the Fargate ``sql-runner`` image instead. Dry run: checks still run (they are
+SQL built-ins reach a connection with a ``host`` through pg8000 (vendored, TLS verify-full,
+``shared/sqlclient.py``) and one without a host through the RDS Data API; the queries and the
+results are the same. Checks open read-only sessions. Dry run: checks still run (they are
 read-only), row counts report a mismatch without failing (DMS did not run), cleanup only
 lists what it would drop.
 """
@@ -30,7 +32,7 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
-from shared import aws, bundle, dms_outcome, log
+from shared import aws, bundle, dms_outcome, log, sqlclient
 
 LOGGER = log.get_logger("builtin_jobs")
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
@@ -177,6 +179,28 @@ class DataApi:
                 time.sleep(resume_delay(attempt))
         raise RuntimeError(f"cluster {self.conn['dataApiClusterArn']} did not resume from auto-pause")
 
+    def close(self) -> None:
+        """Nothing to close: one HTTPS call per statement (the same interface as sqlclient.Session)."""
+
+
+def database(spec: dict[str, Any], name: str, *, read_only: bool = True) -> DataApi | sqlclient.Session:
+    """The connection ``name`` as the project's job role: pg8000 when it has a host, else the Data API.
+
+    Both answer ``query(sql, **params)`` with ``:name`` parameters and rows as dicts, so a check
+    gives the same result (and the same fingerprint) through either. pg8000 sessions are
+    read-only unless the job writes; their statement timeout is the job timeout less a margin.
+    """
+    conn = connection(spec, name)
+    if conn.get("host"):
+        timeout = max(30, int(spec.get("timeoutSeconds") or 600) - 30)
+        return sqlclient.connect(spec, name, read_only=read_only, timeout_seconds=timeout)
+    if not conn.get("dataApiClusterArn"):
+        raise ValueError(
+            f"connection {name!r} has neither host (pg8000) nor dataApiClusterArn (Aurora Data API): "
+            "a SQL built-in job cannot reach it"
+        )
+    return DataApi.for_job(spec, name)
+
 
 def task_tables(spec: dict[str, Any]) -> list[str]:
     dms = aws.client("dms")
@@ -264,10 +288,17 @@ def check_connections(spec: dict[str, Any]) -> dict[str, Any]:
 @job("checks/postgresql_source_grants")
 def check_postgresql_source_grants(spec: dict[str, Any]) -> dict[str, Any]:
     w = spec.get("with") or {}
-    db = DataApi.for_job(spec, w.get("connection", "source"))
     schemas = w.get("schemas") or ["public"]
     for s in schemas:
         quote_ident(s)
+    db = database(spec, w.get("connection", "source"))
+    try:
+        return _source_grants(db, w, schemas)
+    finally:
+        db.close()
+
+
+def _source_grants(db: DataApi | sqlclient.Session, w: dict[str, Any], schemas: list[str]) -> dict[str, Any]:
     require = {r.upper() for r in w.get("require") or ["SELECT"]}
     info = db.query(
         "SELECT current_user AS usr, current_setting('wal_level') AS wal_level, "
@@ -308,18 +339,24 @@ def check_postgresql_source_grants(spec: dict[str, Any]) -> dict[str, Any]:
 @job("checks/row_counts")
 def check_row_counts(spec: dict[str, Any]) -> dict[str, Any]:
     w = spec.get("with") or {}
-    src = DataApi.for_job(spec, w.get("source", "source"))
-    tgt = DataApi.for_job(spec, w.get("target", "target"))
     tables = w.get("tables") or task_tables(spec)
     if isinstance(tables, str):
         tables = [t for t in tables.split(",") if t]
     tolerance = int(w.get("tolerance", 0))
     rows = []
-    for table in tables:
-        sql = f"SELECT count(*)::bigint AS n FROM {quote_table(table)}"  # noqa: S608 - identifiers are validated
-        s = src.query(sql)[0]["n"]
-        t = tgt.query(sql)[0]["n"]
-        rows.append({"table": table, "source": s, "target": t, "diff": t - s})
+    src = database(spec, w.get("source", "source"))
+    try:
+        tgt = database(spec, w.get("target", "target"))
+        try:
+            for table in tables:
+                sql = f"SELECT count(*)::bigint AS n FROM {quote_table(table)}"  # noqa: S608 - identifiers are validated
+                s = int(src.query(sql)[0]["n"])
+                t = int(tgt.query(sql)[0]["n"])
+                rows.append({"table": table, "source": s, "target": t, "diff": t - s})
+        finally:
+            tgt.close()
+    finally:
+        src.close()
     mismatched = [r for r in rows if abs(r["diff"]) > tolerance]
     if spec.get("dryRun"):
         # DMS was not started: a mismatch is the expected state, report it without failing.
@@ -398,14 +435,21 @@ def target_verify(spec: dict[str, Any]) -> dict[str, Any]:
     rules = (spec.get("ctx") or {}).get("selectionRules") or w.get("rules") or []
     if not rules:
         return result("fail", "no selection rules for this task: the table mapping cannot scope the check")
-    tgt = DataApi.for_job(spec, w.get("connection", "target"))
     max_exact = int(w.get("exactCountMaxRows", 1_000_000))
     source_name = w.get("source", "source")
     source = (spec.get("connections") or {}).get(source_name) if source_name else None
-    source_query = None
-    if source and source.get("dataApiClusterArn"):
-        source_query = DataApi.for_job(spec, source_name).query
-    fp, database_bytes = fingerprint.build(tgt.query, rules, max_exact=max_exact, source_query=source_query)
+    tgt = database(spec, w.get("connection", "target"))
+    src = None
+    try:
+        if source and (source.get("host") or source.get("dataApiClusterArn")):
+            src = database(spec, source_name)
+        fp, database_bytes = fingerprint.build(
+            tgt.query, rules, max_exact=max_exact, source_query=src.query if src else None
+        )
+    finally:
+        tgt.close()
+        if src is not None:
+            src.close()
     bucket, _, prefix = spec["artifactsS3Prefix"].removeprefix("s3://").partition("/")
     key = f"{prefix}target-fingerprint.json"
     artifacts_s3(spec).put_object(
@@ -582,23 +626,28 @@ def cleanup_cluster_snapshots(spec: dict[str, Any]) -> dict[str, Any]:
 @job("cleanup/drop_control_tables")
 def drop_control_tables(spec: dict[str, Any]) -> dict[str, Any]:
     w = spec.get("with") or {}
-    db = DataApi.for_job(spec, w.get("connection", "target"))
     schema = w.get("schema", "dms_control")
     quote_ident(schema)
     wanted = [t for t in DMS_CONTROL_TABLES if not (w.get("keepValidationFailures", True) and "validation" in t)]
-    existing = [
-        r["table_name"]
-        for r in db.query(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = :schema "
-            "AND table_name = ANY(string_to_array(:tables, ',')) ORDER BY 1",
-            schema=schema,
-            tables=",".join(wanted),
-        )
-    ]
-    if spec.get("dryRun"):
-        return result("ok", f"dry run: would drop {len(existing)} control table(s)", wouldDrop=existing, schema=schema)
-    for table in existing:
-        db.query(f"DROP TABLE IF EXISTS {quote_ident(schema)}.{quote_ident(table)}")
+    dry = bool(spec.get("dryRun"))
+    db = database(spec, w.get("connection", "target"), read_only=dry)
+    try:
+        existing = [
+            r["table_name"]
+            for r in db.query(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = :schema "
+                "AND table_name = ANY(string_to_array(:tables, ',')) ORDER BY 1",
+                schema=schema,
+                tables=",".join(wanted),
+            )
+        ]
+        if dry:
+            msg = f"dry run: would drop {len(existing)} control table(s)"
+            return result("ok", msg, wouldDrop=existing, schema=schema)
+        for table in existing:
+            db.query(f"DROP TABLE IF EXISTS {quote_ident(schema)}.{quote_ident(table)}")
+    finally:
+        db.close()
     return result("ok", f"dropped {len(existing)} control table(s)", dropped=existing, schema=schema)
 
 
@@ -610,7 +659,7 @@ def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
         return result("fail", f"unknown built-in job {spec.get('handler')!r}; known: {sorted(REGISTRY)}")
     try:
         out = fn(spec)
-    except ValueError as err:  # configuration problems are job failures, not Lambda crashes
+    except (ValueError, sqlclient.SqlError) as err:  # configuration and SQL problems are job failures
         out = result("fail", str(err))
     log.info(LOGGER, "built-in job finished", runId=spec.get("runId"), job=spec.get("name"), status=out["status"])
     return out

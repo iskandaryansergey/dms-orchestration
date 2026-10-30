@@ -25,10 +25,25 @@ def test_example_job_set_is_valid():
     assert jobset_tool.validate(EXAMPLE) == 0
     jobs = jobset.normalize(yaml.safe_load((EXAMPLE / "jobset.yaml").read_text()))
     names = [j["name"] for j in jobs["pre"]]
-    assert names == ["check-connections", "check-source-grants", "schema-diff", "create-tables"]
-    assert jobs["pre"][0]["runtime"] == "lambda" and jobs["pre"][2]["runtime"] == "fargate"
+    assert names == ["check-connections", "check-source-grants", "schema-check", "create-tables"]
+    # No image on the default path: every job of the example runs in Lambda (ADR 0011).
+    assert {j["runtime"] for phase in jobs.values() for j in phase} == {"lambda"}
+    assert jobs["reset"][0]["sql"] == {"connection": "target", "truncateScope": True}
     assert jobs["reset"][0]["retry"] == {"maxAttempts": 2, "backoffSeconds": 30}
-    assert jobs["post"][0]["timeoutSeconds"] == 14400
+    assert jobs["post"][0]["sql"]["file"] == ["ddl/020_indexes.sql", "ddl/030_foreign_keys.sql"]
+    # Jobs that write are skipped in dry runs (read-only sessions).
+    writers = [j for p in jobs.values() for j in p if j.get("sql") and not j["sql"].get("truncateScope")]
+    assert [j["name"] for j in writers if "not run.dryRun" not in (j.get("when") or "")] == ["schema-check"]
+
+
+def test_example_schema_check_renders_to_quoted_sql():
+    from lambdas.sql_jobs.handler import render
+
+    jobs = jobset.normalize(yaml.safe_load((EXAMPLE / "jobset.yaml").read_text()))
+    check = next(j for j in jobs["pre"] if j["name"] == "schema-check")
+    sql = render(check["sql"]["inline"], {"var": check["sql"]["vars"]})
+    assert "ARRAY['customers', 'accounts', 'transactions', 'audit_notes']::text[]" in sql
+    assert "{{" not in sql
 
 
 def test_build_writes_json_next_to_bundle(tmp_path):
@@ -45,6 +60,8 @@ def write_bundle(tmp_path: Path, jobset_text: str) -> Path:
 
 BAD = [
     ("pre:\n    - name: a\n      command: [psql-run, --file, nope.sql]\n", "not found"),
+    ("pre:\n    - name: a\n      sql: {file: [nope.sql]}\n", "nope.sql not found"),
+    ("pre:\n    - name: a\n      sql: {inline: 'SELECT 1', truncateScope: true}\n", "exactly one of file"),
     ("pre:\n    - name: a\n      handler: builtin:x/y\n      function: arn\n", "phases"),
     ("pre:\n    - name: a\n      command: [x]\n      when: 'a >'\n", "bad 'when'"),
     ("pre:\n    - {name: a, command: [x]}\n    - {name: a, command: [y]}\n", "duplicate"),
@@ -160,8 +177,9 @@ def test_minimal_example_is_valid_and_covers_every_phase():
     jobs = jobset.normalize(yaml.safe_load((MINIMAL / "jobset.yaml").read_text()))
     assert [j["name"] for j in jobs["pre"]] == ["check-connections"]
     assert jobs["pre"][0]["runtime"] == "lambda"
-    assert jobs["reset"][0]["command"][:2] == ["psql-run", "--connection"]
-    assert [j["runtime"] for j in jobs["post"]] == ["fargate", "lambda"]
+    assert jobs["reset"][0]["sql"] == {"connection": "target", "truncateScope": True}
+    assert [j["runtime"] for j in jobs["post"]] == ["lambda", "lambda"]
+    assert jobs["post"][0]["sql"]["file"] == "sql/indexes.sql" and jobs["post"][0]["when"] == "not run.dryRun"
     assert jobs["on_failure"][0]["onError"] == "continue"
 
 

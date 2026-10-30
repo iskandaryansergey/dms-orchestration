@@ -156,7 +156,7 @@ run "no_secrets_no_data_api_no_fargate" {
   variables {
     job_secret_arns     = []
     fargate             = {}
-    acknowledged_checks = ["own_sns_topic_outside_sandbox", "state_in_the_dms_workspace", "dumps_without_cmk", "no_cmk", "include_execution_data", "lambda_reserved_concurrency", "no_fargate_images"]
+    acknowledged_checks = ["own_sns_topic_outside_sandbox", "state_in_the_dms_workspace", "dumps_without_cmk", "no_cmk", "include_execution_data", "lambda_reserved_concurrency"]
     projects            = { ledger = { tasks = { core = {} } } }
   }
 

@@ -112,6 +112,10 @@ jobs:
         with:
           version: "0.13.0"
       - run: uv sync --frozen
+      # The Lambda SQL runtime ships pg8000 in the zip: rebuild it from the hashed requirements and
+      # compare every file; the RDS CA bundle must match its pin.
+      - name: vendored SQL driver and CA bundle
+        run: make vendor-check
       - name: pytest (unit, lambdas, state machine paths, sql-runner)
         run: |
           uv run pytest --cov=src/shared --cov=src/lambdas --cov=src/jobs/sql-runner \

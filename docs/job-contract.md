@@ -3,7 +3,7 @@
 A **job set** describes what runs around the DMS task. Project teams own it; the
 orchestrator runs it. Start with the tutorial below; the rest of this page is the contract.
 Examples: [`examples/jobs/minimal`](../examples/jobs/minimal) (the tutorial) and
-[`examples/jobs/postgres-basic`](../examples/jobs/postgres-basic) (schema diff, DDL, scripts).
+[`examples/jobs/postgres-basic`](../examples/jobs/postgres-basic) (schema check, DDL, row counts).
 
 ## Authoring a first job set
 
@@ -17,8 +17,8 @@ my-jobs/
 └── sql/indexes.sql
 ```
 
-**2. The job set.** Four phases; each job is either a built-in Lambda job (`handler:`) or a
-command in the Fargate `sql-runner` image (`command:`). This is
+**2. The job set.** Four phases; each job is a built-in Lambda job (`handler:`), SQL in the
+Lambda SQL runtime (`sql:`), or a command in a command runtime (`command:`). This is
 [`examples/jobs/minimal/jobset.yaml`](../examples/jobs/minimal/jobset.yaml):
 
 ```yaml
@@ -26,17 +26,13 @@ command in the Fargate `sql-runner` image (`command:`). This is
 # build the indexes after the load and compare row counts.
 #
 # Connections (registered in Terraform, projects.<p>.tasks.<t>.connections): source and
-# target, both with data_api_cluster_arn (the row counts run through the Data API).
+# target with host and secret_arn. Every job runs in Lambda: sql jobs and the SQL built-ins
+# reach the databases through pg8000 with TLS verify-full; no image is needed.
 #
 # Validate: uv run python scripts/jobset_tool.py validate examples/jobs/minimal
 # Upload:   scripts/sync-jobs.sh <project> <version> examples/jobs/minimal
 schemaVersion: 1
 description: connection check, reset of partial tables, indexes after the load, row counts
-
-defaults:
-  runtime: fargate            # jobs with a command run in the sql-runner image
-  image: sql-runner           # key in the module variable fargate.images
-  timeoutSeconds: 1800
 
 phases:
   pre:
@@ -45,11 +41,12 @@ phases:
 
   reset:
     - name: truncate-tables
-      command: [psql-run, --connection, target, --truncate-scope]   # ctx.resetTables of the spec file, any size
+      sql: { connection: target, truncateScope: true }   # ctx.resetTables of the spec file, any size
 
   post:
     - name: indexes
-      command: [psql-run, --connection, target, --file, sql/indexes.sql]
+      sql: { connection: target, file: sql/indexes.sql }
+      when: "not run.dryRun"                # it writes; a dry run session is read-only
 
     - name: row-counts
       handler: builtin:checks/row_counts
@@ -64,19 +61,21 @@ phases:
 * `pre` runs before DMS starts. `check-connections` comes first in every job set: DMS refuses
   to start until its endpoints passed a connection test.
 * `reset` runs only when the run decides partly loaded tables must be emptied
-  ([When does `reset` run?](#when-does-reset-run)); `{{ ctx.resetTables }}` is the list it
-  decided on.
+  ([When does `reset` run?](#when-does-reset-run)); `truncateScope` empties exactly the
+  tables it decided on (`ctx.resetTables`).
 * `post` runs after a successful load; `on_failure` after a failure that is not resumed.
-* **Runtime.** A job with `handler:` is a Lambda (up to 840 s, Data API for SQL); a job with
-  `command:` runs on Fargate in the image named by `image` (psql, mysql, python, bash, pwsh).
+* **Runtime.** `handler:` and `sql:` jobs run in Lambda (up to 840 s; pg8000 with TLS
+  verify-full when the connection has a host, the Data API otherwise). A job with `command:`
+  runs in a command runtime: Fargate in the image named by `image` (psql, mysql, python,
+  bash, pwsh), optional ([ADR 0011](adr/0011-job-runtimes.md)).
 * **Conditions.** Add `when: "<expression>"` to run a job only sometimes, for example
   `when: "ctx.startType == 'reload-target'"` ([Conditions and templates](#conditions-and-templates)).
-* **SQL.** `psql-run --file` runs files from the bundle; `--template` fills placeholders safely
-  ([SQL templates](#sql-templates---template)). Write SQL that can run twice
-  (`IF NOT EXISTS`): a job may be retried.
+* **SQL.** `sql: {file: ...}` runs files from the bundle, each file as one transaction;
+  placeholders are filled safely ([SQL jobs](#sql-jobs-lambda-sql-runtime)). Write SQL that
+  can run twice (`IF NOT EXISTS`): a job may be retried.
 
 **3. Validate, upload and pin.** The tool checks the schema, the job names and that every file a
-command names exists; versions in S3 are immutable (use a git sha or tag). `sync-jobs.sh` prints
+job names exists; versions in S3 are immutable (use a git sha or tag). `sync-jobs.sh` prints
 the bundle hash; a run takes the version only once the hash is in Terraform:
 
 ```bash
@@ -88,8 +87,9 @@ scripts/sync-jobs.sh ledger v1 examples/jobs/minimal
 jobs = { bundles = { v1 = "<bundle sha256 printed by sync-jobs.sh>" } }
 ```
 
-**4. Try it without DMS.** A dry run runs every job with `ORCH_DRY_RUN=1` (`psql-run` prints the
-SQL instead of running it, built-ins only read) and never starts the task:
+**4. Try it without DMS.** A dry run runs every job in dry mode (sql jobs in read-only
+sessions, `truncateScope` only counts, built-ins only read; `indexes` is skipped by its `when`)
+and never starts the task:
 
 ```bash
 python scripts/orch.py start --project ledger --task core --jobs-version v1 --dry-run --wait
@@ -165,7 +165,7 @@ Each run checks the job set against that hash:
 | `ResolveContext` | the version is in `jobs.bundles` | `JobSetNotPinned` |
 | `ResolveContext` | `bundle.sha256` exists, its total is the registered one, `jobset.json` matches | `JobSetTampered` |
 | Fargate jobs (`sql-runner`) | every downloaded file matches, no file outside the list, none missing; the command does not start otherwise | `JobSetTampered` (job result) |
-| built-in Lambda jobs | every bundle file they read matches | `JobSetTampered` |
+| built-in Lambda jobs, sql jobs | every bundle file they read matches; a sql job opens no session otherwise | `JobSetTampered` |
 
 The run context keeps the hashes (`ctx.jobsBundle`: `sha256`, `files`), and each job carries
 `bundleSha256` to its runtime, so a file changed after the run started is refused too.
@@ -177,7 +177,7 @@ still checked against a `bundle.sha256` uploaded with them, and a registered has
 ```yaml
 schemaVersion: 1
 defaults:                     # applied to every job unless the job overrides them
-  runtime: fargate            # lambda | fargate (lambda when handler/function is set)
+  runtime: fargate            # lambda | ssm | fargate (lambda when handler/function/sql is set)
   image: sql-runner           # key of the module variable fargate.images
   timeoutSeconds: 3600        # lambda jobs are capped at 840
   retry: { maxAttempts: 1, backoffSeconds: 60 }
@@ -185,9 +185,11 @@ defaults:                     # applied to every job unless the job overrides th
   onError: fail               # fail | continue | warn
 phases:
   pre:
-    - name: schema-diff                         # unique within the phase: [a-z0-9][a-z0-9_-]*
-      command: [python3, scripts/diff_schema.py, --source, source, --target, target]
+    - name: schema-check                        # unique within the phase: [a-z0-9][a-z0-9_-]*
+      sql: { connection: target, file: sql/check.sql, vars: { schema: app } }  # Lambda SQL runtime
       when: "ctx.migrationType == 'full-load'"  # optional condition
+    - name: schema-diff
+      command: [python3, scripts/diff_schema.py, --source, source, --target, target]  # command runtime
       artifacts: { upload: [/out/diff.json] }   # files to keep in S3
     - name: grants
       handler: builtin:checks/postgresql_source_grants   # built-in Lambda job
@@ -197,10 +199,53 @@ phases:
 ```
 
 JSON Schema: [`src/shared/schemas/jobset.schema.json`](../src/shared/schemas/jobset.schema.json).
+`runtime: ssm` is part of the schema; a module that does not configure it refuses such jobs
+when they are prepared (`InvalidJobSet`).
+
+## SQL jobs (Lambda SQL runtime)
+
+A job with `sql:` runs in the module's `sql_jobs` Lambda (`lambda.sql_jobs_enabled`, on by
+default): pg8000, pure Python and vendored in the Lambda zip with hashed requirements, TLS
+`verify-full` (or `verify-ca`) against the RDS CA bundle shipped in the zip; any other
+`sslMode` is refused. It logs in as the project job role (the connection's secret, or an IAM
+token for `auth = iam`) and needs a connection with `host`; PostgreSQL only.
+
+| Field | Meaning |
+|---|---|
+| `connection` | registered connection (default `target`) |
+| `file` | one bundle file or a list (up to 20), checked against `bundle.sha256` |
+| `inline` | SQL in the job set itself (up to 16 KB) |
+| `truncateScope: true` | `TRUNCATE` of `ctx.resetTables` in one statement, the full list also above the payload cap; `cascade: true` adds `CASCADE` |
+| `vars` | values for `{{ var.<name> }}`; they may use `{{ }}` templates themselves |
+| `singleTransaction` | all files in one transaction (`BEGIN` … `COMMIT`, `ROLLBACK` on the first error) |
+
+Exactly one of `file`, `inline` and `truncateScope` is set.
+
+**Transactions.** Each file (and `inline`) is sent to PostgreSQL as **one message**, so it runs
+as **one implicit transaction**: all its statements apply, or none. This differs from `psql`,
+which commits statement by statement. Statements that cannot run inside a transaction block
+(`CREATE INDEX CONCURRENTLY`, `VACUUM`, `CREATE DATABASE`) must be alone in their file.
+`singleTransaction: true` puts every file of the job into one transaction; without it each
+file commits on its own, in order. psql meta-commands (`\set`, `\i`) do not exist here.
+
+**Templates.** `{{ expr }}` in the SQL becomes a SQL literal and `{{ ident:expr }}` a quoted
+identifier, exactly as in [SQL templates](#sql-templates---template) (PostgreSQL quoting);
+the scope is `ctx`, `run`, `failure`, `var` and earlier results. Nothing is spliced as raw text.
+
+**Dry run.** The session starts with `default_transaction_read_only = on`: reading SQL runs and
+a write fails the job with `ReadOnlySqlTransaction`. Guard jobs that write with
+`when: "not run.dryRun"`. SQL that mentions `transaction_read_only` or `READ WRITE` is refused
+in a dry run before it is sent. `truncateScope` opens the session and only counts.
+
+**Limits.** 840 s per job (`statement_timeout` is the job timeout less 30 s); longer DDL, dumps
+and scripts belong to a command runtime. `summary.result` is the first row of the last
+statement (up to 50 columns, values cut at 256 characters) — return counts and flags there,
+for `when:` conditions such as `pre.schema-check.summary.result.missing_tables > 0`, never row
+data. The result also goes to `result.json` next to the job's `spec.json`.
 
 ## Conditions and templates
 
-`when:` and `{{ ... }}` in `command` / `with` use a small safe expression language
+`when:` and `{{ ... }}` in `command` / `with` / `sql.vars` use a small safe expression language
 (no function calls): paths, `== != > >= < <=`, `and or not`, `in`, `not in`,
 literals, lists. Missing paths are `null`.
 
@@ -215,7 +260,7 @@ Examples: `when: "pre.schema-diff.summary.missingTables > 0"`,
 `when: "failure.category != 'TRANSIENT_SOURCE_CONN'"`,
 `command: [psql-run, --connection, target, --truncate, "{{ failure.erroredTables }}"]`
 (lists become comma-separated in command arguments; a reset list kept in S3 above the
-payload cap is refused as a template — use `--truncate-scope`).
+payload cap is refused as a template — use `sql: {truncateScope: true}` or `--truncate-scope`).
 
 ## Connections and secrets
 
@@ -226,7 +271,9 @@ never appear in Terraform state, SSM, Step Functions payloads or logs.
 * Fargate jobs: `orch_job.py` reads the secrets with the task role and writes
   `$ORCH_CONNECTIONS_FILE` (mode 0600, deleted after the job). `psql-run` and
   `scripts/pgq.py` use it; the password reaches `psql` only through its own environment.
-* Built-in Lambda jobs: RDS Data API with the secret ARN (`dataApiClusterArn` on the connection).
+* sql jobs and SQL built-in Lambda jobs: pg8000 when the connection has a `host` (secret or IAM
+  token read as the project job role, kept in memory only), otherwise the RDS Data API with the
+  secret ARN (`dataApiClusterArn` on the connection).
 * Every secret must be listed in `job_secret_arns` (IAM allow-list).
 * Use dedicated users (`migration_runner`, the DMS user), not the master user.
 
@@ -305,23 +352,31 @@ Schema: [`src/shared/schemas/job_result.schema.json`](../src/shared/schemas/job_
 |---|---|---|
 | `builtin:checks/connections` | `test` (default `true`), `timeoutSeconds` (300) | endpoint connections are `successful`; untested or failed ones get `TestConnection` first (not in a dry run) |
 | `builtin:checks/postgresql_source_grants` | `connection`, `schemas`, `require: [SELECT, REPLICATION]`, `walLevel`, `minFreeSlots` | the user can read the schemas; for CDC: replication role, `wal_level`, free slots |
-| `builtin:checks/row_counts` | `source`, `target`, `tables` (default: all task tables), `tolerance` | exact `count(*)` per table (Data API, small/medium tables; use a Fargate job for big ones) |
+| `builtin:checks/row_counts` | `source`, `target`, `tables` (default: all task tables), `tolerance` | exact `count(*)` per table (small/medium tables; use a command runtime for big ones) |
 | `builtin:diagnostics/dms_dump` | — | task, unfinished tables and last 24 h of DMS events → `dms-dump.json` artifact |
 | `builtin:dump/cluster_snapshot` | `connection` (`target`), `waitSeconds` (600) | dump phase, `dump.method = snapshot`: tagged cluster snapshot of the connection's cluster, polled until available, `runs/<runId>/dump.json` (ADR 0007) |
 | `builtin:cleanup/cluster_snapshots` | `connection`, `retentionDays` | post job `snapshot-retention`: deletes this task's tagged snapshots older than the retention; dry run only lists them |
 | `builtin:cleanup/drop_control_tables` | `connection`, `schema` (`dms_control`), `keepValidationFailures` | drops DMS control tables; dry run only lists them |
 
-SQL built-ins need the RDS Data API on the cluster (`enable_data_api` in the upstream
-aurora module) and the endpoint `rds-data` in an isolated VPC. Without it, use Fargate jobs.
+SQL built-ins (`postgresql_source_grants`, `row_counts`, `target_verify`,
+`drop_control_tables`) reach a connection with a `host` through pg8000 (the jobs security
+group needs the database port, like any job) and one without a host through the RDS Data API
+(`enable_data_api` in the upstream aurora module, endpoint `rds-data` in an isolated VPC).
+Both give the same results; the pre-flight fingerprint and its hash are identical.
 
 ## Dry run
 
-`dryRun: true` runs `resolve_context`, the lock, `inspect_task` and **all jobs with
-`ORCH_DRY_RUN=1`**, but never calls `StartReplicationTask`. Jobs must not change
-anything in dry runs: `psql-run` prints the SQL instead of running it, built-in
-checks are read-only, cleanup lists only.
+`dryRun: true` runs `resolve_context`, the lock, `inspect_task` and **all jobs in dry
+mode** (`ORCH_DRY_RUN=1` for commands), but never calls `StartReplicationTask`. Jobs must not
+change anything in dry runs: sql jobs run in read-only sessions (writes fail with
+`ReadOnlySqlTransaction`, `truncateScope` only counts), `psql-run` prints the SQL instead of
+running it, built-in checks are read-only, cleanup lists only.
 
-Fargate jobs also get `PGOPTIONS=-c default_transaction_read_only=on` (appended to
+* **Enforced in the Lambda SQL runtime and the SQL built-ins**: the pg8000 session starts with
+  `default_transaction_read_only = on`, and a sql job whose SQL mentions
+  `transaction_read_only` or `READ WRITE` is refused before it is sent.
+
+Command jobs also get `PGOPTIONS=-c default_transaction_read_only=on` (appended to
 any `PGOPTIONS` already set) for the whole command environment:
 
 * **Enforced for libpq clients** started by the command (`psql`, `pg_dump`, drivers

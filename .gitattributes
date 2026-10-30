@@ -2,3 +2,6 @@
 *.ps1 text eol=lf
 *.png binary
 *.zip binary
+# Vendored wheels and the pinned CA bundle stay byte for byte as built (make vendor-check).
+src/lambdas/sql_jobs/vendor/** -text
+src/lambdas/sql_jobs/rds-global-bundle.pem -text

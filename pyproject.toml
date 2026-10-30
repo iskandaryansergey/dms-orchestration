@@ -30,8 +30,8 @@ addopts = "-q"
 [tool.ruff]
 line-length = 120
 target-version = "py313"
-# Fetched by `sandbox.py fetch-upstream`, not ours (gitignored).
-extend-exclude = ["examples/sandbox/upstream"]
+# Fetched by `sandbox.py fetch-upstream`, not ours (gitignored); vendored third-party wheels.
+extend-exclude = ["examples/sandbox/upstream", "src/lambdas/sql_jobs/vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
@@ -42,3 +42,4 @@ ignore = ["S101", "S603", "S607"]
 
 [tool.coverage.run]
 source = ["src/shared", "src/lambdas"]
+omit = ["src/lambdas/sql_jobs/vendor/*"]
