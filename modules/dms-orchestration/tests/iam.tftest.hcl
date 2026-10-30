@@ -313,6 +313,16 @@ run "per_project_job_roles" {
   }
 
   assert {
+    # load_post reads context.json by VersionId: GetObject on a version needs GetObjectVersion
+    # (live sandbox run: AccessDenied, every post failed ContextNotPinned).
+    condition = anytrue([
+      for st in jsondecode(aws_iam_role_policy.lambda_core[0].policy).Statement :
+      contains(flatten([st.Action]), "s3:GetObjectVersion") && contains(flatten([st.Resource]), "arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runs/*/context.json")
+    ])
+    error_message = "the core Lambdas read the pinned version of context.json"
+  }
+
+  assert {
     condition = alltrue([
       for st in jsondecode(aws_iam_role.job["ledger"].assume_role_policy).Statement :
       st.Principal == { Service = "ecs-tasks.amazonaws.com" } ? st.Condition.StringEquals["aws:SourceAccount"] == "111122223333" : st.Principal == { AWS = aws_iam_role.lambda_jobs[0].arn }

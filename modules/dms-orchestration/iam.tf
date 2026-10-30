@@ -334,6 +334,13 @@ locals {
         Resource = ["${local.bucket_arn}/runs/*"]
       },
       {
+        # load_post reads context.json by the VersionId migrate recorded (RUN#.contextVersionId).
+        Sid      = "ReadPinnedContext"
+        Effect   = "Allow"
+        Action   = ["s3:GetObjectVersion"]
+        Resource = ["${local.bucket_arn}/runs/*/context.json"]
+      },
+      {
         # resolve_context, operator repeat of post: is the first post still running?
         Sid      = "CheckPostExecutions"
         Effect   = "Allow"
