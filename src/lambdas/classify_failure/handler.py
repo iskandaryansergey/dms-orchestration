@@ -27,7 +27,7 @@ import re
 from typing import Any
 
 from shared import aws, dms_outcome, log
-from shared.handoff import describe_task
+from shared.handoff import describe_task, table_statistics
 from shared.store import Store
 
 LOGGER = log.get_logger("classify_failure")
@@ -92,6 +92,7 @@ _ERROR_CATEGORIES = {
     "AssessmentWarning": "ASSESSMENT",
     "AssessmentTimeout": "ASSESSMENT",
     "JobSetNotFound": "CONFIG",
+    "DmsValidationErrors": "DATA",
 }
 
 
@@ -184,7 +185,12 @@ def classify(event: dict[str, Any], dms: Any, logs: Any) -> dict[str, Any]:
 
     recovered: dict[str, Any] | None = None
     if error == "WaitTimeout" and task is not None:
-        outcome = dms_outcome.evaluate_outcome(task, event.get("completion") or {}, started_at=event.get("startedAt"))
+        outcome = dms_outcome.evaluate_outcome(
+            task,
+            event.get("completion") or {},
+            started_at=event.get("startedAt"),
+            table_stats=lambda: table_statistics(dms, ctx["taskArn"]),
+        )
         if outcome.kind == "SUCCESS":
             recovered = {**outcome.payload(), "completedBy": "classify-failure"}
             notes.append(f"wait timed out but DMS reports {outcome.outcome}; continuing")

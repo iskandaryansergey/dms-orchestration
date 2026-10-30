@@ -207,6 +207,9 @@ def build(request: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
 
     req["completion"] = req.get("completion") or defaults.get("completion", "auto")
     req["failOnTableErrors"] = bool(req.get("failOnTableErrors", defaults.get("failOnTableErrors", True)))
+    req["failOnValidationErrors"] = bool(
+        req.get("failOnValidationErrors", defaults.get("failOnValidationErrors", True))
+    )
     req["targetReset"] = {
         "policy": (req.get("targetReset") or {}).get("policy") or defaults.get("targetResetPolicy", "if-interrupted")
     }
@@ -334,7 +337,10 @@ def repeat_post(data: dict[str, Any], saved: dict[str, Any], execution: dict[str
             raise RunAlreadyActive(f"post of run {run_id} is still running ({lock['executionArn']})")
     task = handoff.describe_task(aws.client("dms"), ctx["taskArn"])
     outcome = dms_outcome.evaluate_outcome(
-        task, (saved.get("inspect") or {}).get("completionSpec") or {}, started_at=saved.get("startedAt")
+        task,
+        (saved.get("inspect") or {}).get("completionSpec") or {},
+        started_at=saved.get("startedAt"),
+        table_stats=lambda: handoff.table_statistics(aws.client("dms"), ctx["taskArn"]),
     )
     if outcome.kind == "PENDING":
         raise InvalidRunRequest(f"the DMS task is still {(task or {}).get('Status')}: post comes with its event")

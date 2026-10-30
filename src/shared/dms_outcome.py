@@ -15,6 +15,7 @@ behaviour is identical whoever looks at the task.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -55,6 +56,14 @@ PARTIAL_TABLE_STATES = {
 COMPLETED_TABLE_STATE = "Table completed"
 
 START_TYPES = ("start-replication", "resume-processing", "reload-target")
+
+# ValidationState values from DescribeTableStatistics. "Not enabled": the task (or the table)
+# does not validate, nothing to judge. While CDC keeps running, records wait for validation
+# all the time: the in-progress states are not a problem in full-load-complete mode.
+VALIDATED_STATE = "Validated"
+VALIDATION_OFF_STATES = {"Not enabled", ""}
+VALIDATION_IN_PROGRESS_STATES = {"Pending records", "Pending validation", "Pending revalidation", "Preparing table"}
+VALIDATION_LISTED_TABLES = 10
 
 
 _STOP_REASON = re.compile(r"stop reason\s+([A-Z_]+)", re.I)
@@ -295,6 +304,7 @@ def completion_spec(
     settings: dict[str, Any] | None,
     completion: str = "auto",
     fail_on_table_errors: bool = False,
+    fail_on_validation_errors: bool = True,
     operation: str = "migrate",
 ) -> dict[str, Any]:
     """What counts as 'done' for the wait step.
@@ -318,6 +328,7 @@ def completion_spec(
         "mode": mode,
         "migrationType": migration_type,
         "failOnTableErrors": bool(fail_on_table_errors),
+        "failOnValidationErrors": bool(fail_on_validation_errors),
         "expectStop": False,
     }
 
@@ -325,10 +336,42 @@ def completion_spec(
 # --- Waiting: outcome ---------------------------------------------------------
 
 
+def validation_problems(table_stats: list[dict[str, Any]] | None, *, cdc_running: bool = False) -> list[str]:
+    """``<schema>.<table>: <what>`` for every table DMS did not load or validate cleanly.
+
+    A problem is a ``ValidationState`` other than ``Validated`` (tables that do not validate,
+    ``Not enabled``, are skipped), ``ValidationFailedRecords > 0`` or ``FullLoadErrorRows > 0``.
+    """
+    out: list[str] = []
+    for t in table_stats or []:
+        if t.get("TableState") == "Table does not exist":
+            continue
+        what: list[str] = []
+        state = str(t.get("ValidationState") or "")
+        tolerated = cdc_running and state in VALIDATION_IN_PROGRESS_STATES
+        if state != VALIDATED_STATE and state not in VALIDATION_OFF_STATES and not tolerated:
+            what.append(f"validation state {state}")
+        failed = int(t.get("ValidationFailedRecords") or 0)
+        if failed:
+            what.append(f"{failed} record(s) failed validation")
+        error_rows = int(t.get("FullLoadErrorRows") or 0)
+        if error_rows:
+            what.append(f"{error_rows} full-load error row(s)")
+        if what:
+            out.append(f"{table_name(t)}: {', '.join(what)}")
+    return sorted(out)
+
+
+def _problem_text(problems: list[str]) -> str:
+    shown = "; ".join(problems[:VALIDATION_LISTED_TABLES])
+    more = len(problems) - VALIDATION_LISTED_TABLES
+    return f"{len(problems)} table(s) not validated: {shown}" + (f"; and {more} more" if more > 0 else "")
+
+
 @dataclass
 class Outcome:
     kind: str  # SUCCESS | FAILURE | PENDING
-    outcome: str | None = None  # COMPLETED, COMPLETED_WITH_TABLE_ERRORS, STOPPED_AT_CHECKPOINT, ...
+    outcome: str | None = None  # COMPLETED, COMPLETED_WITH_TABLE_ERRORS, COMPLETED_WITH_VALIDATION_ERRORS, ...
     error: str | None = None  # DmsTaskFailed, DmsTaskStoppedUnexpectedly, ...
     cause: str = ""
     task: dict[str, Any] = field(default_factory=dict)
@@ -350,6 +393,7 @@ def evaluate_outcome(
     started_at: Any = None,
     now: Any = None,
     start_error: Any = None,
+    table_stats: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
 ) -> Outcome:
     """Decide whether the wait is over.
 
@@ -362,6 +406,12 @@ def evaluate_outcome(
     first call went through (the task is starting or running); if instead the task
     has not moved since ``started_at``, the start was really refused and the wait
     fails at once with the DMS text instead of after the not-started grace period.
+
+    ``table_stats`` (``DescribeTableStatistics`` rows, or a function returning them, called
+    only when the load finished) gates the outcome on DMS validation: with
+    ``failOnValidationErrors`` (absent = on) a table not validated, with failed validation
+    records or full-load error rows fails ``DmsValidationErrors``; off, the run succeeds as
+    ``COMPLETED_WITH_VALIDATION_ERRORS``. ``None``: validation is not looked at.
     """
     if task is None:
         return Outcome("FAILURE", error="DmsTaskDeleted", cause="replication task not found")
@@ -376,12 +426,21 @@ def evaluate_outcome(
     now_dt = as_dt(now) or datetime.now(UTC)
 
     def success(outcome: str, cause: str) -> Outcome:
+        if errored and spec.get("failOnTableErrors"):
+            return Outcome(
+                "FAILURE", error="DmsTableErrors", cause=f"{errored} table(s) in error state; {cause}", task=summary
+            )
+        rows = table_stats() if callable(table_stats) else table_stats
+        problems = validation_problems(rows, cdc_running=status == "running") if rows is not None else []
+        if problems and spec.get("failOnValidationErrors", True):
+            return Outcome("FAILURE", error="DmsValidationErrors", cause=_problem_text(problems), task=summary)
         if errored:
-            if spec.get("failOnTableErrors"):
-                return Outcome(
-                    "FAILURE", error="DmsTableErrors", cause=f"{errored} table(s) in error state; {cause}", task=summary
-                )
-            return Outcome("SUCCESS", "COMPLETED_WITH_TABLE_ERRORS", cause=f"{errored} table(s) errored", task=summary)
+            note = f"; {_problem_text(problems)}" if problems else ""
+            return Outcome(
+                "SUCCESS", "COMPLETED_WITH_TABLE_ERRORS", cause=f"{errored} table(s) errored{note}", task=summary
+            )
+        if problems:
+            return Outcome("SUCCESS", "COMPLETED_WITH_VALIDATION_ERRORS", cause=_problem_text(problems), task=summary)
         return Outcome("SUCCESS", outcome, cause=cause, task=summary)
 
     if status == "deleting":

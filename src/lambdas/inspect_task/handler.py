@@ -158,6 +158,7 @@ def inspect(event: dict[str, Any], dms: Any) -> dict[str, Any]:
         settings=settings,
         completion=req.get("completion", "auto"),
         fail_on_table_errors=bool(req.get("failOnTableErrors")),
+        fail_on_validation_errors=bool(req.get("failOnValidationErrors", True)),
         operation=req.get("operation", "migrate"),
     )
     prep_mode = (settings.get("FullLoadSettings") or {}).get("TargetTablePrepMode")

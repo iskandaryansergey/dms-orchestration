@@ -40,6 +40,14 @@ def describe_task(dms: Any, task_arn: str) -> dict[str, Any] | None:
     return tasks[0] if tasks else None
 
 
+def table_statistics(dms: Any, task_arn: str) -> list[dict[str, Any]]:
+    """``DescribeTableStatistics`` of the task (validation state per table), all pages."""
+    out: list[dict[str, Any]] = []
+    for page in dms.get_paginator("describe_table_statistics").paginate(ReplicationTaskArn=task_arn):
+        out.extend(page.get("TableStatistics") or [])
+    return out
+
+
 def post_execution_name(run_id: str) -> str:
     """``<runId>-post``; a run id too long for the 80-character limit is shortened with a hash."""
     name = f"{run_id}{POST_SUFFIX}"
@@ -80,6 +88,7 @@ def evaluate(dms: Any, item: dict[str, Any], now: Any = None) -> dms_outcome.Out
         started_at=item.get("startedAt"),
         now=now,
         start_error=item.get("startError"),
+        table_stats=lambda: table_statistics(dms, item["taskArn"]),
     )
 
 
