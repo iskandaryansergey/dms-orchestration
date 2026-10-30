@@ -195,12 +195,43 @@ def assessment_settings(registered: dict[str, Any] | None, asked: dict[str, Any]
     return {**registered, "enabled": enabled, "failOnWarning": fail_on_warning}
 
 
+CHAIN_FIELDS = ("attempt", "parentRunId", "parentStartedAt")
+
+
+def resolve_chain(req: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
+    """The dump already taken in this chain of runs, for a chained resume only.
+
+    ``attempt``, ``parentRunId`` and ``parentStartedAt`` skip the pre-jobs, the dump and maybe
+    the start (review finding 5), so they are accepted only from the execution that post named on
+    the parent run when it handed the lock over (``RUN#<parentRunId>.resumeChildRunId``, written
+    by ``HandOverLock``); an operator who sets them gets InvalidRunRequest.
+    """
+    if not any(req.get(f) is not None for f in CHAIN_FIELDS):
+        return {"dumped": False, "dumpUri": None}
+    parent_id, name = req.get("parentRunId"), execution.get("name")
+    if not parent_id or not req.get("attempt") or int(req["attempt"]) < 2:
+        raise InvalidRunRequest("attempt, parentRunId and parentStartedAt are set by post for a chained resume only")
+    parent = Store(aws.table()).get_run(str(parent_id)) or {}
+    if (
+        not name
+        or parent.get("resumeChildRunId") != name
+        or parent.get("project") != req["project"]
+        or parent.get("taskKey") not in (None, req["taskKey"])
+    ):
+        raise InvalidRunRequest(
+            f"run {parent_id} did not hand over to {name}: attempt, parentRunId and parentStartedAt "
+            "are set by post for a chained resume only"
+        )
+    return {"dumped": bool(parent.get("chainDumped")), "dumpUri": parent.get("dumpUri")}
+
+
 def build(request: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
     try:
         validation.validate("run_request", request)
     except validation.ValidationError as err:
         raise InvalidRunRequest(str(err)) from err
     req = validation.with_defaults("run_request", request)
+    chain = resolve_chain(req, execution)
 
     reg = load_registration(req["project"], req["taskKey"])
     defaults = reg.get("defaults") or {}
@@ -255,6 +286,7 @@ def build(request: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
         "runTimeoutSeconds": int(defaults.get("runTimeoutSeconds", 604800)),
         "executionArn": execution.get("arn"),
         "assessment": assessment_settings(reg.get("assessment"), req.get("assessment") or {}),
+        "chain": chain,
     }
     return {"runId": run_id, "request": req, "ctx": ctx, "attempt": int(req.get("attempt") or 1)}
 
@@ -479,6 +511,9 @@ def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
             "requestedBy": req.get("requestedBy"),
             "changeRef": req.get("changeRef"),
             "jobsVersion": req.get("jobsVersion"),
+            "parentRunId": req.get("parentRunId"),
+            "chainDumped": ctx["chain"]["dumped"],
+            "dumpUri": ctx["chain"]["dumpUri"],
         },
     )
     store.append_event(result["runId"], "sfn", "resolve", {"request": req})

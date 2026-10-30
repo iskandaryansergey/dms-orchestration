@@ -7,6 +7,9 @@ Item layout (pk / sk):
   end of post; ``executionArn`` names the execution that owns it now.
 * ``RUN#<runId>`` / ``META`` — run metadata (``gsi1pk = PROJECT#<project>``); ``contextVersionId``
   is the S3 version of ``context.json`` that migrate saved, the only one post loads.
+  ``resumeChildRunId`` names the only migrate execution post handed the lock to (``HandOverLock``):
+  the only one that may claim this run as its ``parentRunId``. ``chainDumped`` / ``dumpUri``: a
+  run of this chain (this one or a parent) dumped the target before a reset (``RecordChainDump``).
 * ``RUN#<runId>`` / ``EVENT#<ts>#<seq>`` — timeline.
 * ``RUN#<runId>`` / ``JOB#<phase>#<nn>#<name>`` — job results.
 * ``MIGRATION#<taskArn>`` / ``ACTIVE`` — DMS was started by ``migrate`` and ``post`` has not

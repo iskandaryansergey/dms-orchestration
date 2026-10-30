@@ -74,6 +74,11 @@ run "least_privilege" {
   }
 
   assert {
+    condition     = contains(flatten([for st in jsondecode(aws_iam_role_policy.migrate.policy).Statement : flatten([st.Action])]), "dms:DescribeReplicationTasks")
+    error_message = "migrate reads the task again before the dump and the reset (RecheckTask)"
+  }
+
+  assert {
     condition     = toset(one([for st in jsondecode(aws_iam_role_policy.migrate.policy).Statement : st.Resource if st.Sid == "StartDmsTasks"])) == toset(values(var.dms.task_arns))
     error_message = "dms:StartReplicationTask must be limited to the DMS task ARNs"
   }

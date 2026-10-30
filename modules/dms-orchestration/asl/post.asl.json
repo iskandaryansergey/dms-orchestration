@@ -64,7 +64,7 @@
     },
     "TakeOverLock": {
       "Type": "Task",
-      "Comment": "The lock now names this execution, so release_lock and the watchdog treat a dead post like a dead migrate.",
+      "Comment": "The lock now names this execution, so release_lock and the watchdog treat a dead post like a dead migrate. A lock that no longer names this run (or cannot be written after the retries) stops post: nothing runs without it (review finding 8).",
       "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
       "Arguments": {
         "TableName": "${table_name}",
@@ -88,8 +88,30 @@
           "JitterStrategy": "FULL"
         }
       ],
-      "Catch": [{ "Comment": "Best effort: the run goes on and reports.", "ErrorEquals": ["States.ALL"], "Next": "DeleteMigration" }],
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDb.ConditionalCheckFailedException"],
+          "Next": "LockLost",
+          "Assign": {
+            "finalStatus": "MANUAL",
+            "failure": { "Error": "LockLost", "Cause": "{% 'the lock of ' & $ctx.taskArn & ' no longer names run ' & $runId & ': another run or an operator holds the task. Post jobs and auto-resume did not run; check the task and the target, then repeat post (orch.py post) if the outcome still applies.' %}" }
+          }
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "LockLost",
+          "Assign": {
+            "finalStatus": "MANUAL",
+            "failure": { "Error": "LockLost", "Cause": "{% 'the lock of ' & $ctx.taskArn & ' could not be taken over for run ' & $runId & ' (' & $string($states.errorOutput.Error) & '). Post jobs and auto-resume did not run; repeat post (orch.py post) once the table answers.' %}" }
+          }
+        }
+      ],
       "Next": "DeleteMigration"
+    },
+    "LockLost": {
+      "Type": "Pass",
+      "Comment": "Report MANUAL and notify; ReleaseLock is skipped (CheckLockHeld): the lock is not ours to delete. A lock this execution does hold after all (a write that timed out) is freed by release_lock when the execution fails.",
+      "Next": "WriteReport"
     },
     "DeleteMigration": {
       "Type": "Task",
@@ -264,19 +286,34 @@
     },
     "HandOverLock": {
       "Type": "Task",
-      "Comment": "Auto-resume is a new migrate execution (ADR 0005). The lock moves to its run id first, so nothing else can take the task in between; its AcquireLock takes it over.",
-      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Comment": "Auto-resume is a new migrate execution (ADR 0005). The lock moves to its run id first, so nothing else can take the task in between; its AcquireLock takes it over. In the same transaction RUN#<runId>.resumeChildRunId names that execution: resolve_context accepts attempt / parentRunId only from it (review finding 5).",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:transactWriteItems",
       "Arguments": {
-        "TableName": "${table_name}",
-        "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
-        "UpdateExpression": "SET runId = :n, executionArn = :e, gsi2sk = :e, handedOverFrom = :o, acquiredAt = :t",
-        "ConditionExpression": "runId = :o",
-        "ExpressionAttributeValues": {
-          ":n": { "S": "{% $nextRunId %}" },
-          ":e": { "S": "{% '${migrate_executions_prefix}' & $nextRunId %}" },
-          ":o": { "S": "{% $runId %}" },
-          ":t": { "S": "{% $now() %}" }
-        }
+        "TransactItems": [
+          {
+            "Update": {
+              "TableName": "${table_name}",
+              "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
+              "UpdateExpression": "SET runId = :n, executionArn = :e, gsi2sk = :e, handedOverFrom = :o, acquiredAt = :t",
+              "ConditionExpression": "runId = :o",
+              "ExpressionAttributeValues": {
+                ":n": { "S": "{% $nextRunId %}" },
+                ":e": { "S": "{% '${migrate_executions_prefix}' & $nextRunId %}" },
+                ":o": { "S": "{% $runId %}" },
+                ":t": { "S": "{% $now() %}" }
+              }
+            }
+          },
+          {
+            "Update": {
+              "TableName": "${table_name}",
+              "Key": { "pk": { "S": "{% 'RUN#' & $runId %}" }, "sk": { "S": "META" } },
+              "UpdateExpression": "SET resumeChildRunId = :n",
+              "ConditionExpression": "attribute_exists(pk)",
+              "ExpressionAttributeValues": { ":n": { "S": "{% $nextRunId %}" } }
+            }
+          }
+        ]
       },
       "TimeoutSeconds": 10,
       "Retry": [
@@ -311,18 +348,32 @@
     },
     "GiveLockBack": {
       "Type": "Task",
-      "Comment": "The new migrate did not start: take the lock back so this run can finish and release it.",
-      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Comment": "The new migrate did not start: take the lock back so this run can finish and release it, and withdraw the hand-over from RUN# so no execution of that name can claim this run as its parent.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:transactWriteItems",
       "Arguments": {
-        "TableName": "${table_name}",
-        "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
-        "UpdateExpression": "SET runId = :o, executionArn = :e, gsi2sk = :e",
-        "ConditionExpression": "runId = :n",
-        "ExpressionAttributeValues": {
-          ":n": { "S": "{% $nextRunId %}" },
-          ":e": { "S": "{% $states.context.Execution.Id %}" },
-          ":o": { "S": "{% $runId %}" }
-        }
+        "TransactItems": [
+          {
+            "Update": {
+              "TableName": "${table_name}",
+              "Key": { "pk": { "S": "{% 'LOCK#' & $ctx.taskArn %}" }, "sk": { "S": "LOCK" } },
+              "UpdateExpression": "SET runId = :o, executionArn = :e, gsi2sk = :e",
+              "ConditionExpression": "runId = :n",
+              "ExpressionAttributeValues": {
+                ":n": { "S": "{% $nextRunId %}" },
+                ":e": { "S": "{% $states.context.Execution.Id %}" },
+                ":o": { "S": "{% $runId %}" }
+              }
+            }
+          },
+          {
+            "Update": {
+              "TableName": "${table_name}",
+              "Key": { "pk": { "S": "{% 'RUN#' & $runId %}" }, "sk": { "S": "META" } },
+              "UpdateExpression": "REMOVE resumeChildRunId",
+              "ConditionExpression": "attribute_exists(pk)"
+            }
+          }
+        ]
       },
       "TimeoutSeconds": 10,
       "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2 }],
@@ -451,7 +502,7 @@
     "CheckNotify": {
       "Type": "Choice",
       "Choices": [{ "Condition": "{% $report.notify = true %}", "Next": "Notify" }],
-      "Default": "ReleaseLock"
+      "Default": "CheckLockHeld"
     },
     "Notify": {
       "Type": "Task",
@@ -465,8 +516,14 @@
       },
       "TimeoutSeconds": 30,
       "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ReleaseLock" }],
-      "Next": "ReleaseLock"
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "CheckLockHeld" }],
+      "Next": "CheckLockHeld"
+    },
+    "CheckLockHeld": {
+      "Type": "Choice",
+      "Comment": "After LockLost the lock belongs to someone else: never delete it.",
+      "Choices": [{ "Condition": "{% $exists($failure.Error) and $failure.Error = 'LockLost' %}", "Next": "Done" }],
+      "Default": "ReleaseLock"
     },
     "ReleaseLock": {
       "Type": "Task",
