@@ -141,6 +141,8 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
     spec["artifacts"] = job.get("artifacts") or {}
     spec["connections"] = ctx.get("connections") or {}
     spec["jobsS3Prefix"] = ctx.get("jobsS3Prefix")
+    # The bundle hash resolve_context pinned (review finding 9); the runtime checks every file.
+    spec["bundleSha256"] = job.get("bundleSha256")
     spec["ctx"] = ctx
     spec["failure"] = event.get("failure")
     spec["previous"] = {k: v for k, v in scope.items() if k in ("pre", "reset", "post", "on_failure")}

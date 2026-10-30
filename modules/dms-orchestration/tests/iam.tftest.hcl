@@ -384,6 +384,14 @@ run "operator_cannot_publish_job_sets" {
   }
 
   assert {
+    condition = alltrue([
+      for p, pol in output.jobset_publisher_policy_json :
+      one([for st in jsondecode(pol).Statement : st.Condition if st.Sid == "PublishJobSets"]).Null["s3:if-none-match"] == "false"
+    ])
+    error_message = "publishers only create objects (PutObject with If-None-Match): a published job set version is never overwritten"
+  }
+
+  assert {
     condition = alltrue(flatten([
       for p, pol in output.jobset_publisher_policy_json : [
         for st in jsondecode(pol).Statement : [for r in flatten([st.Resource]) : !strcontains(r, "/runs/") && !strcontains(r, ":secret:")]

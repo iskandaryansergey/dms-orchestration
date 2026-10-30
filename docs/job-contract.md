@@ -75,12 +75,17 @@ phases:
   ([SQL templates](#sql-templates---template)). Write SQL that can run twice
   (`IF NOT EXISTS`): a job may be retried.
 
-**3. Validate and upload.** The tool checks the schema, the job names and that every file a
-command names exists; versions in S3 are immutable (use a git sha or tag):
+**3. Validate, upload and pin.** The tool checks the schema, the job names and that every file a
+command names exists; versions in S3 are immutable (use a git sha or tag). `sync-jobs.sh` prints
+the bundle hash; a run takes the version only once the hash is in Terraform:
 
 ```bash
 uv run python scripts/jobset_tool.py validate examples/jobs/minimal
 scripts/sync-jobs.sh ledger v1 examples/jobs/minimal
+```
+
+```hcl
+jobs = { bundles = { v1 = "<bundle sha256 printed by sync-jobs.sh>" } }
 ```
 
 **4. Try it without DMS.** A dry run runs every job with `ORCH_DRY_RUN=1` (`psql-run` prints the
@@ -135,10 +140,37 @@ my-bundle/
 ```
 
 `scripts/sync-jobs.sh <project> <version> <bundle-dir>` validates the bundle
-(`scripts/jobset_tool.py`), converts YAML to `jobset.json` and uploads it to
-`s3://<artifacts>/jobs/<project>/<version>/`. Versions are immutable (use the git
-SHA). A run uses `jobsVersion` from the request, or the task's
-`jobs.default_version` from Terraform. No version → no jobs.
+(`scripts/jobset_tool.py`), converts YAML to `jobset.json`, writes `bundle.sha256` and uploads
+it to `s3://<artifacts>/jobs/<project>/<version>/`. A run uses `jobsVersion` from the request,
+or the task's `jobs.default_version` from Terraform. No version → no jobs.
+
+**Versions are immutable and pinned.** The upload creates every object with `If-None-Match`
+(the publisher policy allows nothing else), so a version is never overwritten: a fix is a new
+version (use the git SHA). `bundle.sha256` lists the SHA-256 of every file, sorted by path
+(`<sha256>  <path>`), and ends with `total <sha256>`, the hash over those lines. The script
+prints the total, and `scripts/jobset_tool.py hash <bundle-dir>` gives the same value from the
+source. Terraform registers it per version:
+
+```hcl
+jobs = {
+  default_version = "3f2c1ab"
+  bundles         = { "3f2c1ab" = "<total>" }   # version => bundle hash
+}
+```
+
+Each run checks the job set against that hash:
+
+| Where | Check | Error |
+|---|---|---|
+| `ResolveContext` | the version is in `jobs.bundles` | `JobSetNotPinned` |
+| `ResolveContext` | `bundle.sha256` exists, its total is the registered one, `jobset.json` matches | `JobSetTampered` |
+| Fargate jobs (`sql-runner`) | every downloaded file matches, no file outside the list, none missing; the command does not start otherwise | `JobSetTampered` (job result) |
+| built-in Lambda jobs | every bundle file they read matches | `JobSetTampered` |
+
+The run context keeps the hashes (`ctx.jobsBundle`: `sha256`, `files`), and each job carries
+`bundleSha256` to its runtime, so a file changed after the run started is refused too.
+`jobs.allow_unpinned = true` (sandbox, development) lets versions without a hash run; files are
+still checked against a `bundle.sha256` uploaded with them, and a registered hash always wins.
 
 ## Job fields
 

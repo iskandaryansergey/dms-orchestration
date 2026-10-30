@@ -95,6 +95,11 @@ variable "projects" {
       jobs = optional(object({
         s3_prefix       = optional(string)
         default_version = optional(string)
+        # version => total of its bundle.sha256 (scripts/jobset_tool.py hash <bundle-dir>). A run
+        # takes only a version listed here, and its runtimes check every file against the hash.
+        bundles = optional(map(string), {})
+        # Run versions not listed in bundles (sandbox, development). A listed hash is still enforced.
+        allow_unpinned = optional(bool, false)
       }), {})
       defaults = optional(object({
         completion                = optional(string, "auto")
@@ -123,6 +128,26 @@ variable "projects" {
   validation {
     condition     = alltrue(flatten([for p in values(var.projects) : [for k in keys(p.tasks) : can(regex("^[a-z][a-z0-9_-]{0,39}$", k))]]))
     error_message = "task keys must match ^[a-z][a-z0-9_-]{0,39}$."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for p in values(var.projects) : [
+        for t in values(p.tasks) : [
+          for v, h in t.jobs.bundles : can(regex("^[A-Za-z0-9._-]{1,64}$", v)) && can(regex("^[0-9a-f]{64}$", h))
+        ]
+      ]
+    ]))
+    error_message = "jobs.bundles maps a job set version (A-Z a-z 0-9 . _ -) to the 64 hex digit total printed by scripts/jobset_tool.py hash."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for p in values(var.projects) : [
+        for t in values(p.tasks) : t.jobs.default_version == null || t.jobs.allow_unpinned || contains(keys(t.jobs.bundles), coalesce(t.jobs.default_version, "-"))
+      ]
+    ]))
+    error_message = "jobs.default_version must have its bundle hash in jobs.bundles (scripts/jobset_tool.py hash), unless jobs.allow_unpinned = true."
   }
 
   validation {

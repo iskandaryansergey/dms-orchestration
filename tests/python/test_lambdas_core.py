@@ -11,6 +11,7 @@ import pytest
 from conftest import EXEC_ARN, TASK_ARN, FakeDms, FakeSfn, dms_task
 
 from shared import aws as shared_aws
+from shared import bundle as jobs_bundle
 
 BUCKET = "dms-orch-artifacts-test"
 REGISTRATION = {
@@ -54,6 +55,23 @@ JOBSET = {
 }
 
 
+def bundle_files(files: dict[str, bytes]) -> dict[str, str]:
+    return {rel: jobs_bundle.digest(data) for rel, data in files.items()}
+
+
+def put_bundle(s3: Any, version: str, files: dict[str, bytes]) -> str:
+    """Upload a built bundle with its bundle.sha256 (as sync-jobs.sh does); returns the total."""
+    for rel, data in files.items():
+        s3.put_object(Bucket=BUCKET, Key=f"jobs/ledger/{version}/{rel}", Body=data)
+    manifest = jobs_bundle.render(bundle_files(files)).encode()
+    s3.put_object(Bucket=BUCKET, Key=f"jobs/ledger/{version}/bundle.sha256", Body=manifest)
+    return jobs_bundle.total(bundle_files(files))
+
+
+# Terraform pins every job set version a task may run (jobs.bundles, review finding 9).
+REGISTRATION["jobs"]["bundles"] = {"v1": jobs_bundle.total(bundle_files({"jobset.json": json.dumps(JOBSET).encode()}))}
+
+
 @pytest.fixture
 def env(table, monkeypatch):
     monkeypatch.setenv("SSM_PREFIX", "/dms-orch/test")
@@ -63,7 +81,7 @@ def env(table, monkeypatch):
     s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
     # post reads context.json by the version migrate recorded: the bucket is versioned.
     s3.put_bucket_versioning(Bucket=BUCKET, VersioningConfiguration={"Status": "Enabled"})
-    s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/jobset.json", Body=json.dumps(JOBSET).encode())
+    put_bundle(s3, "v1", {"jobset.json": json.dumps(JOBSET).encode()})
     ssm = boto3.client("ssm", region_name="eu-west-2")
     ssm.put_parameter(Name="/dms-orch/test/ledger/core", Type="String", Value=json.dumps(REGISTRATION))
     return {"s3": s3, "ssm": ssm, "table": table}
@@ -134,6 +152,7 @@ def test_resolve_context_missing_jobset_version(env):
     from lambdas.resolve_context.handler import handler
     from shared.errors import JobSetNotFound
 
+    register_jobs(env, bundles={**REGISTRATION["jobs"]["bundles"], "v9": "9" * 64})
     with pytest.raises(JobSetNotFound):
         handler({"request": {"project": "ledger", "taskKey": "core", "jobsVersion": "v9"}, "execution": EXECUTION})
 
@@ -1406,7 +1425,8 @@ def test_post_repeat_can_take_the_post_jobs_of_a_fixed_job_set_version(env, stor
         **JOBSET,
         "phases": {**JOBSET["phases"], "post": [{"name": "row-counts", "command": ["psql-run", "--sql", "SELECT 1"]}]},
     }
-    env["s3"].put_object(Bucket=BUCKET, Key="jobs/ledger/v2/jobset.json", Body=json.dumps(fixed).encode())
+    v2 = put_bundle(env["s3"], "v2", {"jobset.json": json.dumps(fixed).encode()})
+    register_jobs(env, bundles={**REGISTRATION["jobs"]["bundles"], "v2": v2})
     use(dms=FakeDms(FINISHED), sfn=FakeSfn())
     data = {
         "runId": "run-1",
@@ -1633,3 +1653,99 @@ def test_classify_validation_errors_are_data_and_not_recovered_after_a_wait_time
     }
     out = classify(event, FakeDms(FINISHED, BAD_VALIDATION), FakeLogs())
     assert out["recovered"] is False
+
+
+# --- review finding 9: job sets pinned by the bundle hash in the registration ---
+
+
+def register_jobs(env, **jobs: Any) -> None:
+    reg = {**REGISTRATION, "jobs": {**REGISTRATION["jobs"], **jobs}}
+    env["ssm"].put_parameter(Name="/dms-orch/test/ledger/core", Type="String", Value=json.dumps(reg), Overwrite=True)
+
+
+def _resolve(version: str = "v1", name: str = "r-pin") -> dict[str, Any]:
+    from lambdas.resolve_context.handler import handler
+
+    req = {"project": "ledger", "taskKey": "core", "jobsVersion": version}
+    return handler({"request": req, "execution": {**EXECUTION, "name": name}})
+
+
+def test_pinned_job_set_puts_its_hashes_into_ctx_and_every_job(env):
+    ctx = _resolve()["ctx"]
+    pinned = REGISTRATION["jobs"]["bundles"]["v1"]
+    assert ctx["jobsBundle"] == {
+        "sha256": pinned,
+        "files": bundle_files({"jobset.json": json.dumps(JOBSET).encode()}),
+        "pinned": True,
+    }
+    assert {j["bundleSha256"] for p in ("pre", "reset") for j in ctx["jobs"][p]} == {pinned}
+    assert "bundle" not in ctx["jobs"]
+
+
+def test_unregistered_job_set_version_is_refused(env):
+    from shared.errors import JobSetNotPinned
+
+    put_bundle(env["s3"], "v3", {"jobset.json": json.dumps(JOBSET).encode()})
+    with pytest.raises(JobSetNotPinned, match="v3"):
+        _resolve("v3")
+
+
+def test_allow_unpinned_takes_the_bundle_hash_it_finds(env):
+    total = put_bundle(env["s3"], "v3", {"jobset.json": json.dumps(JOBSET).encode()})
+    register_jobs(env, allowUnpinned=True)
+    ctx = _resolve("v3")["ctx"]
+    assert ctx["jobsBundle"]["sha256"] == total and ctx["jobsBundle"]["pinned"] is False
+    assert ctx["jobs"]["pre"][0]["bundleSha256"] == total
+
+
+def test_allow_unpinned_without_a_manifest_runs_unverified(env):
+    env["s3"].put_object(Bucket=BUCKET, Key="jobs/ledger/v4/jobset.json", Body=json.dumps(JOBSET).encode())
+    register_jobs(env, allowUnpinned=True)
+    ctx = _resolve("v4")["ctx"]
+    assert ctx["jobsBundle"] is None and ctx["jobs"]["pre"][0]["bundleSha256"] is None
+
+
+def test_tampered_job_set_file_is_refused(env):
+    from shared.errors import JobSetTampered
+
+    evil = {**JOBSET, "phases": {**JOBSET["phases"], "pre": [{"name": "x", "command": ["sh", "-c", "id"]}]}}
+    env["s3"].put_object(Bucket=BUCKET, Key="jobs/ledger/v1/jobset.json", Body=json.dumps(evil).encode())
+    with pytest.raises(JobSetTampered, match="jobset.json"):
+        _resolve()
+
+
+def test_bundle_rewritten_with_a_fresh_manifest_does_not_match_the_pin(env):
+    from shared.errors import JobSetTampered
+
+    evil = {**JOBSET, "phases": {**JOBSET["phases"], "pre": [{"name": "x", "command": ["sh", "-c", "id"]}]}}
+    put_bundle(env["s3"], "v1", {"jobset.json": json.dumps(evil).encode()})
+    with pytest.raises(JobSetTampered, match="pinned"):
+        _resolve()
+    register_jobs(env, allowUnpinned=True)  # allow_unpinned never overrides a registered hash
+    with pytest.raises(JobSetTampered, match="pinned"):
+        _resolve(name="r-pin2")
+
+
+def test_pinned_version_without_a_manifest_is_refused(env):
+    from shared.errors import JobSetTampered
+
+    env["s3"].delete_object(Bucket=BUCKET, Key="jobs/ledger/v1/bundle.sha256")
+    with pytest.raises(JobSetTampered, match="bundle.sha256"):
+        _resolve()
+
+
+def test_post_repeat_with_an_unpinned_job_set_version_is_refused(env, table):
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import JobSetNotPinned
+
+    _save_repeat_context(env)
+    put_bundle(env["s3"], "v5", {"jobset.json": json.dumps(JOBSET).encode()})
+    use(dms=FakeDms(FINISHED), sfn=FakeSfn())
+    data = {"runId": "run-1", "operation": "post", "jobsVersion": "v5", "startedBy": "operator"}
+    with pytest.raises(JobSetNotPinned):
+        handler({"mode": "post", "input": data, "execution": REPEAT_EXEC})
+
+
+def test_job_set_errors_are_configuration_failures():
+    for error in ("JobSetNotPinned", "JobSetTampered"):
+        assert _classify({"Error": error, "Cause": "x"})["category"] == "CONFIG"

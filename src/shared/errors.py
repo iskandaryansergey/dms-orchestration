@@ -26,6 +26,14 @@ class InvalidJobSet(OrchestratorError):  # noqa: N818
     pass
 
 
+class JobSetNotPinned(OrchestratorError):  # noqa: N818
+    """The job set version has no bundle hash in the task registration (jobs.bundles)."""
+
+
+class JobSetTampered(OrchestratorError):  # noqa: N818
+    """A job set file, or bundle.sha256, does not match the hash the run pinned."""
+
+
 class DmsTaskNotFound(OrchestratorError):  # noqa: N818
     pass
 

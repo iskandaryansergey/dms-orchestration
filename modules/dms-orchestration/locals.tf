@@ -87,6 +87,8 @@ locals {
       jobs = {
         s3Prefix       = coalesce(t.jobs.s3_prefix, "jobs/${t.project}")
         defaultVersion = t.jobs.default_version
+        bundles        = t.jobs.bundles
+        allowUnpinned  = t.jobs.allow_unpinned
       }
       defaults = {
         completion             = t.defaults.completion

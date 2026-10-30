@@ -47,7 +47,8 @@ module "dms_orchestration" {
         target = { engine = "postgresql", secret_arn = var.target_secret_arn,
                    data_api_cluster_arn = var.target_cluster_arn }
       }
-      jobs = { default_version = "v1" }
+      # bundles: the hash sync-jobs.sh prints for v1 (step 4); runs refuse an unpinned version
+      jobs = { default_version = "v1", bundles = { v1 = var.jobs_v1_sha256 } }
     } } }
   }
 
@@ -96,7 +97,11 @@ scripts/sync-jobs.sh ledger v1 examples/jobs/minimal
 ```
 
 Versions are immutable; use a git sha or tag. The version named in `jobs.default_version` (or in
-the request as `jobsVersion`) is what a run uses.
+the request as `jobsVersion`) is what a run uses, and only once it is pinned: `sync-jobs.sh`
+prints `bundle sha256: <hash>` (`scripts/jobset_tool.py hash examples/jobs/minimal` gives the
+same value before the upload); put it into `jobs.bundles` of the task and apply. Runs refuse a
+version without a hash (`JobSetNotPinned`) and a bundle that differs from it (`JobSetTampered`).
+A sandbox can set `jobs.allow_unpinned = true` ([job contract](job-contract.md#file-layout-and-versions)).
 
 ## 5. Plan: what would happen
 

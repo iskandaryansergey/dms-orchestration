@@ -483,7 +483,9 @@ module "dms_orchestration" {
                 iam_policy_arn = try(module.aurora["target"].iam_database_auth.users[local.iam_user].policy_arn, null)
               }
           } : k => v if var.iam_auth })
-          jobs = { default_version = "e2e" }
+          # The e2e job sets are rebuilt per run (sandbox.py sync-jobs), so they are not pinned;
+          # runs still check every file against the bundle.sha256 uploaded with them.
+          jobs = { default_version = "e2e", allow_unpinned = true }
           # snapshot_dumps (s10snap): dump.method = snapshot, the job role may snapshot the target cluster.
           defaults = { target_reset_policy = "if-interrupted", run_timeout_seconds = 7200, fail_on_table_errors = true, snapshot_dumps = var.snapshot_dumps }
         }

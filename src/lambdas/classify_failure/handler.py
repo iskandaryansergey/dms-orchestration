@@ -92,6 +92,8 @@ _ERROR_CATEGORIES = {
     "AssessmentWarning": "ASSESSMENT",
     "AssessmentTimeout": "ASSESSMENT",
     "JobSetNotFound": "CONFIG",
+    "JobSetNotPinned": "CONFIG",
+    "JobSetTampered": "CONFIG",
     "DmsValidationErrors": "DATA",
 }
 

@@ -33,6 +33,10 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from botocore.exceptions import ClientError
+
+from shared import bundle  # image layout: /opt/orch/shared/bundle.py
+from shared.errors import JobSetTampered
 
 OK_STATUSES = {"ok", "warn"}
 VALID_STATUSES = {"ok", "warn", "fail"}
@@ -55,25 +59,51 @@ def dirs() -> tuple[Path, Path, Path]:
     return out, work, tmp
 
 
-def download_bundle(s3: Any, prefix_uri: str | None, dest: Path) -> int:
-    """Copy s3://bucket/jobs/<project>/<version>/ into dest. Returns the file count."""
+def _manifest(s3: Any, bucket: str, prefix: str) -> bytes | None:
+    try:
+        return s3.get_object(Bucket=bucket, Key=f"{prefix.rstrip('/')}/{bundle.MANIFEST}")["Body"].read()
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return None
+        raise
+
+
+def download_bundle(s3: Any, prefix_uri: str | None, dest: Path, expected: str | None = None) -> int:
+    """Copy s3://bucket/jobs/<project>/<version>/ into dest. Returns the file count.
+
+    ``expected`` is the bundle hash the run pinned (spec ``bundleSha256``). Every file must
+    match ``bundle.sha256``, files it does not list are refused, files it lists must exist
+    (JobSetTampered). Without a pin a manifest found is still checked.
+    """
     if not prefix_uri:
         return 0
     bucket, prefix = split_s3(prefix_uri)
+    files = bundle.check_manifest(_manifest(s3, bucket, prefix), expected)
     root = dest.resolve()
-    count = 0
+    seen: set[str] = set()
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             rel = obj["Key"][len(prefix) :].lstrip("/")
-            if not rel or rel.endswith("/"):
+            if not rel or rel.endswith("/") or rel == bundle.MANIFEST:
                 continue
             target = (root / rel).resolve()
             if root not in target.parents:
                 raise ValueError(f"refusing to write outside the work dir: {obj['Key']}")
+            if files is not None and rel not in files:
+                raise JobSetTampered(f"{rel} is not in the job set bundle ({bundle.MANIFEST})")
             target.parent.mkdir(parents=True, exist_ok=True)
             s3.download_file(bucket, obj["Key"], str(target))
-            count += 1
-    return count
+            if files is not None:
+                try:
+                    bundle.verify(rel, target.read_bytes(), files)
+                except JobSetTampered:
+                    target.unlink(missing_ok=True)
+                    raise
+            seen.add(rel)
+    missing = sorted(set(files or {}) - seen)
+    if missing:
+        raise JobSetTampered(f"files listed in {bundle.MANIFEST} are missing: {', '.join(missing[:5])}")
+    return len(seen)
 
 
 def _rds_client() -> Any:
@@ -249,7 +279,17 @@ def main(argv: list[str] | None = None, s3: Any = None, secrets: Any = None) -> 
     jobs_dir = work_dir / "jobs"
     shutil.rmtree(jobs_dir, ignore_errors=True)
     jobs_dir.mkdir(parents=True)
-    files = download_bundle(s3, spec.get("jobsS3Prefix"), jobs_dir)
+    try:
+        files = download_bundle(s3, spec.get("jobsS3Prefix"), jobs_dir, spec.get("bundleSha256"))
+    except JobSetTampered as err:
+        # Nothing of a bundle that differs from the pinned one runs; no connection is resolved.
+        shutil.rmtree(jobs_dir, ignore_errors=True)
+        print(f"orch: JobSetTampered: {err}")
+        result = {"status": "fail", "message": f"JobSetTampered: {err}"[:4000], "summary": {}, "artifacts": []}
+        s3.put_object(
+            Bucket=bucket, Key=spec["resultKey"], Body=json.dumps(result).encode(), ContentType="application/json"
+        )
+        return 1
     conn_file = tmp_dir / "connections.json"
     names = resolve_connections(secrets, spec.get("connections") or {}, conn_file)
     print(f"orch: {files} bundle file(s), connections: {', '.join(names) or 'none'}")

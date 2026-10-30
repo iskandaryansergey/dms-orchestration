@@ -19,7 +19,8 @@ locals {
   sql_runner_files = concat(
     ["src/jobs/sql-runner/Dockerfile", "src/jobs/sql-runner/requirements.txt", "src/jobs/sql-runner/orch_job.py",
       "src/jobs/sql-runner/orch_sql.py", "src/jobs/sql-runner/orch_dump.py", "src/jobs/sql-runner/orch_verify.py",
-    "src/shared/__init__.py", "src/shared/expr.py", "src/shared/preflight.py", "src/shared/fingerprint.py"],
+      "src/shared/__init__.py", "src/shared/expr.py", "src/shared/preflight.py", "src/shared/fingerprint.py",
+    "src/shared/bundle.py", "src/shared/errors.py"],
     [for f in fileset("${local.repo_root}/src/jobs/sql-runner/bin", "*") : "src/jobs/sql-runner/bin/${f}"],
   )
 }

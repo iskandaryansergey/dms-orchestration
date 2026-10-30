@@ -39,7 +39,7 @@ COPY src/jobs/sql-runner/requirements.txt /opt/orch/requirements.txt
 RUN pip install --no-cache-dir -r /opt/orch/requirements.txt \
  && pip uninstall -y pip
 
-COPY src/shared/__init__.py src/shared/expr.py src/shared/preflight.py src/shared/fingerprint.py /opt/orch/shared/
+COPY src/shared/__init__.py src/shared/expr.py src/shared/preflight.py src/shared/fingerprint.py src/shared/bundle.py src/shared/errors.py /opt/orch/shared/
 COPY src/jobs/sql-runner/orch_job.py src/jobs/sql-runner/orch_sql.py src/jobs/sql-runner/orch_dump.py \
      src/jobs/sql-runner/orch_verify.py /opt/orch/
 COPY src/jobs/sql-runner/bin/ /usr/local/bin/
