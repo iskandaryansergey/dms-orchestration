@@ -415,3 +415,28 @@ run "network_contract_with_snapshot_dumps" {
     error_message = "a task with snapshot_dumps makes the rds endpoint required"
   }
 }
+
+# The SSM runtime is opt-in: nothing of it exists and nothing can reach a runner by default.
+run "no_ssm_runtime_by_default" {
+  command = apply
+
+  assert {
+    condition     = length(aws_ssm_document.orch_job) == 0 && length(aws_s3_object.ssm_runtime) == 0 && length(data.archive_file.ssm_runtime) == 0
+    error_message = "no document and no runtime zip without ssm.enabled"
+  }
+
+  assert {
+    condition     = !strcontains(aws_iam_role_policy.job_runner.policy, "ssm:") && !strcontains(aws_iam_role.job["ledger"].assume_role_policy, "SsmRunnerInstances")
+    error_message = "without ssm.enabled the job-runner sends no command and no job role trusts a runner"
+  }
+
+  assert {
+    condition     = aws_lambda_function.this["prepare_job"].environment[0].variables.SSM_JOBS == "0" && aws_lambda_function.this["resolve_context"].environment[0].variables.SSM_JOBS == "0"
+    error_message = "prepare_job refuses runtime ssm and dumps stay off SSM"
+  }
+
+  assert {
+    condition     = output.ssm_runner_policy_json == null && output.ssm_document_content == null && !contains(output.network_contract.required_vpc_endpoints, "ec2messages")
+    error_message = "no SSM outputs and no SSM agent endpoints by default"
+  }
+}

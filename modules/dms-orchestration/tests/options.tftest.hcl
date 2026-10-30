@@ -197,3 +197,70 @@ run "platform_checks_outside_the_sandbox" {
   # stage without the platform topic and with state in the DMS workspace: both advisories fire
   expect_failures = [check.own_sns_topic_outside_sandbox, check.state_in_the_dms_workspace]
 }
+
+# SSM runtime with a document the platform registers itself (ssm.document_name_override): the
+# module ships the runtime zip and the content, the job-runner may send only that document.
+run "ssm_runtime_with_a_platform_document" {
+  command = apply
+
+  variables {
+    kms_key_arn = "arn:aws:kms:eu-west-2:111122223333:key/11111111-2222-3333-4444-555555555555"
+    ssm = {
+      enabled                = true
+      target_tags            = { Role = "dms-runner" }
+      instance_role_arn      = "arn:aws:iam::111122223333:role/team-dms-runner"
+      document_name_override = "platform-dms-orch-job"
+      runner_user            = "dmsjob"
+    }
+  }
+
+  assert {
+    condition     = length(aws_ssm_document.orch_job) == 0 && output.ssm_document_name == "platform-dms-orch-job"
+    error_message = "with document_name_override the module creates no document"
+  }
+
+  assert {
+    condition     = one([for st in jsondecode(aws_iam_role_policy.job_runner.policy).Statement : st.Resource if st.Sid == "SendJobDocument"]) == ["arn:aws:ssm:eu-west-2:111122223333:document/platform-dms-orch-job"]
+    error_message = "the job-runner sends only the named document"
+  }
+
+  assert {
+    condition     = strcontains(output.ssm_document_content, aws_s3_object.ssm_runtime[0].key) && strcontains(output.ssm_document_content, "runner_user='dmsjob'")
+    error_message = "the content to register names the uploaded runtime zip and the runner user"
+  }
+
+  assert {
+    condition     = aws_s3_object.ssm_runtime[0].server_side_encryption == "aws:kms" && aws_s3_object.ssm_runtime[0].kms_key_id == var.kms_key_arn
+    error_message = "the runtime zip is encrypted with the CMK"
+  }
+
+  assert {
+    condition     = length([for st in jsondecode(output.ssm_runner_policy_json).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
+    error_message = "the runner instance profile can decrypt the runtime zip and the job objects"
+  }
+}
+
+run "ssm_runtime_needs_runners_and_the_instance_role" {
+  command = plan
+
+  variables {
+    ssm = { enabled = true }
+  }
+
+  expect_failures = [var.ssm]
+}
+
+run "ssm_runtime_never_runs_jobs_as_root" {
+  command = plan
+
+  variables {
+    ssm = {
+      enabled           = true
+      instance_ids      = ["i-0123456789abcdef0"]
+      instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner"
+      runner_user       = "root"
+    }
+  }
+
+  expect_failures = [var.ssm]
+}
