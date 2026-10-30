@@ -7,25 +7,30 @@
 data "aws_partition" "current" {}
 
 locals {
+  create     = var.create
   bucket_arn = "arn:${data.aws_partition.current.partition}:s3:::${var.name}"
+  tags       = merge(var.tags, { ManagedBy = "terraform", Module = "artifacts-bucket" })
 }
 
 # Access logging and cross-region replication are landing-zone decisions (.checkov.yaml).
 resource "aws_s3_bucket" "this" {
+  count         = local.create ? 1 : 0
   bucket        = var.name
   force_destroy = var.force_destroy
-  tags          = var.tags
+  tags          = local.tags
 }
 
 resource "aws_s3_bucket_ownership_controls" "this" {
-  bucket = aws_s3_bucket.this.id
+  count  = local.create ? 1 : 0
+  bucket = aws_s3_bucket.this[0].id
   rule {
     object_ownership = "BucketOwnerEnforced"
   }
 }
 
 resource "aws_s3_bucket_public_access_block" "this" {
-  bucket                  = aws_s3_bucket.this.id
+  count                   = local.create ? 1 : 0
+  bucket                  = aws_s3_bucket.this[0].id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
@@ -34,25 +39,28 @@ resource "aws_s3_bucket_public_access_block" "this" {
 
 # Required: post loads context.json by the version id migrate recorded.
 resource "aws_s3_bucket_versioning" "this" {
-  bucket = aws_s3_bucket.this.id
+  count  = local.create ? 1 : 0
+  bucket = aws_s3_bucket.this[0].id
   versioning_configuration {
     status = "Enabled"
   }
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
-  bucket = aws_s3_bucket.this.id
+  count  = local.create ? 1 : 0
+  bucket = aws_s3_bucket.this[0].id
   rule {
     apply_server_side_encryption_by_default {
       sse_algorithm     = "aws:kms"
-      kms_master_key_id = var.kms_key_arn
+      kms_master_key_id = var.kms_key_arn == "" ? null : var.kms_key_arn
     }
     bucket_key_enabled = true
   }
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "this" {
-  bucket = aws_s3_bucket.this.id
+  count  = local.create ? 1 : 0
+  bucket = aws_s3_bucket.this[0].id
 
   rule {
     id     = "expire-run-artifacts"
@@ -100,7 +108,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
 }
 
 resource "aws_s3_bucket_policy" "this" {
-  bucket = aws_s3_bucket.this.id
+  count  = local.create ? 1 : 0
+  bucket = aws_s3_bucket.this[0].id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

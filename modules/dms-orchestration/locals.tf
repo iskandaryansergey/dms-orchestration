@@ -8,28 +8,46 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
 
+  # create = false: every resource has count/for_each 0 and every output is empty. The
+  # projects map is emptied here, so everything built per project or task is empty as well.
+  create   = var.create
+  projects = local.create ? var.projects : {}
+
   tags = merge(var.tags, {
+    ManagedBy              = "terraform"
+    Module                 = "dms-orchestration"
     "dms-orch:module"      = "dms-orchestration"
     "dms-orch:environment" = var.environment
   })
 
-  use_cmk      = var.kms_key_arn != null
+  # Unset optional strings are "" in the inputs; resource arguments get null instead.
+  use_cmk      = var.kms_key_arn != ""
+  kms_key_arn  = local.use_cmk ? var.kms_key_arn : null
   kms_key_arns = local.use_cmk ? [var.kms_key_arn] : []
+  boundary     = var.permissions_boundary_arn == "" ? null : var.permissions_boundary_arn
+
+  create_security_group = local.create && var.create_security_group
 
   # Storage and notifications: created or brought by the caller.
-  create_table  = var.table_name == ""
-  table_name    = local.create_table ? aws_dynamodb_table.this[0].name : var.table_name
+  create_table  = local.create && var.table_name == ""
+  table_name    = !local.create ? "" : local.create_table ? aws_dynamodb_table.this[0].name : var.table_name
   table_arn     = "arn:${local.partition}:dynamodb:${local.region}:${local.account_id}:table/${local.table_name}"
-  create_bucket = var.artifacts_bucket_name == ""
+  create_bucket = local.create && var.artifacts_bucket_name == ""
   bucket_name   = local.create_bucket ? "${local.prefix}-artifacts-${local.account_id}" : var.artifacts_bucket_name
   bucket_arn    = "arn:${local.partition}:s3:::${local.bucket_name}"
-  create_topic  = var.sns_topic_arn == ""
-  topic_arn     = local.create_topic ? aws_sns_topic.this[0].arn : var.sns_topic_arn
+  create_topic  = local.create && var.sns_topic_arn == ""
+  topic_arn     = !local.create ? null : local.create_topic ? aws_sns_topic.this[0].arn : var.sns_topic_arn
   # Fargate is an optional third runtime (ADR 0011): ECS cluster, task definitions, ECS roles
   # and the ECR endpoints exist only when fargate.images is non-empty.
-  fargate_enabled = length(var.fargate.images) > 0
-  create_cluster  = local.fargate_enabled && var.fargate.cluster_arn == null
+  fargate_enabled = local.create && length(var.fargate.images) > 0
+  create_cluster  = local.fargate_enabled && var.fargate.cluster_arn == ""
   cluster_arn     = !local.fargate_enabled ? null : local.create_cluster ? aws_ecs_cluster.this[0].arn : var.fargate.cluster_arn
+
+  # Attributes of singleton resources read by locals: "" with create = false, when no policy
+  # or definition that uses them is created.
+  dlq_arn             = local.create ? aws_sqs_queue.dlq[0].arn : ""
+  jobs_log_group_arn  = local.create ? aws_cloudwatch_log_group.jobs[0].arn : ""
+  jobs_log_group_name = local.create ? aws_cloudwatch_log_group.jobs[0].name : ""
 
   ssm_prefix = "/${var.name}/${var.environment}"
 
@@ -49,7 +67,7 @@ locals {
 
   # Every registered task: key "<project>/<taskKey>".
   tasks = merge([
-    for project, p in var.projects : {
+    for project, p in local.projects : {
       for task_key, t in p.tasks : "${project}/${task_key}" => {
         project      = project
         task_key     = task_key
@@ -71,25 +89,25 @@ locals {
       taskResourceId         = lookup(var.dms.task_resource_ids, t.task_arn_key, null)
       replicationInstanceArn = var.dms.replication_instance_arn
       replicationInstanceId  = var.dms.replication_instance_id
-      logGroupName           = var.dms.log_group_name
+      logGroupName           = var.dms.log_group_name == "" ? null : var.dms.log_group_name
       endpointArns           = values(var.dms.endpoint_arns)
       connections = {
         for name, c in t.connections : name => {
           engine            = c.engine
-          secretArn         = c.secret_arn
-          host              = c.host
+          secretArn         = c.secret_arn == "" ? null : c.secret_arn
+          host              = c.host == "" ? null : c.host
           port              = c.port
-          database          = c.database
+          database          = c.database == "" ? null : c.database
           sslMode           = c.ssl_mode
-          dataApiClusterArn = c.data_api_cluster_arn
-          clusterArn        = c.cluster_arn
+          dataApiClusterArn = c.data_api_cluster_arn == "" ? null : c.data_api_cluster_arn
+          clusterArn        = c.cluster_arn == "" ? null : c.cluster_arn
           auth              = c.auth
-          iamUser           = c.iam_user
+          iamUser           = c.iam_user == "" ? null : c.iam_user
         }
       }
       jobs = {
         s3Prefix       = coalesce(t.jobs.s3_prefix, "jobs/${t.project}")
-        defaultVersion = t.jobs.default_version
+        defaultVersion = t.jobs.default_version == "" ? null : t.jobs.default_version
         bundles        = t.jobs.bundles
         allowUnpinned  = t.jobs.allow_unpinned
       }
@@ -108,13 +126,13 @@ locals {
       # Command runtimes the module has (orch.py restore picks ssm when present).
       runtimes = {
         ssm     = var.ssm.enabled
-        fargate = contains(keys(var.fargate.images), "sql-runner")
+        fargate = contains(keys(local.fargate_images), "sql-runner")
       }
-      assessment = var.assessment == null ? null : {
+      assessment = var.assessment.role_arn == "" ? null : {
         roleArn       = var.assessment.role_arn
         bucket        = var.assessment.bucket
         folder        = "${trimsuffix(var.assessment.folder, "/")}/${t.task_key}"
-        kmsKeyArn     = var.assessment.kms_key_arn
+        kmsKeyArn     = var.assessment.kms_key_arn == "" ? null : var.assessment.kms_key_arn
         enabled       = var.assessment.enabled
         failOnWarning = var.assessment.fail_on_warning
       }
@@ -125,7 +143,8 @@ locals {
   # runTimeoutSeconds is checked by the watchdog against MIGRATION# (MigrationOverdue).
   orchestration_timeout_seconds = 604800
 
-  security_group_ids = concat(var.create_security_group ? [aws_security_group.jobs[0].id] : [], var.security_group_ids)
+  security_group_ids = concat(local.create_security_group ? [aws_security_group.jobs[0].id] : [], var.security_group_ids)
 
-  task_definition_families = { for key, image in var.fargate.images : key => "${local.prefix}-${key}" }
+  fargate_images           = local.fargate_enabled ? var.fargate.images : {}
+  task_definition_families = { for key, image in local.fargate_images : key => "${local.prefix}-${key}" }
 }

@@ -9,9 +9,8 @@
 ############################################
 
 locals {
-  boundary = var.permissions_boundary_arn
-
-  function_arns = { for k, f in aws_lambda_function.this : k => f.arn }
+  # With create = false: "" for every function the policies name.
+  function_arns = { for k in keys(local.lambda_functions_all) : k => local.create ? aws_lambda_function.this[k].arn : "" }
 
   kms_statements = local.use_cmk ? [{
     Sid      = "UseOrchestratorKey"
@@ -59,7 +58,7 @@ locals {
     Resource = "*"
   }
 
-  dms_log_statements = var.dms.log_group_name == null ? [] : [{
+  dms_log_statements = var.dms.log_group_name == "" ? [] : [{
     Sid      = "ReadDmsTaskLogs"
     Effect   = "Allow"
     Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
@@ -187,10 +186,10 @@ locals {
           Sid       = "PassAssessmentRole"
           Effect    = "Allow"
           Action    = ["iam:PassRole"]
-          Resource  = [try(var.assessment.role_arn, "")]
+          Resource  = [var.assessment.role_arn]
           Condition = { StringEquals = { "iam:PassedToService" = "dms.amazonaws.com" } }
         },
-    ] : st if var.assessment != null], local.run_machine_statements, local.kms_statements, local.xray_statements)
+    ] : st if var.assessment.role_arn != ""], local.run_machine_statements, local.kms_statements, local.xray_statements)
   }
 
   # post: no DMS start; may start a new migrate for auto-resume.
@@ -262,7 +261,7 @@ locals {
           Resource  = concat(aws_iam_role.ecs_execution[*].arn, aws_iam_role.ecs_task[*].arn, values(local.job_role_arns))
           Condition = { StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" } }
         },
-        ] : st if length(var.fargate.images) > 0], [for st in [
+        ] : st if local.fargate_enabled], [for st in [
         {
           # FindSsmRunner: no resource-level permissions.
           Sid      = "FindSsmRunners"
@@ -391,7 +390,7 @@ locals {
         Sid      = "DeadLetters"
         Effect   = "Allow"
         Action   = ["sqs:SendMessage"]
-        Resource = [aws_sqs_queue.dlq.arn]
+        Resource = [local.dlq_arn]
       },
     ], local.kms_statements, local.xray_statements)
   }
@@ -453,7 +452,7 @@ locals {
         Sid      = "JobLogs"
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = ["${aws_cloudwatch_log_group.jobs.arn}:*"]
+        Resource = ["${local.jobs_log_group_arn}:*"]
       },
     ], local.kms_statements)
   }
@@ -568,7 +567,7 @@ locals {
   # (scripts/sync-jobs.sh). Job set code runs with the project's job role, so uploading it
   # is a separate grant from running migrations (review finding 2).
   jobset_publisher_policies = {
-    for p in keys(var.projects) : p => {
+    for p in keys(local.projects) : p => {
       Version = "2012-10-17"
       Statement = concat([
         {
@@ -593,6 +592,7 @@ locals {
 }
 
 resource "aws_iam_role" "migrate" {
+  count                = local.create ? 1 : 0
   name                 = "${local.prefix}-sfn-migrate"
   assume_role_policy   = local.states_assume
   permissions_boundary = local.boundary
@@ -600,12 +600,14 @@ resource "aws_iam_role" "migrate" {
 }
 
 resource "aws_iam_role_policy" "migrate" {
+  count  = local.create ? 1 : 0
   name   = "migrate"
-  role   = aws_iam_role.migrate.id
+  role   = aws_iam_role.migrate[0].id
   policy = jsonencode(local.migrate_policy)
 }
 
 resource "aws_iam_role" "post" {
+  count                = local.create ? 1 : 0
   name                 = "${local.prefix}-sfn-post"
   assume_role_policy   = local.states_assume
   permissions_boundary = local.boundary
@@ -613,12 +615,14 @@ resource "aws_iam_role" "post" {
 }
 
 resource "aws_iam_role_policy" "post" {
+  count  = local.create ? 1 : 0
   name   = "post"
-  role   = aws_iam_role.post.id
+  role   = aws_iam_role.post[0].id
   policy = jsonencode(local.post_policy)
 }
 
 resource "aws_iam_role" "job_runner" {
+  count                = local.create ? 1 : 0
   name                 = "${local.prefix}-sfn-job-runner"
   assume_role_policy   = local.states_assume
   permissions_boundary = local.boundary
@@ -626,12 +630,14 @@ resource "aws_iam_role" "job_runner" {
 }
 
 resource "aws_iam_role_policy" "job_runner" {
+  count  = local.create ? 1 : 0
   name   = "job-runner"
-  role   = aws_iam_role.job_runner.id
+  role   = aws_iam_role.job_runner[0].id
   policy = jsonencode(local.job_runner_policy)
 }
 
 resource "aws_iam_role" "lambda_core" {
+  count                = local.create ? 1 : 0
   name                 = "${local.prefix}-lambda-core"
   assume_role_policy   = local.lambda_assume
   permissions_boundary = local.boundary
@@ -639,12 +645,14 @@ resource "aws_iam_role" "lambda_core" {
 }
 
 resource "aws_iam_role_policy" "lambda_core" {
+  count  = local.create ? 1 : 0
   name   = "lambda-core"
-  role   = aws_iam_role.lambda_core.id
+  role   = aws_iam_role.lambda_core[0].id
   policy = jsonencode(local.lambda_core_policy)
 }
 
 resource "aws_iam_role" "lambda_waiter" {
+  count                = local.create ? 1 : 0
   name                 = "${local.prefix}-lambda-waiter"
   assume_role_policy   = local.lambda_assume
   permissions_boundary = local.boundary
@@ -652,12 +660,14 @@ resource "aws_iam_role" "lambda_waiter" {
 }
 
 resource "aws_iam_role_policy" "lambda_waiter" {
+  count  = local.create ? 1 : 0
   name   = "lambda-waiter"
-  role   = aws_iam_role.lambda_waiter.id
+  role   = aws_iam_role.lambda_waiter[0].id
   policy = jsonencode(local.lambda_waiter_policy)
 }
 
 resource "aws_iam_role" "lambda_jobs" {
+  count                = local.create ? 1 : 0
   name                 = "${local.prefix}-lambda-jobs"
   assume_role_policy   = local.lambda_assume
   permissions_boundary = local.boundary
@@ -665,8 +675,9 @@ resource "aws_iam_role" "lambda_jobs" {
 }
 
 resource "aws_iam_role_policy" "lambda_jobs" {
+  count  = local.create ? 1 : 0
   name   = "lambda-jobs"
-  role   = aws_iam_role.lambda_jobs.id
+  role   = aws_iam_role.lambda_jobs[0].id
   policy = jsonencode(local.lambda_jobs_policy)
 }
 
@@ -701,7 +712,8 @@ resource "aws_iam_role_policy" "ecs_task" {
 }
 
 resource "aws_iam_role" "scheduler" {
-  name = "${local.prefix}-scheduler"
+  count = local.create ? 1 : 0
+  name  = "${local.prefix}-scheduler"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -716,7 +728,8 @@ resource "aws_iam_role" "scheduler" {
 }
 
 resource "aws_iam_role_policy" "scheduler" {
+  count  = local.create ? 1 : 0
   name   = "invoke-watchdog"
-  role   = aws_iam_role.scheduler.id
+  role   = aws_iam_role.scheduler[0].id
   policy = jsonencode(local.scheduler_policy)
 }

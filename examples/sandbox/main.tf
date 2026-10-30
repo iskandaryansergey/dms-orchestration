@@ -438,6 +438,7 @@ module "dms_orchestration" {
   subnet_ids  = aws_subnet.public[*].id
   # The VPC is created in this same plan, so the module cannot read its CIDR for the
   # jobs SG egress for_each (Invalid for_each argument): pass it as a known value.
+  https_egress_vpc_cidr    = false
   https_egress_cidr_blocks = [var.vpc_cidr]
 
   # The upstream dms module outputs, same names (docs/upstream-modules-contract.md). Named one by
@@ -490,7 +491,7 @@ module "dms_orchestration" {
                 host           = module.aurora["target"].cluster_endpoint
                 port           = 5432
                 database       = "ledger"
-                iam_policy_arn = try(module.aurora["target"].iam_database_auth.users[local.iam_user].policy_arn, null)
+                iam_policy_arn = try(module.aurora["target"].iam_database_auth.users[local.iam_user].policy_arn, "")
               }
           } : k => v if var.iam_auth })
           # The e2e job sets are rebuilt per run (sandbox.py sync-jobs), so they are not pinned;

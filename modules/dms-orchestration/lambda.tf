@@ -5,7 +5,7 @@
 ############################################
 
 data "archive_file" "lambda" {
-  count       = var.lambda.artifact_s3_bucket == null ? 1 : 0
+  count       = local.create && var.lambda.artifact_s3_bucket == "" ? 1 : 0
   type        = "zip"
   source_dir  = "${path.module}/../../src"
   output_path = "${path.module}/.build/lambda-${local.prefix}.zip"
@@ -43,7 +43,7 @@ locals {
   } : {}
 
   # name => settings; role is one of core | waiter | jobs; memory defaults to lambda.memory_mb
-  lambda_functions = merge(local.sql_jobs_function, {
+  lambda_functions_all = merge(local.sql_jobs_function, {
     resolve_context = {
       description = "Validate run request, read task registration and job set"
       timeout     = 60
@@ -52,7 +52,7 @@ locals {
       # SSM_JOBS: pg-dump dumps run on the SSM runtime when it is on.
       env = {
         SSM_PREFIX     = local.ssm_prefix
-        FARGATE_IMAGES = jsonencode(sort(keys(var.fargate.images)))
+        FARGATE_IMAGES = jsonencode(sort(keys(local.fargate_images)))
         SSM_JOBS       = local.ssm_enabled ? "1" : "0"
       }
     }
@@ -116,11 +116,12 @@ locals {
       env         = {}
     }
   })
+  lambda_functions = { for k, v in local.lambda_functions_all : k => v if local.create }
 
-  lambda_role_arns = {
-    core   = aws_iam_role.lambda_core.arn
-    waiter = aws_iam_role.lambda_waiter.arn
-    jobs   = aws_iam_role.lambda_jobs.arn
+  lambda_role_arns = !local.create ? {} : {
+    core   = aws_iam_role.lambda_core[0].arn
+    waiter = aws_iam_role.lambda_waiter[0].arn
+    jobs   = aws_iam_role.lambda_jobs[0].arn
   }
 
   lambda_reserved = toset(["dms_event_handler", "watchdog"])
@@ -130,7 +131,7 @@ resource "aws_cloudwatch_log_group" "lambda" {
   for_each          = local.lambda_functions
   name              = "/aws/lambda/${local.prefix}-${each.key}"
   retention_in_days = var.log_retention_days
-  kms_key_id        = var.kms_key_arn
+  kms_key_id        = local.kms_key_arn
   tags              = local.tags
 }
 
@@ -145,13 +146,13 @@ resource "aws_lambda_function" "this" {
   memory_size   = try(each.value.memory, var.lambda.memory_mb)
   timeout       = each.value.timeout
 
-  filename         = var.lambda.artifact_s3_bucket == null ? data.archive_file.lambda[0].output_path : null
-  source_code_hash = var.lambda.artifact_s3_bucket == null ? data.archive_file.lambda[0].output_base64sha256 : var.lambda.artifact_source_hash
-  s3_bucket        = var.lambda.artifact_s3_bucket
-  s3_key           = var.lambda.artifact_s3_key
+  filename         = var.lambda.artifact_s3_bucket == "" ? data.archive_file.lambda[0].output_path : null
+  source_code_hash = var.lambda.artifact_s3_bucket == "" ? data.archive_file.lambda[0].output_base64sha256 : var.lambda.artifact_source_hash
+  s3_bucket        = var.lambda.artifact_s3_bucket == "" ? null : var.lambda.artifact_s3_bucket
+  s3_key           = var.lambda.artifact_s3_bucket == "" ? null : var.lambda.artifact_s3_key
 
-  reserved_concurrent_executions = contains(local.lambda_reserved, each.key) && var.lambda.reserved_concurrency != null ? var.lambda.reserved_concurrency : -1
-  kms_key_arn                    = var.kms_key_arn
+  reserved_concurrent_executions = contains(local.lambda_reserved, each.key) ? var.lambda.reserved_concurrency : -1
+  kms_key_arn                    = local.kms_key_arn
 
   vpc_config {
     subnet_ids         = var.subnet_ids
@@ -178,40 +179,44 @@ resource "aws_lambda_function" "this" {
 
 # DMS events -> handler is asynchronous; failed invocations go to the DLQ.
 resource "aws_lambda_function_event_invoke_config" "dms_event_handler" {
+  count                        = local.create ? 1 : 0
   function_name                = aws_lambda_function.this["dms_event_handler"].function_name
   maximum_retry_attempts       = 2
   maximum_event_age_in_seconds = 3600
   destination_config {
     on_failure {
-      destination = aws_sqs_queue.dlq.arn
+      destination = aws_sqs_queue.dlq[0].arn
     }
   }
 }
 
 resource "aws_lambda_function_event_invoke_config" "release_lock" {
+  count                  = local.create ? 1 : 0
   function_name          = aws_lambda_function.this["release_lock"].function_name
   maximum_retry_attempts = 2
   destination_config {
     on_failure {
-      destination = aws_sqs_queue.dlq.arn
+      destination = aws_sqs_queue.dlq[0].arn
     }
   }
 }
 
 resource "aws_lambda_permission" "dms_events" {
+  count         = local.create ? 1 : 0
   statement_id  = "AllowDmsEventRule"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.this["dms_event_handler"].function_name
   principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.dms_task_state.arn
+  source_arn    = aws_cloudwatch_event_rule.dms_task_state[0].arn
 }
 
 resource "aws_lambda_permission" "sfn_status" {
+  count         = local.create ? 1 : 0
   statement_id  = "AllowExecutionStatusRule"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.this["release_lock"].function_name
   principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.execution_status.arn
+  source_arn    = aws_cloudwatch_event_rule.execution_status[0].arn
 }
 
 ############################################
@@ -220,7 +225,7 @@ resource "aws_lambda_permission" "sfn_status" {
 
 resource "aws_security_group" "jobs" {
   # checkov:skip=CKV2_AWS_5:attached to the Lambdas and Fargate tasks through local.security_group_ids (concat), which checkov does not follow
-  count       = var.create_security_group ? 1 : 0
+  count       = local.create_security_group ? 1 : 0
   name        = "${local.prefix}-jobs"
   description = "DMS orchestration Lambda and Fargate jobs (no ingress)"
   vpc_id      = var.vpc_id
@@ -232,17 +237,17 @@ resource "aws_security_group" "jobs" {
 # gateway endpoints (AWS managed prefix lists; ECR image layers come from S3).
 # Never 0.0.0.0/0: a job that really needs the internet gets an extra security group.
 data "aws_vpc" "jobs" {
-  count = var.create_security_group && var.https_egress_cidr_blocks == null ? 1 : 0
+  count = local.create_security_group && var.https_egress_vpc_cidr ? 1 : 0
   id    = var.vpc_id
 }
 
 data "aws_prefix_list" "gateway" {
-  for_each = var.create_security_group && var.https_egress_prefix_list_ids == null ? toset(["s3", "dynamodb"]) : toset([])
+  for_each = local.create_security_group && var.https_egress_gateway_endpoints ? toset(["s3", "dynamodb"]) : toset([])
   name     = "com.amazonaws.${data.aws_region.current.name}.${each.key}"
 }
 
 resource "aws_vpc_security_group_egress_rule" "https_cidr" {
-  for_each          = var.create_security_group ? toset(var.https_egress_cidr_blocks != null ? var.https_egress_cidr_blocks : data.aws_vpc.jobs[*].cidr_block) : toset([])
+  for_each          = local.create_security_group ? toset(concat(data.aws_vpc.jobs[*].cidr_block, var.https_egress_cidr_blocks)) : toset([])
   security_group_id = aws_security_group.jobs[0].id
   description       = "AWS APIs via interface VPC endpoints"
   ip_protocol       = "tcp"
@@ -252,8 +257,8 @@ resource "aws_vpc_security_group_egress_rule" "https_cidr" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "https_prefix_list" {
-  for_each = var.create_security_group ? {
-    for i, id in var.https_egress_prefix_list_ids != null ? var.https_egress_prefix_list_ids : [for k in ["s3", "dynamodb"] : data.aws_prefix_list.gateway[k].id] : tostring(i) => id
+  for_each = local.create_security_group ? {
+    for i, id in concat([for k in ["s3", "dynamodb"] : data.aws_prefix_list.gateway[k].id if contains(keys(data.aws_prefix_list.gateway), k)], var.https_egress_prefix_list_ids) : tostring(i) => id
   } : {}
   security_group_id = aws_security_group.jobs[0].id
   description       = "AWS APIs via gateway VPC endpoints"
@@ -264,7 +269,7 @@ resource "aws_vpc_security_group_egress_rule" "https_prefix_list" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "db_cidr" {
-  for_each          = var.create_security_group ? { for pair in setproduct(var.database_ports, var.database_cidr_blocks) : "${pair[0]}-${pair[1]}" => pair } : {}
+  for_each          = local.create_security_group ? { for pair in setproduct(var.database_ports, var.database_cidr_blocks) : "${pair[0]}-${pair[1]}" => pair } : {}
   security_group_id = aws_security_group.jobs[0].id
   description       = "Databases"
   ip_protocol       = "tcp"
@@ -276,7 +281,7 @@ resource "aws_vpc_security_group_egress_rule" "db_cidr" {
 # Keyed by position, not by id: the database security groups are often created in
 # the same plan (the upstream aurora module), and unknown ids cannot be for_each keys.
 resource "aws_vpc_security_group_egress_rule" "db_sg" {
-  for_each = var.create_security_group ? {
+  for_each = local.create_security_group ? {
     for pair in setproduct(var.database_ports, range(length(var.database_security_group_ids))) :
     "${pair[0]}-${pair[1]}" => { port = pair[0], sg = var.database_security_group_ids[pair[1]] }
   } : {}

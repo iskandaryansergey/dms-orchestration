@@ -6,7 +6,7 @@
 ############################################
 
 locals {
-  ssm_enabled       = var.ssm.enabled
+  ssm_enabled       = local.create && var.ssm.enabled
   ssm_document_name = coalesce(var.ssm.document_name_override, "${local.prefix}-orch-job")
   ssm_document_arn  = "arn:${local.partition}:ssm:${local.region}:${local.account_id}:document/${local.ssm_document_name}"
 
@@ -66,8 +66,8 @@ locals {
           runtime_sha256 = local.ssm_runtime_sha256
           region         = local.region
           environment    = var.environment
-          dump_kms_key   = var.kms_key_arn == null ? "" : var.kms_key_arn
-          log_group      = aws_cloudwatch_log_group.jobs.name
+          dump_kms_key   = var.kms_key_arn
+          log_group      = local.jobs_log_group_name
         })))
       }
     }]
@@ -97,7 +97,7 @@ locals {
         Sid      = "CommandOutput"
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
-        Resource = ["${aws_cloudwatch_log_group.jobs.arn}:*"]
+        Resource = ["${local.jobs_log_group_arn}:*"]
       },
       {
         Sid      = "FindLogGroup"
@@ -131,13 +131,13 @@ resource "aws_s3_object" "ssm_runtime" {
   source_hash            = data.archive_file.ssm_runtime[0].output_base64sha256
   content_type           = "application/zip"
   server_side_encryption = local.use_cmk ? "aws:kms" : null
-  kms_key_id             = var.kms_key_arn
+  kms_key_id             = local.kms_key_arn
 
   depends_on = [aws_s3_bucket_policy.artifacts, aws_s3_bucket_server_side_encryption_configuration.artifacts]
 }
 
 resource "aws_ssm_document" "orch_job" {
-  count           = local.ssm_enabled && var.ssm.document_name_override == null ? 1 : 0
+  count           = local.ssm_enabled && var.ssm.document_name_override == "" ? 1 : 0
   name            = local.ssm_document_name
   document_type   = "Command"
   document_format = "JSON"

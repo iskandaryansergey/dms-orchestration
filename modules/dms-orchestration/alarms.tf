@@ -4,8 +4,9 @@
 
 locals {
   alarm_actions       = [local.topic_arn]
-  lambda_error_alarms = var.create_alarms ? toset(["dms_event_handler", "watchdog", "release_lock"]) : toset([])
-  sfn_alarm_metrics = var.create_alarms ? merge([
+  create_alarms       = local.create && var.create_alarms
+  lambda_error_alarms = local.create_alarms ? toset(["dms_event_handler", "watchdog", "release_lock"]) : toset([])
+  sfn_alarm_metrics = local.create_alarms ? merge([
     for m in ["migrate", "post"] : {
       "${m}-failed"    = { metric = "ExecutionsFailed", arn = aws_sfn_state_machine.run[m].arn, machine = m }
       "${m}-timed-out" = { metric = "ExecutionsTimedOut", arn = aws_sfn_state_machine.run[m].arn, machine = m }
@@ -49,12 +50,12 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "dlq" {
-  count               = var.create_alarms ? 1 : 0
+  count               = local.create_alarms ? 1 : 0
   alarm_name          = "${local.prefix}-events-dlq"
   alarm_description   = "DMS orchestration: undelivered DMS / execution events or failed async invocations"
   namespace           = "AWS/SQS"
   metric_name         = "ApproximateNumberOfMessagesVisible"
-  dimensions          = { QueueName = aws_sqs_queue.dlq.name }
+  dimensions          = { QueueName = aws_sqs_queue.dlq[0].name }
   statistic           = "Maximum"
   period              = 300
   evaluation_periods  = 1
@@ -67,7 +68,7 @@ resource "aws_cloudwatch_metric_alarm" "dlq" {
 
 # "The watchdog is dead": no invocations for 3 intervals. Missing data is breaching.
 resource "aws_cloudwatch_metric_alarm" "watchdog_silent" {
-  count               = var.create_alarms ? 1 : 0
+  count               = local.create_alarms ? 1 : 0
   alarm_name          = "${local.prefix}-watchdog-not-running"
   alarm_description   = "DMS orchestration: the watchdog has not run; lost DMS events would not be recovered"
   namespace           = "AWS/Lambda"
@@ -84,7 +85,7 @@ resource "aws_cloudwatch_metric_alarm" "watchdog_silent" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "orphans" {
-  for_each            = var.create_alarms ? toset(["MigrationOverdue", "OrphanedLock"]) : toset([])
+  for_each            = local.create_alarms ? toset(["MigrationOverdue", "OrphanedLock"]) : toset([])
   alarm_name          = "${local.prefix}-${lower(each.key)}"
   alarm_description   = "DMS orchestration watchdog: ${each.key} (a DMS run took longer than its runTimeoutSeconds, or an execution ended without its own cleanup)"
   namespace           = "DmsOrchestration"

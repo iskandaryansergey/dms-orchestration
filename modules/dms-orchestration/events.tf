@@ -3,6 +3,7 @@
 ############################################
 
 resource "aws_cloudwatch_event_rule" "dms_task_state" {
+  count       = local.create ? 1 : 0
   name        = "${local.prefix}-dms-task-state"
   description = "DMS replication task state changes in this account and region"
   event_pattern = jsonencode({
@@ -14,7 +15,8 @@ resource "aws_cloudwatch_event_rule" "dms_task_state" {
 }
 
 resource "aws_cloudwatch_event_target" "dms_task_state" {
-  rule      = aws_cloudwatch_event_rule.dms_task_state.name
+  count     = local.create ? 1 : 0
+  rule      = aws_cloudwatch_event_rule.dms_task_state[0].name
   target_id = "dms-event-handler"
   arn       = aws_lambda_function.this["dms_event_handler"].arn
 
@@ -24,7 +26,7 @@ resource "aws_cloudwatch_event_target" "dms_task_state" {
   }
 
   dead_letter_config {
-    arn = aws_sqs_queue.dlq.arn
+    arn = aws_sqs_queue.dlq[0].arn
   }
 }
 
@@ -33,6 +35,7 @@ resource "aws_cloudwatch_event_target" "dms_task_state" {
 ############################################
 
 resource "aws_cloudwatch_event_rule" "execution_status" {
+  count       = local.create ? 1 : 0
   name        = "${local.prefix}-execution-status"
   description = "Release DMS task locks of migrate/post executions that failed, timed out or were aborted"
   event_pattern = jsonencode({
@@ -47,7 +50,8 @@ resource "aws_cloudwatch_event_rule" "execution_status" {
 }
 
 resource "aws_cloudwatch_event_target" "execution_status" {
-  rule      = aws_cloudwatch_event_rule.execution_status.name
+  count     = local.create ? 1 : 0
+  rule      = aws_cloudwatch_event_rule.execution_status[0].name
   target_id = "release-lock"
   arn       = aws_lambda_function.this["release_lock"].arn
 
@@ -57,7 +61,7 @@ resource "aws_cloudwatch_event_target" "execution_status" {
   }
 
   dead_letter_config {
-    arn = aws_sqs_queue.dlq.arn
+    arn = aws_sqs_queue.dlq[0].arn
   }
 }
 
@@ -66,16 +70,18 @@ resource "aws_cloudwatch_event_target" "execution_status" {
 ############################################
 
 resource "aws_sqs_queue" "dlq" {
+  count                             = local.create ? 1 : 0
   name                              = "${local.prefix}-events-dlq"
   message_retention_seconds         = 1209600
-  kms_master_key_id                 = var.kms_key_arn
+  kms_master_key_id                 = local.kms_key_arn
   kms_data_key_reuse_period_seconds = local.use_cmk ? 300 : null
   sqs_managed_sse_enabled           = local.use_cmk ? null : true
   tags                              = local.tags
 }
 
 resource "aws_sqs_queue_policy" "dlq" {
-  queue_url = aws_sqs_queue.dlq.id
+  count     = local.create ? 1 : 0
+  queue_url = aws_sqs_queue.dlq[0].id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -84,10 +90,10 @@ resource "aws_sqs_queue_policy" "dlq" {
         Effect    = "Allow"
         Principal = { Service = "events.amazonaws.com" }
         Action    = "sqs:SendMessage"
-        Resource  = aws_sqs_queue.dlq.arn
+        Resource  = aws_sqs_queue.dlq[0].arn
         Condition = {
           ArnEquals = {
-            "aws:SourceArn" = [aws_cloudwatch_event_rule.dms_task_state.arn, aws_cloudwatch_event_rule.execution_status.arn]
+            "aws:SourceArn" = [aws_cloudwatch_event_rule.dms_task_state[0].arn, aws_cloudwatch_event_rule.execution_status[0].arn]
           }
         }
       },
@@ -96,7 +102,7 @@ resource "aws_sqs_queue_policy" "dlq" {
         Effect    = "Deny"
         Principal = "*"
         Action    = "sqs:*"
-        Resource  = aws_sqs_queue.dlq.arn
+        Resource  = aws_sqs_queue.dlq[0].arn
         Condition = { Bool = { "aws:SecureTransport" = "false" } }
       },
     ]
@@ -108,10 +114,11 @@ resource "aws_sqs_queue_policy" "dlq" {
 ############################################
 
 resource "aws_scheduler_schedule" "watchdog" {
+  count               = local.create ? 1 : 0
   name                = "${local.prefix}-watchdog"
   description         = "DMS orchestration watchdog: lost DMS events, stale claims, orphaned locks, overdue runs"
   schedule_expression = "rate(${var.watchdog_interval_minutes} minutes)"
-  kms_key_arn         = var.kms_key_arn
+  kms_key_arn         = local.kms_key_arn
 
   flexible_time_window {
     mode = "OFF"
@@ -119,7 +126,7 @@ resource "aws_scheduler_schedule" "watchdog" {
 
   target {
     arn      = aws_lambda_function.this["watchdog"].arn
-    role_arn = aws_iam_role.scheduler.arn
+    role_arn = aws_iam_role.scheduler[0].arn
     input    = jsonencode({ source = "scheduler" })
 
     retry_policy {
