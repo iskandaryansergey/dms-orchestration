@@ -178,6 +178,47 @@ run "project_key_prefix_of_another_is_refused" {
   expect_failures = [var.projects]
 }
 
+# Job sets are pinned by the bundle hash (jobset_tool.py hash): a malformed hash, or a default
+# version without one, fails at plan time unless the task allows unpinned job sets (sandbox).
+run "job_set_bundle_hash_must_be_sha256" {
+  command = plan
+  variables {
+    projects = { ledger = { tasks = { core = { jobs = { bundles = { v1 = "not-a-hash" } } } } } }
+  }
+  expect_failures = [var.projects]
+}
+
+run "job_set_bundle_version_must_be_a_version_name" {
+  command = plan
+  variables {
+    projects = { ledger = { tasks = { core = { jobs = { bundles = { "v 1/x" = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0" } } } } } }
+  }
+  expect_failures = [var.projects]
+}
+
+run "default_job_set_version_without_a_hash_is_refused" {
+  command = plan
+  variables {
+    projects = { ledger = { tasks = { core = { jobs = { default_version = "v1" } } } } }
+  }
+  expect_failures = [var.projects]
+}
+
+run "default_job_set_version_pinned_or_unpinned_allowed_plans" {
+  command = plan
+  variables {
+    dms = {
+      replication_instance_arn = "arn:aws:dms:eu-west-2:111122223333:rep:RI1"
+      replication_instance_id  = "dms-dev-ri"
+      task_arns                = { core = "arn:aws:dms:eu-west-2:111122223333:task:CORE1", extra = "arn:aws:dms:eu-west-2:111122223333:task:EXTRA1" }
+    }
+    projects = { ledger = { tasks = {
+      core  = { jobs = { default_version = "v1", bundles = { v1 = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0" } } }
+      extra = { jobs = { default_version = "e2e", allow_unpinned = true } }
+    } } }
+  }
+}
+
 run "project_keys_that_are_not_prefixes_plan" {
   command = plan
   variables {

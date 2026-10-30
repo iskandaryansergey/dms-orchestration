@@ -32,7 +32,7 @@ variables {
               database   = "ledger"
             }
           }
-          jobs = { default_version = "v1" }
+          jobs = { default_version = "v1", bundles = { v1 = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0" } }
         }
       }
     }
@@ -197,6 +197,14 @@ run "storage_and_registration" {
   assert {
     condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).jobs.s3Prefix == "jobs/ledger"
     error_message = "default job set prefix is jobs/<project>"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ssm_parameter.task["ledger/core"].value).jobs.bundles == { v1 = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0" }
+      && jsondecode(aws_ssm_parameter.task["ledger/core"].value).jobs.allowUnpinned == false
+    )
+    error_message = "the registration carries the pinned bundle hashes; unpinned job sets are refused by default"
   }
 
   assert {

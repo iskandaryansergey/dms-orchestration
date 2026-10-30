@@ -538,10 +538,13 @@ locals {
       Version = "2012-10-17"
       Statement = concat([
         {
-          Sid      = "PublishJobSets"
-          Effect   = "Allow"
-          Action   = ["s3:PutObject"]
-          Resource = [for prefix in local.project_job_prefixes[p] : "${local.bucket_arn}/${prefix}/*"]
+          # Create only: PutObject must carry If-None-Match, so a published version is never
+          # overwritten (the registration pins its bundle hash, review finding 9).
+          Sid       = "PublishJobSets"
+          Effect    = "Allow"
+          Action    = ["s3:PutObject"]
+          Resource  = [for prefix in local.project_job_prefixes[p] : "${local.bucket_arn}/${prefix}/*"]
+          Condition = { Null = { "s3:if-none-match" = "false" } }
         },
         {
           Sid       = "ListJobSets"
