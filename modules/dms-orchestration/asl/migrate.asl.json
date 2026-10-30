@@ -654,6 +654,7 @@
               "mode": { "S": "{% $string($inspect.completionSpec.mode) %}" },
               "migrationType": { "S": "{% $string($inspect.completionSpec.migrationType) %}" },
               "failOnTableErrors": { "Bool": "{% $inspect.completionSpec.failOnTableErrors = true %}" },
+              "failOnValidationErrors": { "Bool": "{% $not($inspect.completionSpec.failOnValidationErrors = false) %}" },
               "expectStop": { "Bool": "{% $inspect.completionSpec.expectStop = true %}" }
             }
           },

@@ -392,3 +392,119 @@ def test_errored_tables_need_reload_target_with_full_reset():
 def test_errored_tables_with_reset_policy_never_are_rejected():
     dec = d.decide(state="interrupted", migration_type="full-load", table_stats=ERRORED, reset_policy="never")
     assert (dec.action, dec.error) == ("reject", "ResetRequired")
+
+
+# --- review finding 7: DMS validation gates the run ----------------------------------
+
+FINISHED = dms_task("stopped", "Stop Reason FULL_LOAD_ONLY_FINISHED", StopDate=AFTER, TablesLoaded=2)
+
+
+def vstat(table: str, state: str = "Validated", failed: int = 0, error_rows: int = 0) -> dict:
+    return {
+        "SchemaName": "app",
+        "TableName": table,
+        "TableState": "Table completed",
+        "ValidationState": state,
+        "ValidationFailedRecords": failed,
+        "FullLoadErrorRows": error_rows,
+    }
+
+
+@pytest.mark.parametrize(
+    "stats,needle",
+    [
+        ([vstat("a"), vstat("b", state="Mismatched records")], "app.b: validation state Mismatched records"),
+        ([vstat("a"), vstat("b", state="Pending records")], "app.b: validation state Pending records"),
+        ([vstat("a"), vstat("b", failed=3)], "app.b: 3 record(s) failed validation"),
+        ([vstat("a"), vstat("b", error_rows=2)], "app.b: 2 full-load error row(s)"),
+    ],
+)
+def test_validation_problems_fail_the_run_when_on(stats, needle):
+    spec = {**FULL_LOAD, "failOnValidationErrors": True}
+    res = d.evaluate_outcome(FINISHED, spec, started_at=STARTED, now=AFTER, table_stats=stats)
+    assert (res.kind, res.error) == ("FAILURE", "DmsValidationErrors")
+    assert needle in res.cause and "1 table(s)" in res.cause
+
+
+def test_validation_problems_succeed_with_warning_when_off():
+    spec = {**FULL_LOAD, "failOnValidationErrors": False}
+    stats = [vstat("a"), vstat("b", failed=3)]
+    res = d.evaluate_outcome(FINISHED, spec, started_at=STARTED, now=AFTER, table_stats=stats)
+    assert (res.kind, res.outcome) == ("SUCCESS", "COMPLETED_WITH_VALIDATION_ERRORS")
+    assert "app.b" in res.cause
+
+
+def test_validation_is_on_when_the_spec_does_not_say():
+    res = d.evaluate_outcome(FINISHED, FULL_LOAD, started_at=STARTED, now=AFTER, table_stats=[vstat("a", failed=1)])
+    assert (res.kind, res.error) == ("FAILURE", "DmsValidationErrors")
+
+
+def test_validated_or_not_enabled_tables_complete():
+    stats = [
+        vstat("a"),
+        vstat("b", state="Not enabled"),
+        {"SchemaName": "app", "TableName": "gone", "TableState": "Table does not exist", "ValidationState": "Error"},
+    ]
+    res = d.evaluate_outcome(FINISHED, FULL_LOAD, started_at=STARTED, now=AFTER, table_stats=stats)
+    assert (res.kind, res.outcome) == ("SUCCESS", "COMPLETED")
+
+
+def test_table_stats_are_read_only_for_a_finished_load():
+    calls: list[int] = []
+
+    def stats() -> list[dict]:
+        calls.append(1)
+        return [vstat("a", failed=1)]
+
+    running = dms_task("running")
+    assert d.evaluate_outcome(running, FULL_LOAD, started_at=STARTED, now=AFTER, table_stats=stats).kind == "PENDING"
+    assert calls == []
+    res = d.evaluate_outcome(FINISHED, FULL_LOAD, started_at=STARTED, now=AFTER, table_stats=stats)
+    assert res.error == "DmsValidationErrors" and calls == [1]
+
+
+def test_cdc_running_tolerates_pending_validation_but_not_failures():
+    spec = {"mode": "full-load-complete", "migrationType": "full-load-and-cdc", "failOnValidationErrors": True}
+    running = dms_task(
+        "running", FullLoadProgressPercent=100, TablesLoading=0, TablesQueued=0, FullLoadFinishDate=AFTER
+    )
+    pending = [vstat("a", state="Pending records"), vstat("b", state="Pending validation")]
+    res = d.evaluate_outcome(running, spec, started_at=STARTED, now=AFTER, table_stats=pending)
+    assert (res.kind, res.outcome) == ("SUCCESS", "FULL_LOAD_COMPLETE_CDC_RUNNING")
+    res = d.evaluate_outcome(running, spec, started_at=STARTED, now=AFTER, table_stats=[vstat("a", failed=4)])
+    assert (res.kind, res.error) == ("FAILURE", "DmsValidationErrors")
+
+
+def test_table_errors_still_fail_first():
+    task = dms_task("stopped", "Stop Reason FULL_LOAD_ONLY_FINISHED", StopDate=AFTER, TablesErrored=1)
+    spec = {**FULL_LOAD, "failOnTableErrors": True}
+    res = d.evaluate_outcome(task, spec, started_at=STARTED, now=AFTER, table_stats=[vstat("a", failed=1)])
+    assert (res.kind, res.error) == ("FAILURE", "DmsTableErrors")
+
+
+def test_completion_spec_carries_fail_on_validation_errors_default_true():
+    assert d.completion_spec(migration_type="full-load", settings={})["failOnValidationErrors"] is True
+    spec = d.completion_spec(migration_type="full-load", settings={}, fail_on_validation_errors=False)
+    assert spec["failOnValidationErrors"] is False
+
+
+def test_armed_migration_keeps_every_field_of_the_completion_spec():
+    """The Arm putItem lists the spec fields one by one; the event path reads only those."""
+    from asl_runner import compile_expr, iter_expressions, render
+
+    spec_keys = set(d.completion_spec(migration_type="full-load", settings={}))
+    found: dict[str, str] = {}
+    for path, text in iter_expressions(render("migrate.asl.json")):
+        if ".Item.completionSpec.M." in path:
+            found[path.split(".Item.completionSpec.M.")[1].split(".")[0]] = text
+    assert set(found) == spec_keys
+    expr = compile_expr(found["failOnValidationErrors"])
+    assert expr.evaluate(None, {"inspect": {"completionSpec": {}}}) is True  # absent: on
+    assert expr.evaluate(None, {"inspect": {"completionSpec": {"failOnValidationErrors": False}}}) is False
+
+
+def test_resumed_run_keeps_the_request_flag():
+    from pathlib import Path
+
+    post = (Path(__file__).resolve().parents[2] / "modules/dms-orchestration/asl/post.asl.json").read_text("utf-8")
+    assert "'failOnTableErrors', 'failOnValidationErrors'," in post

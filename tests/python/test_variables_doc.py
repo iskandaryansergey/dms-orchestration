@@ -30,7 +30,8 @@ def variable_block(text: str, name: str) -> str:
 
 
 def type_fields(block: str) -> set[str]:
-    type_expr = block[block.index("type = ") + len("type = ") : block.index("validation")]
+    # Up to the first validation block: field names may contain the word (fail_on_validation_errors).
+    type_expr = block[block.index("type = ") + len("type = ") : re.search(r"^\s*validation\s*\{", block, re.M).start()]
     return set(re.findall(r"^\s*([a-z_][a-z0-9_]*)\s*=", type_expr, flags=re.MULTILINE))
 
 

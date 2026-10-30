@@ -62,6 +62,10 @@
     "failOnTableErrors": {
       "type": "boolean"
     },
+    "failOnValidationErrors": {
+      "type": "boolean",
+      "description": "DMS validation gates the run: a table not validated, with failed validation records or full-load error rows fails DmsValidationErrors; false succeeds as COMPLETED_WITH_VALIDATION_ERRORS. Default: the task's fail_on_validation_errors (true)"
+    },
     "targetReset": {
       "type": "object",
       "additionalProperties": false,

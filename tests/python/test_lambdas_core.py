@@ -1537,3 +1537,57 @@ def test_write_report_counts_a_reset_list_kept_in_s3(env, store):
     )
     md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-1/report.md")["Body"].read().decode()
     assert "- Target reset: all (600 tables)" in md
+
+
+# --- review finding 7: failOnValidationErrors (registration default, request override) ---
+
+BAD_VALIDATION = [
+    {
+        "SchemaName": "app",
+        "TableName": "accounts",
+        "TableState": "Table completed",
+        "ValidationState": "Mismatched records",
+        "ValidationFailedRecords": 2,
+    }
+]
+
+
+def test_resolve_context_fail_on_validation_errors_defaults_on_registration_and_request(env, store):
+    from lambdas.resolve_context.handler import handler
+
+    out = handler({"request": {"project": "ledger", "taskKey": "core"}, "execution": EXECUTION})
+    assert out["request"]["failOnValidationErrors"] is True
+    reg = {**REGISTRATION, "defaults": {**REGISTRATION["defaults"], "failOnValidationErrors": False}}
+    env["ssm"].put_parameter(Name="/dms-orch/test/ledger/core", Type="String", Value=json.dumps(reg), Overwrite=True)
+    out = handler({"request": {"project": "ledger", "taskKey": "core"}, "execution": {**EXECUTION, "name": "v1"}})
+    assert out["request"]["failOnValidationErrors"] is False
+    req = {"project": "ledger", "taskKey": "core", "failOnValidationErrors": True}
+    out = handler({"request": req, "execution": {**EXECUTION, "name": "v2"}})
+    assert out["request"]["failOnValidationErrors"] is True
+
+
+@pytest.mark.parametrize("flag,expected", [(None, True), (False, False), (True, True)])
+def test_inspect_puts_fail_on_validation_errors_into_the_completion_spec(table, flag, expected):
+    from lambdas.inspect_task.handler import handler
+
+    use(dms=FakeDms(dms_task("ready")))
+    req = _req() if flag is None else _req(failOnValidationErrors=flag)
+    out = handler({"runId": "r1", "request": req, "ctx": _ctx(), "attempt": 1})
+    assert out["completionSpec"]["failOnValidationErrors"] is expected
+
+
+def test_classify_validation_errors_are_data_and_not_recovered_after_a_wait_timeout():
+    from lambdas.classify_failure.handler import classify
+
+    assert _classify({"Error": "DmsValidationErrors", "Cause": "1 table(s) not validated"})["category"] == "DATA"
+    event = {
+        "failure": {"Error": "WaitTimeout", "Cause": "heartbeat"},
+        "ctx": {"taskArn": TASK_ARN},
+        "request": {},
+        "started": True,
+        "attempt": 1,
+        "completion": {"mode": "task-stopped", "failOnValidationErrors": True},
+        "startedAt": "2026-10-27T10:00:00Z",
+    }
+    out = classify(event, FakeDms(FINISHED, BAD_VALIDATION), FakeLogs())
+    assert out["recovered"] is False

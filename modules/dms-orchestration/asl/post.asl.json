@@ -298,7 +298,7 @@
       "Arguments": {
         "StateMachineArn": "${migrate_arn}",
         "Name": "{% $nextRunId %}",
-        "Input": "{% $merge([$sift($req, function($v, $k) { $k in ['project', 'taskKey', 'jobSet', 'jobsVersion', 'completion', 'failOnTableErrors', 'targetReset', 'autoResume', 'notify', 'allowReset', 'requestedBy', 'changeRef'] and $v != null }), {'operation': 'resume', 'attempt': $attempt + 1, 'parentRunId': $runId, 'parentStartedAt': $startedAt}]) %}"
+        "Input": "{% $merge([$sift($req, function($v, $k) { $k in ['project', 'taskKey', 'jobSet', 'jobsVersion', 'completion', 'failOnTableErrors', 'failOnValidationErrors', 'targetReset', 'autoResume', 'notify', 'allowReset', 'requestedBy', 'changeRef'] and $v != null }), {'operation': 'resume', 'attempt': $attempt + 1, 'parentRunId': $runId, 'parentStartedAt': $startedAt}]) %}"
       },
       "TimeoutSeconds": 30,
       "Retry": [{ "ErrorEquals": ["StepFunctions.ExecutionLimitExceeded", "States.Timeout"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],

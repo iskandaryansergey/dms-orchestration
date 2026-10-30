@@ -96,7 +96,7 @@ exactly when it has no username; a validation requires one credential source).
 | any `terraform apply` that changes a running task **stops it** | a run in progress sees an unexpected stop | RUNBOOK: no applies of the dms module during a run |
 | `target_table_prep_mode = DO_NOTHING`; `DROP_AND_CREATE`/`TRUNCATE_BEFORE_LOAD` need an explicit opt-in | the target schema must exist; truncation on reset is our `reset` job | ✅ consistent with `target_reset_policy` |
 | `control_schema = "dms_control"` | the schema must exist on the target before the first start | sandbox seed creates it; on the target platform — the target-schema pipeline |
-| `validation_enabled = true` | full-load task keeps running for validation after the load | handled by the outcome evaluation |
+| `validation_enabled = true` | full-load task keeps running for validation after the load | handled by the outcome evaluation; validation mismatches fail the run unless `fail_on_validation_errors = false` |
 | `TableErrorPolicy = SUSPEND_TABLE`, escalation `STOP_TASK` after `table_error_max` (50) | a table error does not fail the task | our `fail_on_table_errors` defaults to `true`: the run fails `DmsTableErrors` before post-jobs |
 | `create_log_group = true`, `log_retention_days = 30`, **`log_group_skip_destroy = true`** | our log tail works from the first run; the group survives `destroy` | sandbox sets `log_group_skip_destroy = false` |
 | `create_event_subscriptions` (SNS) | independent of our EventBridge rule on `aws.dms` | ✅ no conflict |
