@@ -45,7 +45,7 @@ phases:
 
   reset:
     - name: truncate-tables
-      command: [psql-run, --connection, target, --truncate, "{{ ctx.resetTables }}"]
+      command: [psql-run, --connection, target, --truncate-scope]   # ctx.resetTables of the spec file, any size
 
   post:
     - name: indexes
@@ -181,8 +181,9 @@ literals, lists. Missing paths are `null`.
 
 Examples: `when: "pre.schema-diff.summary.missingTables > 0"`,
 `when: "failure.category != 'TRANSIENT_SOURCE_CONN'"`,
-`command: [psql-run, --connection, target, --truncate, "{{ ctx.resetTables }}"]`
-(lists become comma-separated in command arguments).
+`command: [psql-run, --connection, target, --truncate, "{{ failure.erroredTables }}"]`
+(lists become comma-separated in command arguments; a reset list kept in S3 above the
+payload cap is refused as a template — use `--truncate-scope`).
 
 ## Connections and secrets
 
@@ -216,7 +217,8 @@ Tools: `psql` 17, `mysql`, `python3` (+ boto3), `bash`, `pwsh`, and
 ```
 psql-run --connection target --file ddl/020_indexes.sql [--file ...] [--single-transaction]
 psql-run --connection target --template sql/reset.sql --var schema=app   # see "SQL templates"
-psql-run --connection target --truncate "{{ ctx.resetTables }}" [--cascade]
+psql-run --connection target --truncate-scope [--cascade]   # ctx.resetTables from the job spec
+psql-run --connection target --truncate "app.a,app.b" [--cascade]
 psql-run --connection target --sql "ANALYZE app.accounts"
 ```
 
