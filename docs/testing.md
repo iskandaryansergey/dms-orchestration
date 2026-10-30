@@ -58,6 +58,22 @@ prints a JSON verdict per check; the exit code is 0 only if every check passed.
 
 `tests/python/test_docs_matrix.py` fails when this table and `e2e.py` disagree.
 
+## Planned scenarios
+
+Live checks of 0.2.0 behaviour that the offline levels already cover (pytest, the local ASL
+runner, TestState cases) but `e2e.py` does not run yet. When one is added to `e2e.py`, its row
+moves to the matrix above; `test_docs_matrix.py` fails while a scenario is in both.
+
+| Scenario | Proves | Covered offline by |
+|---|---|---|
+| `dry-ro` | a dry run's jobs open read-only sessions: a write fails with `ReadOnlySqlTransaction`, the target is unchanged | `test_sql_jobs.py`, `test_sql_runner.py` |
+| `s4big` | a reset above 500 tables: the list goes to `inspect/reset-tables.json`, `--truncate-scope` truncates all of them, the report gives the full count | `test_preflight.py`, `test_lambdas_core.py`, `test_sql_runner.py` |
+| `s17-lock-lost` | post finds its lock taken: `LockLost`, `MANUAL`, no post jobs, the other run's lock untouched | TestState case `post-lock-lost-stops`, `test_asl.py` |
+| `s18-recheck` | the task changes between inspect and reset: `TaskStateChanged` before the target is touched | TestState cases `recheck-task-*`, `test_asl.py` |
+| `s19-chain-dump` | a resume that resets after a run that did not dump takes a dump first | TestState cases `dump-runs-on-chained-reset-without-dump`, `chained-reset-after-a-dump-does-not-dump-again` |
+| `s20-tampered-jobset` | one file of a published job set changed: `JobSetTampered` before any job runs | `test_lambdas_core.py`, `test_sql_runner.py`, `test_jobset_example.py` |
+| `s21-validation` | a table that fails DMS validation: `DmsValidationErrors`; with the flag off `COMPLETED_WITH_VALIDATION_ERRORS` | `test_dms_outcome.py` |
+
 ## Adding a scenario
 
 1. Write the function in `examples/sandbox/scripts/e2e.py`: start a run with `start(...)`, follow

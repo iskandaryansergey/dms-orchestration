@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| 0.1.x | yes |
+| 0.2.x | yes |
+| 0.1.x | no: 0.2.0 fixes security findings in it; upgrade |
 
 ## Reporting a vulnerability
 

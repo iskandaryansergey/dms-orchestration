@@ -37,7 +37,7 @@ rules × source catalogue), and the request flags `allowReset`, `targetReset.pol
   tables, columns and types, PK and
   unique indexes, FKs, sequences, `reltuples`, `n_tup_ins/upd/del`, exact `count(*)` up to
   `preflight.exactCountMaxRows`, the `dms_control` table. Hash in DynamoDB, full JSON in
-  `runs/<runId>/jobs/<preflight|baseline>/00-target-verify/target-fingerprint.json`. Objects
+  `runs/<project>/<runId>/jobs/<preflight|baseline>/00-target-verify/target-fingerprint.json`. Objects
   outside the scope give a warning only
   (many-to-one: other sources live in the same target).
 - `manual` = run status `MANUAL`, a report with the diff (missing / extra / changed /

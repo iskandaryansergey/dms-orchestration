@@ -35,7 +35,7 @@ Terraform 1.9.8, `hashicorp/aws >= 5.90, < 6`. In the migration workspace, next 
 
 ```hcl
 module "dms_orchestration" {
-  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.1.0"
+  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.2.0"
 
   environment = "dev"
   vpc_id      = var.vpc_id
@@ -71,7 +71,7 @@ module "dms_orchestration" {
   }
 
   job_secret_arns             = [var.source_runner_secret_arn, var.target_runner_secret_arn]
-  kms_key_arn                 = var.kms_key_arn  # null only in a sandbox
+  kms_key_arn                 = var.kms_key_arn  # "" only in a sandbox
   database_security_group_ids = [var.target_db_security_group_id, var.source_db_security_group_id]
 }
 ```
@@ -80,14 +80,18 @@ Every input and output: [docs/configuration.md](docs/configuration.md). Outside 
 pass `sns_topic_arn`, `table_name` and `artifacts_bucket_name` from a long-lived workspace
 (RUNBOOK §9–10). The module creates no VPC endpoints, KMS key policies or operator roles; it
 publishes what they must allow (`network_contract`, `kms_key_policy_requirements`,
-`operator_policy_json`, `jobset_publisher_policy_json`).
+`bucket_requirements`, `operator_policy_json`, `jobset_publisher_policy_json`). A brought
+artifacts bucket must be versioned; `modules/artifacts-bucket` creates one with every control.
+`create = false` creates nothing.
 
-Footprint: Lambda functions from zips the module packages (or a prebuilt zip,
-`lambda.artifact_s3_*`), three Step Functions state machines, IAM roles, SSM parameters, alarms
-and, unless you bring them, a DynamoDB table, an S3 bucket and an SNS topic. No ECS cluster, no
-ECR endpoints and no container image by default: SQL jobs run in a Lambda, long jobs
+Footprint: Lambda functions from zips the module packages from its own directory (or a prebuilt
+zip, `lambda.artifact_s3_*`), three Step Functions state machines, IAM roles (one job role per
+project), SSM parameters, alarms and, unless you bring them, a DynamoDB table, an S3 bucket and
+an SNS topic; the module's tags include `ManagedBy` and `Module`. No ECS cluster, no ECR
+endpoints and no container image by default: SQL jobs run in a Lambda, long jobs
 (`pg_dump`/`pg_restore`, long DDL, scripts) on SSM-managed instances built from your AMI
-(`ssm`), and Fargate is an optional third runtime that appears only with `fargate.images`, a
+(`ssm`; one runner per project, since projects sharing a runner are not isolated from each
+other), and Fargate is an optional third runtime that appears only with `fargate.images`, a
 pre-pushed image pinned by digest. The module never builds an image
 ([ADR 0011](docs/adr/0011-job-runtimes.md)).
 
@@ -132,12 +136,14 @@ make teststate-dry    # build the TestState requests (no AWS)
 The cycle, the commit rules and the denylist gate: [CONTRIBUTING.md](CONTRIBUTING.md); for coding
 agents: [AGENTS.md](AGENTS.md). Test levels and the e2e matrix: [docs/testing.md](docs/testing.md).
 
-## Release 0.1.0
+## Release 0.2.0
 
-The first release: two state machines with a pre-flight verdict, target dumps by `pg_dump` or
-cluster snapshot, IAM database authentication for Fargate jobs, the target check in a Lambda or
-on Fargate, SNS fan-out attributes, repeat of post, the sandbox and its e2e matrix. What is in
-it: [CHANGELOG.md](CHANGELOG.md).
+Hardening and new job runtimes: run artifacts per project and a pinned run context, job sets
+pinned by hash, a transactional restore scoped to the dump's tables under the task lock, DMS
+validation failing the run by default, SQL jobs in a Lambda and long jobs on SSM with Fargate
+optional, and the registry conventions (`create`, non-nullable inputs, KMS key policy contract
+v2). 0.2.0 has breaking changes for 0.1 deployments, runs and dumps; each is listed under
+*Changed* in [CHANGELOG.md](CHANGELOG.md).
 
 ## License and security
 

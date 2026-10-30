@@ -9,7 +9,7 @@ AWS call (and the command's) uses the project's job role through a profile that 
 from the instance profile (refreshed by botocore for jobs longer than an hour). Both get these
 environment variables:
 
-* ``ORCH_JOB_SPEC_S3`` — s3://<bucket>/runs/<runId>/jobs/<phase>/<nn>-<name>/spec.json
+* ``ORCH_JOB_SPEC_S3`` — s3://<bucket>/runs/<project>/<runId>/jobs/<phase>/<nn>-<name>/spec.json
 * ``ORCH_RUN_ID``, ``ORCH_DRY_RUN`` (1/0), ``ORCH_ATTEMPT``
 
 Steps: download the spec and the job bundle (``jobsS3Prefix``) into the work dir,

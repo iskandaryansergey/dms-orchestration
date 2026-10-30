@@ -359,7 +359,7 @@ Schema: [`modules/dms-orchestration/src/shared/schemas/job_result.schema.json`](
 | `builtin:checks/postgresql_source_grants` | `connection`, `schemas`, `require: [SELECT, REPLICATION]`, `walLevel`, `minFreeSlots` | the user can read the schemas; for CDC: replication role, `wal_level`, free slots |
 | `builtin:checks/row_counts` | `source`, `target`, `tables` (default: all task tables), `tolerance` | exact `count(*)` per table (small/medium tables; use a command runtime for big ones) |
 | `builtin:diagnostics/dms_dump` | — | task, unfinished tables and last 24 h of DMS events → `dms-dump.json` artifact |
-| `builtin:dump/cluster_snapshot` | `connection` (`target`), `waitSeconds` (600) | dump phase, `dump.method = snapshot`: tagged cluster snapshot of the connection's cluster, polled until available, `runs/<runId>/dump.json` (ADR 0007) |
+| `builtin:dump/cluster_snapshot` | `connection` (`target`), `waitSeconds` (600) | dump phase, `dump.method = snapshot`: tagged cluster snapshot of the connection's cluster, polled until available, `dump.json` next to the job result under `runs/<project>/<runId>/jobs/dump/` (ADR 0007) |
 | `builtin:cleanup/cluster_snapshots` | `connection`, `retentionDays` | post job `snapshot-retention`: deletes this task's tagged snapshots older than the retention; dry run only lists them |
 | `builtin:cleanup/drop_control_tables` | `connection`, `schema` (`dms_control`), `keepValidationFailures` | drops DMS control tables; dry run only lists them |
 

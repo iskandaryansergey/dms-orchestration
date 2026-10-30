@@ -13,9 +13,10 @@ the sandbox: [`examples/sandbox/README.md`](../examples/sandbox/README.md).
 | Terraform 1.9.8 (any `>= 1.9, < 2`), provider `hashicorp/aws >= 5.90, < 6`, `hashicorp/archive ~> 2.4` | the module avoids 1.10+ features (`modules/dms-orchestration/versions.tf`) |
 | A DMS replication instance, endpoints and tasks created with `start = false` | the orchestrator starts tasks, Terraform never does; any module that satisfies [the upstream modules contract](upstream-modules-contract.md) works |
 | Source and target databases (Aurora PostgreSQL or PostgreSQL), each with a Secrets Manager secret holding `host`, `port`, `username`, `password`, `dbname` | jobs and pre-flight read connections through secret ARNs only |
-| The RDS Data API on the target cluster (recommended) | pre-flight's target check and the built-in SQL checks; without it the check runs in psql on Fargate (`preflight.verifyRuntime`, [preflight.md](preflight.md)) |
-| Private subnets (at least two) and the VPC endpoints of the `network_contract` output | Lambdas and Fargate jobs run without internet access |
-| The `sql-runner` image in your registry (`modules/dms-orchestration/src/jobs/sql-runner/Dockerfile`, `make image`) | Fargate jobs: psql, dumps, the psql target check |
+| The RDS Data API on the target cluster, or a `host` in the target connection | pre-flight's target check and the built-in SQL checks run in a Lambda, through the Data API or pg8000 over verified TLS (`preflight.verifyRuntime`, [preflight.md](preflight.md)) |
+| Private subnets (at least two) and the VPC endpoints of the `network_contract` output | Lambdas and job runners run without internet access |
+| Optional: SSM-managed instances built from your AMI (`ssm`, [RUNBOOK.md](../RUNBOOK.md) §16) | long jobs: `pg_dump`/`pg_restore` dumps and restores, long DDL, scripts; SQL jobs need none ([ADR 0011](adr/0011-job-runtimes.md)) |
+| Optional: a `sql-runner` image you build and push yourself, pinned by digest (`fargate.images`; `modules/dms-orchestration/src/jobs/sql-runner/Dockerfile`) | the optional Fargate runtime; the module never builds an image and creates no ECS resources without it |
 | Python 3.13 with `uv` and the AWS CLI v2 on the operator machine | `orch.py`, `sync-jobs.sh` |
 
 ## 2. Wire the module
@@ -26,7 +27,7 @@ the minimum:
 
 ```hcl
 module "dms_orchestration" {
-  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.1.0"
+  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.2.0"
 
   environment = "dev"
   vpc_id      = var.vpc_id
@@ -53,7 +54,6 @@ module "dms_orchestration" {
   }
 
   job_secret_arns = [var.source_secret_arn, var.target_secret_arn]
-  fargate         = { images = { sql-runner = "<registry>/sql-runner:<tag>" } }
 }
 ```
 
@@ -67,7 +67,7 @@ encryption, TLS only, SSE-KMS only under `dumps/`, and the lifecycle of `runs/`,
 
 ```hcl
 module "artifacts_bucket" {
-  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/artifacts-bucket?ref=v0.1.0"
+  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/artifacts-bucket?ref=v0.2.0"
 
   name        = "dms-dev-artifacts-<account-id>"
   kms_key_arn = var.kms_key_arn
