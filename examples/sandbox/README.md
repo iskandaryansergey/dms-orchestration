@@ -43,7 +43,7 @@ Give them as `TF_VAR_*` once per shell, so every `terraform` command (and `e2e s
 | Variable | Default | Turns on |
 |---|---|---|
 | `TF_VAR_operator_cidr` | — (required) | your IP for seeding through the cluster endpoints |
-| `TF_VAR_sql_runner` | `false` | ECR, CodeBuild and the Fargate `sql-runner` task definition (`s1f`, `s10`, `s8fargate`, `s1iam`) |
+| `TF_VAR_sql_runner` | `false` | sandbox only: ECR, CodeBuild and the Fargate `sql-runner` task definition for the optional Fargate runtime (`s1f`, `s8fargate`, `s1iam`; `s10` without `ssm_runner`); the module itself never builds an image ([ADR 0011](../../docs/adr/0011-job-runtimes.md)) |
 | `TF_VAR_ssm_runner` | `false` | the SSM runner instance and the module's SSM runtime (`s1ssm`, `s10` on SSM); `TF_VAR_runner_ami_id` = the team AMI, empty = Amazon Linux 2023 stand-in |
 | `TF_VAR_sql_runner_image_tag` | `""` | the image tag `sbx build-image` printed; the task definition and the ECR endpoints come with it |
 | `TF_VAR_assessment` | `false` | the premigration assessment bucket and role (`s14`) |

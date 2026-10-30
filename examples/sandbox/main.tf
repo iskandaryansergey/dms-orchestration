@@ -103,11 +103,11 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_https" {
 
 resource "aws_vpc_endpoint" "interface" {
   # From the module's network_contract: rds (a task with snapshot_dumps), ec2messages and
-  # ssmmessages (the SSM runtime; ssm is in interface_endpoints already).
+  # ssmmessages (the SSM runtime; ssm is in interface_endpoints already), ecr.api and ecr.dkr
+  # (the optional Fargate runtime, with sql_runner_image_tag).
   for_each = toset(concat(
     var.interface_endpoints,
-    local.sql_runner_image != "" ? ["ecr.api", "ecr.dkr"] : [],
-    [for e in module.dms_orchestration.network_contract.required_vpc_endpoints : e if contains(["rds", "ec2messages", "ssmmessages"], e)],
+    [for e in module.dms_orchestration.network_contract.required_vpc_endpoints : e if contains(["rds", "ec2messages", "ssmmessages", "ecr.api", "ecr.dkr"], e)],
   ))
   vpc_id              = aws_vpc.this.id
   service_name        = "com.amazonaws.${var.region}.${each.key}"

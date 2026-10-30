@@ -98,6 +98,28 @@ def test_build_sources_older_than_the_tree_are_listed(tmp_path):
     assert sandbox.stale_build_sources(_zip({"src/same.py": b"same\n"}), tmp_path) == []
 
 
+def test_build_image_refuses_when_the_sandbox_build_is_off(monkeypatch, capsys):
+    """CodeBuild is a sandbox convenience behind var.sql_runner (off by default): without it
+    the outputs carry no project, and build-image stops before any AWS call."""
+
+    def no_session(out):
+        raise AssertionError("must not call AWS")
+
+    monkeypatch.setattr(sandbox, "session", no_session)
+    out = {"artifacts_bucket": "bkt", "sql_runner_codebuild_project": None, "sql_runner_repository": None}
+    assert sandbox.cmd_build_image(out, "abc1234") == 2
+    assert "sql_runner=true" in capsys.readouterr().out
+
+
+def test_sandbox_build_is_off_by_default_and_sandbox_only():
+    tf = (SCRIPT.parents[1] / "variables.tf").read_text(encoding="utf-8")
+    block = tf[tf.index('variable "sql_runner" {') :]
+    block = block[: block.index("\n}\n")]
+    assert "default     = false" in block and "Sandbox only" in block
+    header = (SCRIPT.parents[1] / "sql_runner.tf").read_text(encoding="utf-8").split("\n\n")[0]
+    assert "never part of the module" in header
+
+
 def test_build_image_refuses_stale_sources_before_starting_a_build(tmp_path, monkeypatch, capsys):
     import io
 

@@ -67,7 +67,7 @@ variable "runner_ami_id" {
 }
 
 variable "sql_runner" {
-  description = "Fargate sql-runner (sql_runner.tf): ECR repository and CodeBuild project."
+  description = "Sandbox only, off by default: ECR repository and CodeBuild project for the optional Fargate runtime (sql_runner.tf). The module never builds an image."
   type        = bool
   default     = false
 }

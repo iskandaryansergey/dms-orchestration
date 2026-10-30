@@ -580,6 +580,15 @@ def test_sandbox_build_context_holds_every_file_the_dockerfile_copies() -> None:
     assert missing == []
 
 
+def test_sandbox_build_takes_the_pinned_base_through_the_build_arg() -> None:
+    """The sandbox CodeBuild pulls the digest-pinned default of BASE_IMAGE from the ECR Public
+    mirror (Docker Hub rate-limits CodeBuild) and passes it as the build arg."""
+    tf = (REPO_ROOT / "examples/sandbox/sql_runner.tf").read_text(encoding="utf-8")
+    assert "s/^ARG BASE_IMAGE=//p" in tf
+    assert '--build-arg BASE_IMAGE="public.ecr.aws/docker/library/$base"' in tf
+    assert "s/^FROM //p" not in tf
+
+
 # --- IAM database authentication for Fargate jobs --------------------------
 
 IAM_CONN = {

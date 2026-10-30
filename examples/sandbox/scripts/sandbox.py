@@ -4,7 +4,7 @@
     sandbox.py seed                       # schema + data on the source, dms_source password
     sandbox.py test-connections           # MaxFileSize 0 fix on PG targets, TestConnection of every endpoint
     sandbox.py sync-jobs                  # jobs/jobset*.yaml.tmpl as jobs/ledger/e2e/, e2e-dms-only/
-    sandbox.py build-image <git-sha>      # CodeBuild: sql-runner image -> ECR; fails on HIGH/CRITICAL
+    sandbox.py build-image <git-sha>      # sandbox only (sql_runner=true): CodeBuild image -> ECR
     sandbox.py sync-jobs-fargate          # jobs/jobset-fargate.yaml.tmpl as jobs/ledger/e2e-fargate/
     sandbox.py sync-jobs-ssm              # jobs/jobset-ssm.yaml.tmpl as jobs/ledger/e2e-ssm/ (ssm_runner)
     sandbox.py sync-jobs-iam              # jobs/jobset-iam.yaml.tmpl as jobs/ledger/e2e-iam/ (iam_auth)
@@ -199,7 +199,11 @@ def cmd_build_image(out: dict[str, Any], tag: str) -> int:
     """CodeBuild builds the sql-runner image (sql_runner.tf) and pushes it only if trivy
     finds no fixable HIGH/CRITICAL; ECR then scans it on push (report only). Refuses when the
     source zip in S3 is older than the working tree: the tags are immutable, so a build from
-    old sources would publish old code under the new tag for good."""
+    old sources would publish old code under the new tag for good. Sandbox only: the module
+    never builds an image, and without ``-var sql_runner=true`` there is no project to start."""
+    if not out.get("sql_runner_codebuild_project"):
+        print("no sandbox image build: apply with -var sql_runner=true first (sandbox only, off by default)")
+        return 2
     s = session(out)
     archive = s.client("s3").get_object(Bucket=out["artifacts_bucket"], Key=BUILD_SOURCE_KEY)["Body"].read()
     stale = stale_build_sources(archive, REPO)
