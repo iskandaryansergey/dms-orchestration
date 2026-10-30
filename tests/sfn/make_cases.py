@@ -83,6 +83,7 @@ def case(
     expect: dict[str, Any],
     mock: Any = None,
     retries: int | None = None,
+    input_: Any = None,
     **var_over: Any,
 ) -> dict[str, Any]:
     base = MIGRATE_VARS if machine == "migrate" else POST_VARS
@@ -94,6 +95,8 @@ def case(
         "variables": variables,
         "context": context(machine, "run-1" if machine == "migrate" else "run-1-post"),
     }
+    if input_ is not None:
+        out["input"] = input_
     if mock is not None:
         out["mock"] = mock
     if retries is not None:
@@ -178,6 +181,27 @@ CASES: dict[str, dict[str, Any]] = {
         "CheckDryRun",
         {"status": "SUCCEEDED", "nextState": "StartPostDryRun"},
         req={"project": "ledger", "taskKey": "core", "operation": "migrate", "dryRun": True},
+    ),
+    "context-version-is-recorded": case(
+        "migrate",
+        "CheckContextVersion",
+        {"status": "SUCCEEDED", "nextState": "RecordContextVersion"},
+        mock={"result": {}},
+        input_={"ETag": '"e"', "VersionId": "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"},
+    ),
+    "context-without-version-stops-before-dms": case(
+        "migrate",
+        "CheckContextVersion",
+        {"status": "SUCCEEDED", "nextState": "ClassifyFailure"},
+        mock={"result": {}},
+        input_={"ETag": '"e"'},
+    ),
+    "record-context-version": case(
+        "migrate",
+        "RecordContextVersion",
+        {"status": "SUCCEEDED", "nextState": "CheckDryRun"},
+        mock={"result": {}},
+        input_={"ETag": '"e"', "VersionId": "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"},
     ),
     "arm-then-start": case(
         "migrate", "Arm", {"status": "SUCCEEDED", "nextState": "CheckWaitOnly"}, mock={"result": {}}

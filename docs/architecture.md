@@ -53,7 +53,8 @@ migration journal (locks, runs, baselines, dumps) stays in a long-lived one.
 | `TARGET#<project>/<taskKey>` / `BASELINE` | `post`, `orch.py restore` | fingerprint hash and S3 URI after the last run or restore |
 | `TABLE#<project>/<taskKey>` / `<schema>.<table>` | `post` | copy of `DescribeTableStatistics`; survives a recreated DMS task (new ARN) |
 
-S3: `jobs/<project>/<version>/`, `runs/<runId>/` (spec, results, report, fingerprint, `dump.json`),
+S3: `jobs/<project>/<version>/`, `runs/<project>/<runId>/` (`context.json` pinned by version on `RUN#`,
+report; `jobs/<phase>/<nn>-<name>/` spec, result, fingerprint, `dump.json`),
 `dumps/<project>/<taskKey>/<ts>-<runId>/` (SSE-KMS, only the project role, `dump_retention_days`).
 With `dump.method = snapshot` a tagged cluster snapshot replaces the S3 dump (ADR 0007). Outside
 the sandbox DynamoDB and S3 come from a long-lived workspace (`table_name`,

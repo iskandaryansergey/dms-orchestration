@@ -89,7 +89,11 @@ sandbox).
 - `kms_key_policy_requirements`: JSON list of key policy statements a customer managed key
   needs when `kms_key_arn` is set; the module does not manage the key policy.
 - `operator_policy_json`: IAM policy for the operator role (CLI or CI): start, watch and stop
-  runs, read reports, sync job sets. Not attached by the module.
+  runs, read reports, take the task lock for `orch.py restore`. It cannot upload job sets. Not
+  attached by the module.
+- `jobset_publisher_policy_json`: map of project key to an IAM policy for whoever publishes that
+  project's job sets (`scripts/sync-jobs.sh`): write and list `jobs/<project>/` only. Job set
+  code runs with the project's job role, so this grant is separate from running migrations.
 
 ## Generated reference
 
@@ -156,13 +160,14 @@ sandbox).
 
 | Name | Description |
 |------|-------------|
-| <a name="output_artifacts_bucket"></a> [artifacts\_bucket](#output\_artifacts\_bucket) | Bucket for job sets (jobs/<project>/<version>/) and run reports (runs/<runId>/). |
+| <a name="output_artifacts_bucket"></a> [artifacts\_bucket](#output\_artifacts\_bucket) | Bucket for job sets (jobs/<project>/<version>/) and run artifacts (runs/<project>/<runId>/). |
 | <a name="output_ecs_cluster_arn"></a> [ecs\_cluster\_arn](#output\_ecs\_cluster\_arn) | ECS cluster used for Fargate jobs. |
 | <a name="output_jobs_security_group_id"></a> [jobs\_security\_group\_id](#output\_jobs\_security\_group\_id) | Security group of Lambda and Fargate jobs. Add it to the Aurora ingress rules (upstream aurora module: ingress\_rules.referenced\_security\_group\_id). |
+| <a name="output_jobset_publisher_policy_json"></a> [jobset\_publisher\_policy\_json](#output\_jobset\_publisher\_policy\_json) | IAM policy per project for whoever publishes that project's job sets (scripts/sync-jobs.sh): write and list jobs/<project>/ only. Not attached by the module. |
 | <a name="output_kms_key_policy_requirements"></a> [kms\_key\_policy\_requirements](#output\_kms\_key\_policy\_requirements) | JSON list of statements the CMK key policy must allow when kms\_key\_arn is set (the module does not manage the key policy). |
 | <a name="output_lambda_function_arns"></a> [lambda\_function\_arns](#output\_lambda\_function\_arns) | Lambda functions of the module. |
 | <a name="output_network_contract"></a> [network\_contract](#output\_network\_contract) | What the network must provide. The module creates no VPC endpoints (owned by the landing zone). |
-| <a name="output_operator_policy_json"></a> [operator\_policy\_json](#output\_operator\_policy\_json) | IAM policy for the operator role (CLI / CI): start, watch and stop runs, read reports, sync job sets. Not attached by the module. |
+| <a name="output_operator_policy_json"></a> [operator\_policy\_json](#output\_operator\_policy\_json) | IAM policy for the operator role (CLI / CI): start, watch and stop runs, read reports, restore under the task lock. No job set uploads (jobset\_publisher\_policy\_json). Not attached by the module. |
 | <a name="output_run_request_example"></a> [run\_request\_example](#output\_run\_request\_example) | Example input for the migrate state machine. |
 | <a name="output_sns_topic_arn"></a> [sns\_topic\_arn](#output\_sns\_topic\_arn) | Topic for run notifications and alarms. |
 | <a name="output_ssm_parameter_names"></a> [ssm\_parameter\_names](#output\_ssm\_parameter\_names) | Task registrations per <project>/<taskKey>. |

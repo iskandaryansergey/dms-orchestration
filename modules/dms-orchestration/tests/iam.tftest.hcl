@@ -270,12 +270,121 @@ run "per_project_job_roles" {
     error_message = "Fargate jobs run with the project's job role"
   }
 
+  # Review finding 1: a project's job reads and writes only its own runs' job prefixes.
+  assert {
+    condition = (
+      one([for st in jsondecode(aws_iam_role_policy.job["ledger"].policy).Statement : st.Resource if st.Sid == "RunSpecsAndResults"]) == ["arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runs/ledger/*/jobs/*"]
+      && one([for st in jsondecode(aws_iam_role_policy.job["cards"].policy).Statement : st.Resource if st.Sid == "RunSpecsAndResults"]) == ["arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runs/cards/*/jobs/*"]
+    )
+    error_message = "a project's job role reaches only runs/<project>/*/jobs/*"
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for p, pol in aws_iam_role_policy.job : [
+        for st in jsondecode(pol.policy).Statement : [
+          for r in flatten([st.Resource]) : !strcontains(r, "/runs/") || startswith(r, "arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runs/${p}/")
+        ]
+      ]
+    ]))
+    error_message = "no job role statement reaches another project's run artifacts"
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for p in [aws_iam_role_policy.lambda_jobs, aws_iam_role_policy.ecs_task] : [
+        for st in jsondecode(p.policy).Statement : [for r in flatten([st.Resource]) : !strcontains(r, "/runs/")]
+      ]
+    ]))
+    error_message = "the shared ecs-job and lambda-jobs roles have no access to run artifacts (all projects)"
+  }
+
+  assert {
+    condition = alltrue([
+      for p in [aws_iam_role_policy.migrate, aws_iam_role_policy.lambda_core, aws_iam_role_policy.job_runner] :
+      contains(flatten([for st in jsondecode(p.policy).Statement : flatten([st.Resource])]), "arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runs/*")
+    ])
+    error_message = "migrate (context), the core Lambdas (reports, context) and job-runner (results) keep runs/*"
+  }
+
   assert {
     condition = alltrue([
       for st in jsondecode(aws_iam_role.job["ledger"].assume_role_policy).Statement :
       st.Principal == { Service = "ecs-tasks.amazonaws.com" } ? st.Condition.StringEquals["aws:SourceAccount"] == "111122223333" : st.Principal == { AWS = aws_iam_role.lambda_jobs.arn }
     ])
     error_message = "job roles trust ECS tasks of this account and the built-in jobs Lambda role only"
+  }
+}
+
+# Review finding 2: the operator role runs migrations; publishing job sets (code that runs with
+# a project's secrets) is a separate, per-project policy.
+run "operator_cannot_publish_job_sets" {
+  command = apply
+
+  variables {
+    projects = {
+      ledger = { tasks = { core = {} } }
+      cards  = { tasks = { extra = {} } }
+    }
+  }
+
+  assert {
+    condition = length([
+      for st in jsondecode(output.operator_policy_json).Statement : st
+      if length(setintersection(toset(flatten([st.Action])), toset(["s3:PutObject", "s3:DeleteObject"]))) > 0
+    ]) == 0
+    error_message = "the operator policy writes nothing to S3 (no job set uploads)"
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for st in jsondecode(output.operator_policy_json).Statement : [for r in flatten([st.Resource]) : !strcontains(r, "/jobs/")]
+    ]))
+    error_message = "the operator policy does not reach job sets"
+  }
+
+  assert {
+    condition     = toset(one([for st in jsondecode(output.operator_policy_json).Statement : st.Resource if st.Sid == "ReadReports"])) == toset(["arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runs/*/report.json", "arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runs/*/report.md"])
+    error_message = "the operator reads run reports, not job specs or results"
+  }
+
+  # orch.py restore takes the task lock (LOCK#) like a run does; nothing else in the table.
+  assert {
+    condition = (
+      toset(one([for st in jsondecode(output.operator_policy_json).Statement : st.Action if st.Sid == "TaskLock"])) == toset(["dynamodb:PutItem", "dynamodb:DeleteItem"])
+      && one([for st in jsondecode(output.operator_policy_json).Statement : st.Condition if st.Sid == "TaskLock"])["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == ["LOCK#*"]
+    )
+    error_message = "the operator writes only LOCK# items (dynamodb:LeadingKeys)"
+  }
+
+  assert {
+    condition = length([
+      for st in jsondecode(output.operator_policy_json).Statement : st
+      if length(setintersection(toset(flatten([st.Action])), toset(["dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:BatchWriteItem"]))) > 0
+    ]) == 1
+    error_message = "the LOCK# statement is the operator's only DynamoDB write"
+  }
+
+  assert {
+    condition     = toset(keys(output.jobset_publisher_policy_json)) == toset(["ledger", "cards"])
+    error_message = "one job set publisher policy per project"
+  }
+
+  assert {
+    condition = (
+      one([for st in jsondecode(output.jobset_publisher_policy_json["cards"]).Statement : st.Resource if st.Sid == "PublishJobSets"]) == ["arn:aws:s3:::dms-orch-dev-artifacts-111122223333/jobs/cards/*"]
+      && one([for st in jsondecode(output.jobset_publisher_policy_json["cards"]).Statement : st.Condition if st.Sid == "ListJobSets"]).StringLike["s3:prefix"] == ["jobs/cards/*"]
+    )
+    error_message = "a project's publisher writes and lists only that project's job sets"
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for p, pol in output.jobset_publisher_policy_json : [
+        for st in jsondecode(pol).Statement : [for r in flatten([st.Resource]) : !strcontains(r, "/runs/") && !strcontains(r, ":secret:")]
+      ]
+    ]))
+    error_message = "publishers reach no run artifacts and no secrets"
   }
 }
 

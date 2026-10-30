@@ -564,13 +564,43 @@
     },
     "SaveContext": {
       "Type": "Task",
-      "Comment": "Everything post needs to continue this run, in S3 (runs/<runId>/context.json); post loads it in its first state. Body is an object: the integration serializes it (a string Body is JSON-encoded once more).",
+      "Comment": "Everything post needs to continue this run, in S3 (runs/<project>/<runId>/context.json); post loads the version RecordContextVersion pins. Body is an object: the integration serializes it (a string Body is JSON-encoded once more).",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Arguments": {
         "Bucket": "${artifacts_bucket}",
-        "Key": "{% 'runs/' & $runId & '/context.json' %}",
+        "Key": "{% 'runs/' & $ctx.project & '/' & $runId & '/context.json' %}",
         "ContentType": "application/json",
         "Body": "{% {'runId': $runId, 'request': $req, 'ctx': $ctx, 'inspect': $inspect, 'jobCtx': $jobCtx, 'attempt': $attempt, 'startedAt': $startedAt, 'preflight': $preflight} %}"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2, "JitterStrategy": "FULL" }],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "Next": "ClassifyFailure", "Assign": { "failure": "{% $states.errorOutput %}" } }
+      ],
+      "Next": "CheckContextVersion"
+    },
+    "CheckContextVersion": {
+      "Type": "Choice",
+      "Comment": "post trusts only the version of context.json written here. Without a VersionId (bucket not versioned) it could not tell, so the run stops before DMS.",
+      "Choices": [
+        {
+          "Condition": "{% $not($exists($states.input.VersionId)) or $states.input.VersionId = 'null' %}",
+          "Next": "ClassifyFailure",
+          "Assign": { "failure": { "Error": "ContextNotPinned", "Cause": "the artifacts bucket returned no object version for context.json: enable versioning on the bucket" } }
+        }
+      ],
+      "Default": "RecordContextVersion"
+    },
+    "RecordContextVersion": {
+      "Type": "Task",
+      "Comment": "RUN#<runId>.contextVersionId: post loads context.json by this version only (review finding 1).",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": { "pk": { "S": "{% 'RUN#' & $runId %}" }, "sk": { "S": "META" } },
+        "UpdateExpression": "SET contextVersionId = :v",
+        "ConditionExpression": "attribute_exists(pk)",
+        "ExpressionAttributeValues": { ":v": { "S": "{% $states.input.VersionId %}" } }
       },
       "TimeoutSeconds": 30,
       "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2, "JitterStrategy": "FULL" }],

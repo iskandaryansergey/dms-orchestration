@@ -75,7 +75,8 @@ terraform output -json dms_orchestration | jq -r '.verify_commands[]' # a plan r
 
 The commands read a root output `output "dms_orchestration" { value = module.dms_orchestration }`.
 `apply` never starts a migration. Attach `operator_policy_json` to the role operators (or the
-pipeline) use. The module creates no VPC endpoints, KMS key policies or operator roles; it
+pipeline) use, and `jobset_publisher_policy_json["<project>"]` to whoever uploads that project's
+job sets (`sync-jobs.sh`); the operator policy cannot upload them. The module creates no VPC endpoints, KMS key policies or operator roles; it
 publishes what they must allow (`network_contract`, `kms_key_policy_requirements`).
 
 ## 4. Upload a job set

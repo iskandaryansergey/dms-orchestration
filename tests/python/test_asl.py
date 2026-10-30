@@ -368,7 +368,8 @@ def migrate_mocks(req: dict[str, Any] | None = None, dec: dict[str, Any] | None 
         "RunPreJob": job_ok,
         "RunResetJob": job_ok,
         "RunOnFailureJob": job_ok,
-        "SaveContext": lambda _a: {},
+        "SaveContext": lambda _a: {"VersionId": "ctx-v1", "ETag": '"e"'},
+        "RecordContextVersion": lambda _a: {},
         "ReadMigration": lambda _a: {},
         "StartPostDryRun": lambda a: {"ExecutionArn": "arn:post:" + a["Name"]},
         "Arm": lambda _a: {},
@@ -392,6 +393,27 @@ def run_migrate(mocks: dict[str, Any], input_: Any = None):
     return Interpreter(render(MIGRATE), mocks).execute(input_ or {"project": "ledger", "taskKey": "core"})
 
 
+def test_migrate_records_the_version_of_the_saved_context_before_arming():
+    """Review finding 1: post loads only the context.json version migrate recorded on RUN#."""
+    run = run_migrate(migrate_mocks())
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    assert run.path.index("SaveContext") < run.path.index("RecordContextVersion") < run.path.index("Arm")
+    rec = run.called("RecordContextVersion")[0]
+    assert rec["Key"] == {"pk": {"S": "RUN#run-1"}, "sk": {"S": "META"}}
+    assert rec["UpdateExpression"] == "SET contextVersionId = :v"
+    assert rec["ExpressionAttributeValues"] == {":v": {"S": "ctx-v1"}}
+    assert rec["ConditionExpression"] == "attribute_exists(pk)"
+
+
+def test_migrate_without_a_context_version_stops_before_dms():
+    """An unversioned bucket returns no VersionId: post could not verify the context, so DMS is not started."""
+    run = run_migrate(migrate_mocks(SaveContext=lambda _a: {"ETag": '"e"'}))
+    assert run.called("RecordContextVersion") == [] and run.called("Arm") == []
+    assert run.called("StartReplicationTask") == []
+    failure = run.called("ClassifyFailure")[0]["Payload"]["failure"]
+    assert failure["Error"] == "ContextNotPinned" and "versioning" in failure["Cause"]
+
+
 def test_migrate_arms_then_starts_then_ends_without_waiting_or_unlocking():
     run = run_migrate(migrate_mocks())
     assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
@@ -409,7 +431,7 @@ def test_migrate_arms_then_starts_then_ends_without_waiting_or_unlocking():
     # and post read a quoted string back.
     saved = run.called("SaveContext")[0]["Body"]
     assert isinstance(saved, dict)
-    assert run.called("SaveContext")[0]["Key"] == "runs/run-1/context.json"
+    assert run.called("SaveContext")[0]["Key"] == "runs/ledger/run-1/context.json"
     assert saved["jobCtx"]["startType"] == "start-replication" and saved["startedAt"] == arm["startedAt"]["S"]
     assert "preflight" in saved  # post's final report carries the verdict (S4)
     assert run.called("ReportStarted")[0]["Payload"]["status"] == "STARTED"

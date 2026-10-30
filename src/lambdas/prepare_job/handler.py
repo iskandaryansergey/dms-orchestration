@@ -7,7 +7,7 @@
   allow-list, or a Fargate task definition for the job's image;
 * adds the project's job role (``jobRoleArn``): the Fargate task role and the role
   built-in jobs assume, the only roles that can read the project's secrets;
-* writes the full job spec to ``s3://<bucket>/runs/<runId>/jobs/<phase>/<nn>-<name>/spec.json``
+* writes the full job spec to ``s3://<bucket>/runs/<project>/<runId>/jobs/<phase>/<nn>-<name>/spec.json``
   (Fargate jobs read it via ORCH_JOB_SPEC_S3; it never contains secret values);
 * expands a reset list kept in S3 (``ctx.resetTablesUri``, above the payload cap) into
   ``spec.json`` only: the state payload keeps ``resetTables`` empty and ``resetTablesCount``.
@@ -24,7 +24,7 @@ from typing import Any
 
 from shared import aws, expr, log
 from shared.errors import InvalidJobSet, JobFailed
-from shared.store import Store
+from shared.store import Store, run_prefix
 
 LOGGER = log.get_logger("prepare_job")
 
@@ -82,7 +82,7 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
     ctx = expand_reset_tables(payload_ctx)
     dry_run = bool(event.get("dryRun"))
     index = int(job.get("index", 0))
-    base = f"runs/{run_id}/jobs/{phase}/{index:02d}-{job['name']}"
+    base = f"{run_prefix(ctx.get('project'), run_id)}/jobs/{phase}/{index:02d}-{job['name']}"
     bucket = aws.env("ARTIFACTS_BUCKET")
 
     scope = {

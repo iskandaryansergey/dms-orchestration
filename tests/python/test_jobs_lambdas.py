@@ -75,11 +75,11 @@ def test_prepare_fargate_job_renders_command_and_writes_spec(jobs_env):
     spec = handler(event(job()))["spec"]
     assert spec["command"] == ["psql-run", "--connection", "target", "--truncate", "public.a,public.b"]
     assert spec["taskDefinitionArn"] == TD and spec["recordSk"] == "JOB#reset#01#reset-target"
-    assert spec["resultKey"] == "runs/run-1/jobs/reset/01-reset-target/result.json"
+    assert spec["resultKey"] == "runs/ledger/run-1/jobs/reset/01-reset-target/result.json"
     assert spec["maxAttempts"] == 2 and spec["backoffSeconds"] == 30 and spec["skip"] is False
     assert "connections" not in spec  # routing fields only; the full spec is in S3
     stored = json.loads(
-        jobs_env.get_object(Bucket=BUCKET, Key="runs/run-1/jobs/reset/01-reset-target/spec.json")["Body"].read()
+        jobs_env.get_object(Bucket=BUCKET, Key="runs/ledger/run-1/jobs/reset/01-reset-target/spec.json")["Body"].read()
     )
     assert stored["connections"]["target"]["secretArn"].endswith(":secret:t")
     assert stored["jobsS3Prefix"] == CTX["jobsS3Prefix"]
@@ -106,7 +106,7 @@ def test_prepare_expands_a_long_reset_list_into_spec_json_only(jobs_env, runtime
     )
     spec = handler(event(j, ctx=_long_ctx(jobs_env)))["spec"]
     stored = json.loads(
-        jobs_env.get_object(Bucket=BUCKET, Key="runs/run-1/jobs/reset/01-reset-target/spec.json")["Body"].read()
+        jobs_env.get_object(Bucket=BUCKET, Key="runs/ledger/run-1/jobs/reset/01-reset-target/spec.json")["Body"].read()
     )
     assert stored["ctx"]["resetTables"] == LONG and stored["ctx"]["resetTablesCount"] == 600
     assert "app.t0599" not in json.dumps(spec)  # the payload stays small
@@ -447,9 +447,36 @@ def test_dms_dump_writes_artifact(aws):
     assert dump["task"]["lastFailureMessage"] == "boom" and len(dump["events"]) == 1
 
 
+def test_builtin_jobs_write_artifacts_as_the_project_job_role(aws):
+    """Review finding 1: the shared lambda-jobs role has no runs/* access; artifacts go through the job role."""
+    s3 = boto3.client("s3", region_name="eu-west-2")
+    s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
+    sts = FakeSts()
+    shared_aws.set_client("sts", sts)
+
+    class Dms(FakeDms):
+        def describe_events(self, **_kw: Any) -> dict[str, Any]:
+            return {"Events": []}
+
+    shared_aws.set_client("dms", Dms(dms_task("failed", last_failure="boom"), []))
+    assert run_builtin(builtin_spec("builtin:diagnostics/dms_dump"))["status"] == "ok"
+    assert [c["RoleArn"] for c in sts.calls] == [LEDGER_ROLE]
+    out = run_builtin(builtin_spec("builtin:diagnostics/dms_dump", jobRoleArn=None))
+    assert out["status"] == "fail" and "job role" in out["message"]
+
+
 # --- per-project job role (review finding 4) ----------------------------------------
 
 LEDGER_ROLE = "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"
+
+
+def test_prepare_writes_the_spec_under_the_project_of_the_run(jobs_env):
+    """Review finding 1: runs/<project>/<runId>/jobs/..., the only run prefix a project job role can write."""
+    from lambdas.prepare_job.handler import handler
+
+    spec = handler(event(job()))["spec"]
+    assert spec["specS3Uri"] == f"s3://{BUCKET}/runs/ledger/run-1/jobs/reset/01-reset-target/spec.json"
+    assert spec["artifactsS3Prefix"] == f"s3://{BUCKET}/runs/ledger/run-1/jobs/reset/01-reset-target/"
 
 
 def test_prepare_puts_the_project_job_role_into_the_spec(jobs_env, monkeypatch):
@@ -762,7 +789,7 @@ def _snapshot_spec(**kw: Any) -> dict[str, Any]:
         "builtin:dump/cluster_snapshot",
         runId=SNAP_RUN,
         phase="dump",
-        artifactsS3Prefix=f"s3://{BUCKET}/runs/{SNAP_RUN}/jobs/dump/00-snapshot-target/",
+        artifactsS3Prefix=f"s3://{BUCKET}/runs/ledger/{SNAP_RUN}/jobs/dump/00-snapshot-target/",
         **{"with": {"connection": "target", "waitSeconds": 60, **kw}},
     )
 
@@ -792,12 +819,14 @@ def test_cluster_snapshot_is_created_tagged_polled_and_recorded(aws, monkeypatch
     tags = {t["Key"]: t["Value"] for t in create["Tags"]}
     assert tags["dms-orch:project"] == "ledger" and tags["dms-orch:task"] == "core"
     assert tags["dms-orch:run"] == SNAP_RUN
-    assert [c["RoleArn"] for c in sts.calls] == [LEDGER_ROLE]  # acts as the project job role
-    manifest = json.loads(s3.get_object(Bucket=BUCKET, Key=f"runs/{SNAP_RUN}/dump.json")["Body"].read())
+    assert {c["RoleArn"] for c in sts.calls} == {LEDGER_ROLE}  # acts as the project job role (rds and s3)
+    # Under the job's own prefix: the project job role writes only runs/<project>/*/jobs/*.
+    manifest_key = f"runs/ledger/{SNAP_RUN}/jobs/dump/00-snapshot-target/dump.json"
+    manifest = json.loads(s3.get_object(Bucket=BUCKET, Key=manifest_key)["Body"].read())
     assert manifest["method"] == "snapshot" and manifest["snapshotIdentifier"] == name
     assert manifest["clusterIdentifier"] == "target" and manifest["status"] == "available"
     assert out["summary"]["snapshotIdentifier"] == name
-    assert out["summary"]["manifestUri"] == f"s3://{BUCKET}/runs/{SNAP_RUN}/dump.json"
+    assert out["summary"]["manifestUri"] == f"s3://{BUCKET}/{manifest_key}"
     text = json.dumps(manifest).lower()
     assert "rds.amazonaws.com" not in text and "password" not in text and "secret" not in text
 

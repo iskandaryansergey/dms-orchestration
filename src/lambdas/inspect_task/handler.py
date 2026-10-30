@@ -36,6 +36,7 @@ from typing import Any
 from shared import aws, dms_outcome, log, preflight
 from shared.errors import DmsTaskNotFound, TaskConfigInvalid
 from shared.store import Store, registration_key
+from shared.store import run_prefix as store_run_prefix
 
 LOGGER = log.get_logger("inspect_task")
 MAX_TABLES_IN_PAYLOAD = 500
@@ -43,8 +44,8 @@ RESET_TABLES_FILE = "inspect/reset-tables.json"
 
 
 def run_prefix(ctx: dict[str, Any], run_id: str) -> str:
-    """S3 prefix of the run's artifacts (``ctx`` for a per-project layout)."""
-    return f"runs/{run_id}"
+    """S3 prefix of the run's artifacts: ``runs/<project>/<runId>``."""
+    return store_run_prefix(ctx.get("project"), run_id)
 
 
 def reset_tables_key(prefix: str) -> str:

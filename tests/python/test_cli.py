@@ -259,14 +259,33 @@ def test_stop_with_task():
     assert sfn.stopped[0]["error"] == "StoppedByOperator" and sfn.stopped[0]["cause"] == "window"
 
 
-def test_report_reads_markdown():
-    class S3:
-        def get_object(self, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
-            assert (Bucket, Key) == ("b", "runs/r1/report.md")
-            return {"Body": io.BytesIO(b"# report")}
+class ReportS3:
+    def __init__(self, key: str) -> None:
+        self.key = key
 
-    code, out = run(["--bucket", "b", "report", "r1"], s3=S3())
+    def get_object(self, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
+        assert (Bucket, Key) == ("b", self.key)
+        return {"Body": io.BytesIO(b"# report")}
+
+
+def test_report_reads_markdown_under_the_project_of_the_run():
+    code, out = run(["--bucket", "b", "report", "r1", "--project", "ledger"], s3=ReportS3("runs/ledger/r1/report.md"))
     assert code == 0 and out.strip() == "# report"
+
+
+def test_report_takes_the_project_from_the_run_item():
+    ddb = FakeDdb({"project": {"S": "cards"}})
+    code, out = run(
+        ["--bucket", "b", "--table", "t", "report", "r1", "--format", "json"],
+        s3=ReportS3("runs/cards/r1/report.json"),
+        dynamodb=ddb,
+    )
+    assert code == 0 and out.strip() == "# report"
+
+
+def test_report_needs_the_project_or_the_table():
+    with pytest.raises(SystemExit, match="--project"):
+        run(["--bucket", "b", "report", "r1"], s3=ReportS3("unused"))
 
 
 def test_list_queries_project_history():

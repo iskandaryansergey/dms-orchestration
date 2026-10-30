@@ -23,7 +23,7 @@ import json
 from typing import Any
 
 from shared import aws, dms_outcome, log
-from shared.store import Store, now_iso, registration_key
+from shared.store import Store, now_iso, registration_key, run_prefix
 
 LOGGER = log.get_logger("write_report")
 TEXT_LIMIT = 300
@@ -299,7 +299,7 @@ def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
     except Exception as err:  # noqa: BLE001 - the run still reports and unlocks
         report["notes"].append(f"baseline not recorded: {err}")
     bucket = aws.env("ARTIFACTS_BUCKET")
-    prefix = f"runs/{report['runId']}"
+    prefix = run_prefix(report.get("project"), report["runId"])
     s3 = aws.client("s3")
     s3.put_object(
         Bucket=bucket,

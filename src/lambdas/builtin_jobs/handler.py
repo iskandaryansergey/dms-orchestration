@@ -94,6 +94,16 @@ def quote_table(qualified: str) -> str:
     return f"{quote_ident(schema)}.{quote_ident(table)}" if table else quote_ident(schema)
 
 
+def artifacts_s3(spec: dict[str, Any]) -> Any:
+    """S3 for the job's artifacts, acting as the project's job role.
+
+    The shared lambda-jobs role has no access to ``runs/``; the job role writes only
+    ``runs/<its project>/*/jobs/*`` (review finding 1).
+    """
+    session = f"{spec.get('runId', 'run')}-{spec.get('name', 'job')}"
+    return aws.job_client("s3", spec.get("jobRoleArn"), session_name=session)
+
+
 class DataApi:
     """Thin wrapper over rds-data ExecuteStatement returning rows as dicts."""
 
@@ -316,7 +326,7 @@ def dms_dump(spec: dict[str, Any]) -> dict[str, Any]:
     }
     bucket, _, prefix = spec["artifactsS3Prefix"].removeprefix("s3://").partition("/")
     key = f"{prefix}dms-dump.json"
-    aws.client("s3").put_object(Bucket=bucket, Key=key, Body=json.dumps(dump, default=str, indent=2).encode())
+    artifacts_s3(spec).put_object(Bucket=bucket, Key=key, Body=json.dumps(dump, default=str, indent=2).encode())
     return {
         "status": "ok",
         "message": "DMS diagnostics collected",
@@ -370,7 +380,7 @@ def target_verify(spec: dict[str, Any]) -> dict[str, Any]:
     fp, database_bytes = fingerprint.build(tgt.query, rules, max_exact=max_exact, source_query=source_query)
     bucket, _, prefix = spec["artifactsS3Prefix"].removeprefix("s3://").partition("/")
     key = f"{prefix}target-fingerprint.json"
-    aws.client("s3").put_object(
+    artifacts_s3(spec).put_object(
         Bucket=bucket, Key=key, Body=json.dumps(fp, indent=2).encode(), ContentType="application/json"
     )
     uri = f"s3://{bucket}/{key}"
@@ -444,7 +454,7 @@ def cluster_snapshot(spec: dict[str, Any]) -> dict[str, Any]:
     create, describe and delete only snapshots with the project tag. Idempotent: a retry
     finds the run's snapshot by its tag and goes on polling. One Lambda polls at most
     ``with.waitSeconds``; still ``creating`` then is a failure the job-runner retries.
-    When available, ``runs/<runId>/dump.json`` records it (no host, no secret).
+    When available, ``dump.json`` next to the job result records it (no host, no secret).
     """
     w = spec.get("with") or {}
     ctx = spec.get("ctx") or {}
@@ -500,9 +510,9 @@ def cluster_snapshot(spec: dict[str, Any]) -> dict[str, Any]:
         "taskKey": task_key,
         "restore": "a new cluster from this snapshot, by the database team (RUNBOOK)",
     }
-    bucket = spec["artifactsS3Prefix"].removeprefix("s3://").partition("/")[0]
-    key = f"runs/{run_id}/dump.json"
-    aws.client("s3").put_object(
+    bucket, _, prefix = spec["artifactsS3Prefix"].removeprefix("s3://").partition("/")
+    key = f"{prefix}dump.json"
+    artifacts_s3(spec).put_object(
         Bucket=bucket,
         Key=key,
         Body=json.dumps(manifest, indent=2, default=str).encode(),

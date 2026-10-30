@@ -71,7 +71,8 @@ resource "aws_dynamodb_table" "this" {
 }
 
 ############################################
-# S3 — job sets (jobs/<project>/<version>/) and run artifacts (runs/<runId>/)
+# S3 — job sets (jobs/<project>/<version>/) and run artifacts (runs/<project>/<runId>/); versioned:
+# post loads context.json by the version migrate recorded
 ############################################
 
 resource "aws_s3_bucket" "artifacts" {
