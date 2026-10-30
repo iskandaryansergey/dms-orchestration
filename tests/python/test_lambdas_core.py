@@ -630,20 +630,62 @@ def test_resolve_context_post_mode_without_saved_context_fails(env):
         )
 
 
-def test_resolve_context_returns_the_attempt_of_a_chained_resume(env):
+CHAINED = {
+    "project": "ledger",
+    "taskKey": "core",
+    "operation": "resume",
+    "attempt": 2,
+    "parentRunId": "run-1",
+    "parentStartedAt": "2026-10-28T10:00:00.000Z",
+}
+
+
+def test_resolve_context_returns_the_attempt_of_a_chained_resume(env, store):
     from lambdas.resolve_context.handler import handler
 
-    req = {
-        "project": "ledger",
-        "taskKey": "core",
-        "operation": "resume",
-        "attempt": 2,
-        "parentRunId": "run-1",
-        "parentStartedAt": "2026-10-28T10:00:00.000Z",
-    }
-    out = handler({"request": req, "execution": {**EXECUTION, "name": "run-1-r2"}})
+    store.put_run("run-1", {"project": "ledger", "resumeChildRunId": "run-1-r2"})
+    out = handler({"request": dict(CHAINED), "execution": {**EXECUTION, "name": "run-1-r2"}})
     assert out["attempt"] == 2 and out["request"]["parentRunId"] == "run-1"
-    assert handler({"request": {"project": "ledger", "taskKey": "core"}, "execution": EXECUTION})["attempt"] == 1
+    assert out["ctx"]["chain"] == {"dumped": False, "dumpUri": None}
+    first = handler({"request": {"project": "ledger", "taskKey": "core"}, "execution": EXECUTION})
+    assert first["attempt"] == 1 and first["ctx"]["chain"] == {"dumped": False, "dumpUri": None}
+
+
+@pytest.mark.parametrize(
+    ("parent", "fields"),
+    [
+        (None, {"attempt": 2, "parentRunId": "run-1"}),
+        ({"project": "ledger"}, {"attempt": 2, "parentRunId": "run-1"}),
+        ({"project": "ledger", "resumeChildRunId": "run-1-r9"}, {"attempt": 2, "parentRunId": "run-1"}),
+        ({"project": "ledger", "resumeChildRunId": "run-1-r2"}, {"attempt": 2}),
+        ({"project": "ledger", "resumeChildRunId": "run-1-r2"}, {"parentRunId": "run-1"}),
+        ({"project": "ledger", "resumeChildRunId": "run-1-r2"}, {"parentStartedAt": "2026-10-28T10:00:00.000Z"}),
+        ({"project": "other", "resumeChildRunId": "run-1-r2"}, {"attempt": 2, "parentRunId": "run-1"}),
+    ],
+)
+def test_resolve_context_rejects_chain_fields_post_did_not_hand_over(env, store, parent, fields):
+    """Review finding 5: attempt / parentRunId from an operator skipped the pre-jobs and the dump.
+    They are accepted only for the execution post named on the parent run (HandOverLock)."""
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import InvalidRunRequest
+
+    if parent:
+        store.put_run("run-1", parent)
+    req = {"project": "ledger", "taskKey": "core", "operation": "resume", **fields}
+    with pytest.raises(InvalidRunRequest):
+        handler({"request": req, "execution": {**EXECUTION, "name": "run-1-r2"}})
+    assert store.get_run("run-1-r2") is None
+
+
+def test_resolve_context_carries_the_dump_of_the_chain(env, store):
+    from lambdas.resolve_context.handler import handler
+
+    dump = "s3://b/dumps/ledger/core/t-run-1/"
+    store.put_run("run-1", {"project": "ledger", "resumeChildRunId": "run-1-r2", "chainDumped": True, "dumpUri": dump})
+    out = handler({"request": dict(CHAINED), "execution": {**EXECUTION, "name": "run-1-r2"}})
+    assert out["ctx"]["chain"] == {"dumped": True, "dumpUri": dump}
+    run = store.get_run("run-1-r2")
+    assert run["chainDumped"] is True and run["dumpUri"] == dump and run["parentRunId"] == "run-1"
 
 
 def _report(handler, status: str, notify: dict | None = None):
