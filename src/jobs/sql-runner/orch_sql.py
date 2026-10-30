@@ -4,6 +4,7 @@
     psql-run --connection target --file ddl/010_tables.sql [--file ...] [--single-transaction]
     psql-run --connection target --template reset/custom.sql --var schema=public
     psql-run --connection target --truncate "{{ ctx.resetTables }}" [--cascade]
+    psql-run --connection target --truncate-scope [--cascade]    # ctx.resetTables of the spec file
     psql-run --connection target --sql "ANALYZE"
 
 Connections come from ``ORCH_CONNECTIONS_FILE`` (written by orch_job.py, mode
@@ -161,6 +162,18 @@ def client_command(conn: dict[str, Any], engine: str, files: list[Path], on_erro
     return argv, env
 
 
+def scope_tables(spec: dict[str, Any]) -> list[str]:
+    """``ctx.resetTables`` of the spec file: the full list, also above the payload cap."""
+    ctx = spec.get("ctx") or {}
+    tables = ctx.get("resetTables") or []
+    if not isinstance(tables, list) or not all(isinstance(t, str) for t in tables):
+        raise SqlRunError("ctx.resetTables of the job spec is not a list of table names")
+    count = ctx.get("resetTablesCount")
+    if count is not None and int(count) != len(tables):
+        raise SqlRunError(f"{len(tables)} table(s) in the spec, the decision says {count}")
+    return tables
+
+
 def build_plan(args: argparse.Namespace, spec: dict[str, Any], engine: str, tmp: Path) -> list[tuple[str, Path]]:
     """List of (label, sql file) to run, rendering templates and generated SQL into tmp."""
     scope = {
@@ -187,8 +200,10 @@ def build_plan(args: argparse.Namespace, spec: dict[str, Any], engine: str, tmp:
         inline = tmp / "inline.sql"
         inline.write_text(args.sql.rstrip(";") + ";\n")
         plan.append(("--sql", inline))
-    if args.truncate is not None:
-        tables = [t.strip() for t in args.truncate.split(",") if t.strip()]
+    if args.truncate is not None or args.truncate_scope:
+        tables = (
+            scope_tables(spec) if args.truncate_scope else [t.strip() for t in args.truncate.split(",") if t.strip()]
+        )
         sql = truncate_sql(tables, engine, args.cascade)
         if sql:
             gen = tmp / "truncate.sql"
@@ -215,7 +230,11 @@ def main(argv: list[str] | None = None, runner: Any = subprocess.run) -> int:
     p.add_argument("--template", action="append", default=[])
     p.add_argument("--var", action="append", default=[])
     p.add_argument("--sql")
-    p.add_argument("--truncate", help="comma-separated schema.table list (may be empty)")
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument("--truncate", help="comma-separated schema.table list (may be empty)")
+    scope.add_argument(
+        "--truncate-scope", action="store_true", help="truncate ctx.resetTables of the job spec file (full list)"
+    )
     p.add_argument("--cascade", action="store_true", help="TRUNCATE ... CASCADE (PostgreSQL)")
     p.add_argument("--on-error", choices=["stop", "continue"], default="stop")
     p.add_argument("--single-transaction", action="store_true")
