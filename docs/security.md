@@ -36,6 +36,13 @@ The architecture stays on one page ([`architecture.md`](architecture.md)); the s
   uid, or `VOLUME` directories owned by 10001 if the platform copies them) — open with the
   platform team.
 * Isolated VPC: required endpoints are published in `network_contract`.
+* Run artifacts are per project: `runs/<project>/<runId>/` (`context.json`, `report.*`, `jobs/`).
+  A project's job role reads and writes only `runs/<project>/*/jobs/*`; the shared `ecs-job` and
+  `lambda-jobs` roles have no access to `runs/`. migrate records the S3 version of the
+  `context.json` it wrote on `RUN#` (`contextVersionId`) and post loads exactly that version under
+  the project recorded on `RUN#`, otherwise it fails with `ContextNotPinned`. This needs a
+  versioned artifacts bucket (the created bucket is; a caller-owned one must be): without a
+  version the run stops before DMS.
 
 ## Enforced by tests
 
@@ -58,6 +65,9 @@ runs the `.tftest.hcl` files with a mock provider; the Python tests run with mot
 | Jobs security group: no ingress; 443 egress only to the VPC CIDR and the gateway prefix lists | `defaults.tftest.hcl::lambda_and_events`, `validations.tftest.hcl::https_egress_to_the_internet`, `validations.tftest.hcl::https_egress_explicit_ranges` |
 | Customer managed KMS key on every store and the key policy requirements | `options.tftest.hcl::customer_managed_key` |
 | Target dumps: SSE-KMS only, expire after `dump_retention_days` | `defaults.tftest.hcl::dumps_are_kms_only_and_expire` |
+| Job roles reach only `runs/<project>/*/jobs/*`; `ecs-job` and `lambda-jobs` no run artifacts | `iam.tftest.hcl::per_project_job_roles`, `test_jobs_lambdas.py::test_builtin_jobs_write_artifacts_as_the_project_job_role` |
+| post loads only the `context.json` version migrate recorded on `RUN#`, under the project on `RUN#` | `test_lambdas_core.py::test_post_loads_the_pinned_version_not_a_later_overwrite`, `test_lambdas_core.py::test_post_refuses_a_context_without_a_recorded_version`, `test_asl.py::test_migrate_without_a_context_version_stops_before_dms` |
+| Operator: no job set uploads, reads only reports, writes only `LOCK#` items; job set publishing per project | `iam.tftest.hcl::operator_cannot_publish_job_sets` |
 | Restore baseline: written only in the `restore` phase, through `dynamodb:LeadingKeys` on `TARGET#` | `iam.tftest.hcl::least_privilege`, `test_jobs_lambdas.py::test_only_the_restore_phase_may_record_a_baseline` |
 | Job container: uid 10001, read-only root, the init container gets no input or secrets | `defaults.tftest.hcl::lambda_and_events` |
 
@@ -68,10 +78,11 @@ Projects trust the orchestrator, not each other.
 
 | Principal | Trusted with | Cannot |
 |---|---|---|
-| Operator role (`operator_policy_json`, CLI / CI of the workspace) | start/stop runs and upload job sets for **every** project of the environment | read secrets, change IAM |
-| Orchestration roles (migrate, post, job-runner, core and handoff Lambdas) | DMS describe; DMS start only for migrate on registered tasks; DynamoDB, run artifacts; StartExecution of post (handoff) or migrate (auto-resume) | read any database secret |
-| Job role `<name>-<env>-job-<project>` (one per project, `job_roles.tf`) | that project's secrets (`connections[*].secret_arn`), its Data API clusters, its job sets (`jobs/<project>/`), run specs/results (`runs/`) | read another project's secrets or job sets |
-| Shared `ecs-job` and `lambda-jobs` roles | DMS describe, run artifacts; `lambda-jobs` may assume project job roles and write `TARGET#` items (`dynamodb:LeadingKeys`, the restore baseline) | read secrets themselves; write any other DynamoDB item |
+| Operator role (`operator_policy_json`, CLI / CI of the workspace) | start/stop runs and restores for **every** project of the environment; read run reports; `LOCK#` items (`dynamodb:LeadingKeys`) | read secrets, upload job sets, change IAM |
+| Job set publisher (`jobset_publisher_policy_json[<project>]`, one per project) | write and list that project's job set prefixes (`jobs/<project>/`) | another project's job sets; run artifacts; secrets |
+| Orchestration roles (migrate, post, job-runner, core and handoff Lambdas) | DMS describe; DMS start only for migrate on registered tasks; DynamoDB, run artifacts (`runs/`); StartExecution of post (handoff) or migrate (auto-resume) | read any database secret |
+| Job role `<name>-<env>-job-<project>` (one per project, `job_roles.tf`) | that project's secrets (`connections[*].secret_arn`), its Data API clusters, its job sets (`jobs/<project>/`), its runs' job specs, results and artifacts (`runs/<project>/*/jobs/*`) | read another project's secrets, job sets or run artifacts; write `context.json` or reports |
+| Shared `ecs-job` and `lambda-jobs` roles | DMS describe; `ecs-job` (default task role, always overridden by the job role) reads job sets; `lambda-jobs` may assume project job roles and write `TARGET#` items (`dynamodb:LeadingKeys`, the restore baseline) | read secrets or run artifacts themselves; write any other DynamoDB item |
 
 How a job gets its project role:
 
@@ -89,6 +100,21 @@ pre-flight accept the restored target, not fake a promotable run.
 
 `job_secret_arns` stays the allow-list: every connection secret must be in it, and each
 project role receives only the subset its own connections use. Job-set *code* is
-uploaded by the operator; a project that needs its own upload boundary needs its own
-operator role (or its own module instance).
+uploaded by whoever holds that project's `jobset_publisher_policy_json`; the operator role
+cannot upload it.
+
+Residual risk, stated plainly:
+
+* Job-set code runs with the project's job role and therefore can read that project's secrets.
+  Whoever can publish a project's job sets can, in effect, read its secrets; attach the
+  publisher policy only to principals trusted with them. Job sets are not yet pinned by hash
+  (a later change), so a publisher can also replace a version that a run will load.
+* The operator role still starts runs and restores for every project of the environment and
+  can read every project's run report (`runs/*/report.*`; IAM `*` also matches a job artifact
+  named `report.json` under `jobs/`). Reports carry job summaries; a job output that prints a
+  secret reaches them until job output is kept out of results (a later change). A project that
+  needs its own run boundary needs its own operator role per module instance.
+* A project's job can overwrite its own run's job results and artifacts (`runs/<project>/*/jobs/*`),
+  so results of one project's jobs are only as trustworthy as that project's job sets. It cannot
+  reach `context.json` or reports, and post reads `context.json` by its pinned version.
 

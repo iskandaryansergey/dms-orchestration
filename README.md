@@ -78,7 +78,7 @@ Every input and output: [docs/configuration.md](docs/configuration.md). Outside 
 pass `sns_topic_arn`, `table_name` and `artifacts_bucket_name` from a long-lived workspace
 (RUNBOOK §9–10). The module creates no VPC endpoints, KMS key policies or operator roles; it
 publishes what they must allow (`network_contract`, `kms_key_policy_requirements`,
-`operator_policy_json`).
+`operator_policy_json`, `jobset_publisher_policy_json`).
 
 ## Run a migration
 

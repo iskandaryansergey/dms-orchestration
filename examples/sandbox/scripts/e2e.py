@@ -254,7 +254,7 @@ def s1iam() -> bool:
     reg = json.loads(ssm.get_parameter(Name=f"{OUT['ssm_prefix']}/ledger/core")["Parameter"]["Value"])
     iam_conn = (reg.get("connections") or {}).get("target_iam") or {}
     s3 = boto3.client("s3", region_name=OUT["region"])
-    listed = s3.list_objects_v2(Bucket=OUT["artifacts_bucket"], Prefix=f"runs/{run['runId']}/jobs/post/")
+    listed = s3.list_objects_v2(Bucket=OUT["artifacts_bucket"], Prefix=f"runs/ledger/{run['runId']}/jobs/post/")
     spec_key = next((o["Key"] for o in listed.get("Contents") or [] if o["Key"].endswith("iam-target/spec.json")), "")
     spec_text = s3.get_object(Bucket=OUT["artifacts_bucket"], Key=spec_key)["Body"].read().decode() if spec_key else ""
     c = counts()
@@ -487,7 +487,7 @@ def s6() -> bool:
 
 def report(run_id: str) -> dict[str, Any]:
     body = boto3.client("s3", region_name=OUT["region"]).get_object(
-        Bucket=OUT["artifacts_bucket"], Key=f"runs/{run_id}/report.json"
+        Bucket=OUT["artifacts_bucket"], Key=f"runs/ledger/{run_id}/report.json"
     )["Body"]
     return json.loads(body.read())
 
@@ -769,7 +769,8 @@ def s10snap() -> bool:
     """Dump by cluster snapshot: a reload-target with reset and
     dump.method = snapshot. The snapshot of the target cluster is available before the reset,
     named <project>-<taskKey>-<ts> (no host), tagged with project, task and run, recorded in
-    runs/<runId>/dump.json; the post job snapshot-retention keeps it (younger than the retention).
+    runs/<project>/<runId>/jobs/dump/00-snapshot-target/dump.json; the post job
+    snapshot-retention keeps it (younger than the retention).
     Needs snapshot_dumps = true. The snapshot is deleted at the end: it would outlive destroy."""
     rds = boto3.client("rds", region_name=OUT["region"])
     s3 = boto3.client("s3", region_name=OUT["region"])
@@ -784,7 +785,9 @@ def s10snap() -> bool:
     j = jobs(run["runId"])
     try:
         manifest = json.loads(
-            s3.get_object(Bucket=OUT["artifacts_bucket"], Key=f"runs/{run['runId']}/dump.json")["Body"].read()
+            s3.get_object(
+                Bucket=OUT["artifacts_bucket"], Key=f"runs/ledger/{run['runId']}/jobs/dump/00-snapshot-target/dump.json"
+            )["Body"].read()
         )
     except s3.exceptions.NoSuchKey:
         manifest = {}

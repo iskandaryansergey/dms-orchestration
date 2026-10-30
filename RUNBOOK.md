@@ -26,7 +26,8 @@ apply, a slow destroy): [docs/troubleshooting.md](docs/troubleshooting.md).
    and fails the run before DMS starts if a test fails (`with: { test: false }` turns
    that off; a dry run only reports `wouldTest`). Put it first in `pre` of every job set.
    The upstream dms module does not test connections.
-3. The job set version is uploaded: `scripts/sync-jobs.sh <project> <version> <dir>`.
+3. The job set version is uploaded: `scripts/sync-jobs.sh <project> <version> <dir>` (by a
+   principal with that project's `jobset_publisher_policy_json`, not the operator role).
 4. Check what the run will do:
    ```bash
    python scripts/orch.py start --project ledger --task core --operation plan --wait
@@ -52,7 +53,7 @@ python scripts/orch.py list --project ledger    # recent runs
 Notifications go to the SNS topic: `SUCCEEDED`, `FAILED`, `REJECTED`, `RunAborted` from the
 safety net, and `STARTED` only with `notify.onStart`. Between the two executions (DMS running)
 the run item says `status=STARTED, phase=dms`. The report is in
-`s3://<bucket>/runs/<runId>/report.md|json`. The Step Functions console shows each
+`s3://<bucket>/runs/<project>/<runId>/report.md|json` (`orch.py report <runId> --project <p>`). The Step Functions console shows each
 state; jobs are nested `job-runner` executions.
 
 A run against an auto-paused Aurora Serverless v2 cluster starts slower: §15.
@@ -68,6 +69,7 @@ A run against an auto-paused Aurora Serverless v2 cluster starts slower: §15.
 | `SUCCEEDED`, `DRY_RUN` | rehearsal only (migrate hands the dry run to post without DMS) | — |
 | post `RESUMED` | transient DMS failure; a new migrate `<runId>-r<n>` resumes the task with the lock handed over | follow it: `orch.py status <runId>-r<n>` |
 | `FAILED` `MigrationAlreadyArmed` | a previous run still waits for its DMS event (`MIGRATION#` item) | `sandbox.py migration` / §6; normally the watchdog hands it to post within 5 min |
+| `FAILED` `ContextNotPinned` | migrate: the artifacts bucket returned no object version for `context.json`, DMS was not started. post: `RUN#` has no `contextVersionId` or that version is gone (e.g. a run saved before this check) | enable versioning on the artifacts bucket and rerun; post does not load an unpinned context |
 | `FAILED` `DmsStartRejected` | the start answered InvalidResourceState and the task never moved | read the DMS text in the report; fix the task state; rerun |
 | `MANUAL` `RestoredTarget` | the target was restored from a dump (`orch.py restore`) and DMS still reports loaded tables: a resume would skip them | `--allow-reset` (full `reload-target`), see section 11 |
 | `MANUAL` `TargetChanged` | the target differs from the baseline of the last run (diff in the report: extra / changed / rowsChanged) | find who changed it; undo, or run again with `--allow-reset` (truncates the scope, `reload-target`) |
@@ -217,10 +219,10 @@ refused before anything runs. The job `snapshot-target` creates a cluster snapsh
 cluster named `<project>-<taskKey>-<YYYYMMDD-HHMMSS>`, tagged `dms-orch:project`,
 `dms-orch:task`, `dms-orch:run`, and waits until it is `available` (up to ~30 min in three
 attempts); a failed or unfinished snapshot stops the run before anything is truncated.
-`runs/<runId>/dump.json` names it:
+`dump.json` next to the job result names it (the job's `manifestUri`):
 
 ```bash
-aws s3 cp s3://<bucket>/runs/<runId>/dump.json -
+aws s3 cp s3://<bucket>/runs/<project>/<runId>/jobs/dump/00-snapshot-target/dump.json -
 aws rds describe-db-cluster-snapshots --db-cluster-snapshot-identifier <snapshotIdentifier>
 ```
 

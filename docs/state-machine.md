@@ -36,7 +36,11 @@ ReadMigration (getItem MIGRATION#, consistent) ─► ArmGuard ── armed / cl
   │      ── nothing above truncates the target; a refusal above leaves it as it was ──
 CheckReset ── decision.reset ──► DumpJobs (Map; when dump is on) ─► ResetJobs (Map) ──error──► ClassifyFailure
   │
-PrepareStart (startedAt = now) ─► SaveContext (runs/<runId>/context.json for post)
+PrepareStart (startedAt = now) ─► SaveContext (runs/<project>/<runId>/context.json for post)
+  │
+CheckContextVersion ── no VersionId ──► ClassifyFailure (ContextNotPinned: the bucket must be versioned)
+  │
+RecordContextVersion (RUN#.contextVersionId: post loads only this version)
   │
 CheckDryRun ── dryRun ──► StartPostDryRun (post runs its jobs in dry mode) ─► Started
   │
