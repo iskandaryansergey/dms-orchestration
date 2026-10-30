@@ -4,7 +4,7 @@
     orch.py start  --project ledger --task core [--dry-run] [--operation plan] [--allow-reset] [--wait]
     orch.py status <runId | executionArn>
     orch.py stop   <runId | executionArn> [--stop-task] [--reason "..."]
-    orch.py report <runId | executionArn> [--format md|json]
+    orch.py report <runId | executionArn> [--format md|json] [--project ledger]
     orch.py list   --project ledger [--limit 20]
     orch.py gate   <runId>        # exit 0 only if the run may be promoted (ADR 0006)
     orch.py post   <runId> [--from-job <name>]   # repeat post; jobs already ok before it are skipped
@@ -274,7 +274,20 @@ def cmd_stop(args: argparse.Namespace, c: Clients, out: Any) -> int:
 def cmd_report(args: argparse.Namespace, c: Clients, out: Any) -> int:
     if not args.bucket:
         raise SystemExit("--bucket (or ORCH_BUCKET) is required")
-    key = f"runs/{run_id_of(args.run)}/report.{'md' if args.format == 'md' else 'json'}"
+    run_id = run_id_of(args.run)
+    project = args.project
+    if not project and args.table:
+        item = (
+            c.get("dynamodb")
+            .get_item(TableName=args.table, Key={"pk": {"S": f"RUN#{run_id}"}, "sk": {"S": "META"}})
+            .get("Item")
+        )
+        project = _attr(item or {}, "project")
+    if not project:
+        raise SystemExit(
+            "--project (or --table to read it from the run) is required: reports are under runs/<project>/"
+        )
+    key = f"runs/{project}/{run_id}/report.{'md' if args.format == 'md' else 'json'}"
     body = c.get("s3").get_object(Bucket=args.bucket, Key=key)["Body"].read().decode()
     print(body, file=out)
     return 0
@@ -526,6 +539,7 @@ def parser() -> argparse.ArgumentParser:
         sp.add_argument("run", help="runId or executionArn")
         if name == "report":
             sp.add_argument("--format", choices=["md", "json"], default="md")
+            sp.add_argument("--project", help="project of the run (default: read from the run item with --table)")
         sp.set_defaults(func=func)
 
     st = sub.add_parser("stop", help="stop a run (and optionally the DMS task)")

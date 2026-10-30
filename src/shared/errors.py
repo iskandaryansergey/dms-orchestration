@@ -40,3 +40,7 @@ class TaskConfigInvalid(OrchestratorError):  # noqa: N818
 
 class RunAlreadyActive(OrchestratorError):  # noqa: N818
     """Another run (or the same run's post) holds the task lock."""
+
+
+class ContextNotPinned(OrchestratorError):  # noqa: N818
+    """post found no context.json version recorded by migrate (RUN# contextVersionId), or not that version."""

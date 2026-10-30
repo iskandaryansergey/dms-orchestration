@@ -61,6 +61,8 @@ def env(table, monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "test")
     s3 = boto3.client("s3", region_name="eu-west-2")
     s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
+    # post reads context.json by the version migrate recorded: the bucket is versioned.
+    s3.put_bucket_versioning(Bucket=BUCKET, VersioningConfiguration={"Status": "Enabled"})
     s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/jobset.json", Body=json.dumps(JOBSET).encode())
     ssm = boto3.client("ssm", region_name="eu-west-2")
     ssm.put_parameter(Name="/dms-orch/test/ledger/core", Type="String", Value=json.dumps(REGISTRATION))
@@ -334,10 +336,10 @@ def test_write_report_puts_json_and_markdown(env, store):
             "attempt": 1,
         }
     )
-    assert out["reportS3Uri"] == f"s3://{BUCKET}/runs/run-1/report.json" and out["notify"] is True
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-1/report.json")["Body"].read())
+    assert out["reportS3Uri"] == f"s3://{BUCKET}/runs/ledger/run-1/report.json" and out["notify"] is True
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-1/report.json")["Body"].read())
     assert report["outcome"] == "COMPLETED" and report["tables"][0]["fullLoadRows"] == 10
-    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-1/report.md")["Body"].read().decode()
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-1/report.md")["Body"].read().decode()
     assert "| public.a | Table completed | 10 | 0 |" in md
     assert store.get_run("run-1")["status"] == "SUCCEEDED"
     assert json.loads(out["message"])["status"] == "SUCCEEDED"
@@ -360,7 +362,7 @@ def test_write_report_failure_contains_classification_and_respects_notify(env, s
         }
     )
     assert out["notify"] is False and "FAILED" in out["subject"]
-    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-2/report.md")["Body"].read().decode()
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-2/report.md")["Body"].read().decode()
     assert "`PERMISSIONS`" in md
 
 
@@ -482,15 +484,83 @@ SAVED_CONTEXT = {
 }
 
 
+def _pin_context(env, body: bytes, run_id: str = "run-1", project: str = "ledger") -> str:
+    """What migrate does: SaveContext (versioned bucket), then RecordContextVersion on RUN#."""
+    from shared.store import Store
+
+    key = f"runs/{project}/{run_id}/context.json"
+    version = env["s3"].put_object(Bucket=BUCKET, Key=key, Body=body)["VersionId"]
+    Store(env["table"]).update_run(run_id, {"project": project, "contextVersionId": version})
+    return version
+
+
 def _save_context(env) -> None:
-    env["s3"].put_object(Bucket=BUCKET, Key="runs/run-1/context.json", Body=json.dumps(SAVED_CONTEXT).encode())
+    _pin_context(env, json.dumps(SAVED_CONTEXT).encode())
+
+
+def test_context_key_is_per_project():
+    from lambdas.resolve_context.handler import context_key
+
+    assert context_key("ledger", "run-1") == "runs/ledger/run-1/context.json"
+
+
+def _post_event(run_id: str = "run-1") -> dict[str, Any]:
+    outcome = {"kind": "SUCCESS", "outcome": "COMPLETED", "error": None, "cause": "full load finished", "task": {}}
+    return {
+        "mode": "post",
+        "input": {"runId": run_id, "taskArn": TASK_ARN, "outcome": outcome, "startedBy": "event-handler"},
+        "execution": POST_EXECUTION,
+    }
+
+
+def test_post_loads_the_pinned_version_not_a_later_overwrite(env, store):
+    """Review finding 1: whatever writes context.json after migrate, post reads the version migrate recorded."""
+    from lambdas.resolve_context.handler import handler
+
+    _save_context(env)
+    forged = {**SAVED_CONTEXT, "request": {**SAVED_CONTEXT["request"], "operation": "forged"}}
+    env["s3"].put_object(Bucket=BUCKET, Key="runs/ledger/run-1/context.json", Body=json.dumps(forged).encode())
+    assert handler(_post_event())["request"] == SAVED_CONTEXT["request"]
+
+
+def test_post_refuses_a_context_without_a_recorded_version(env, store):
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import ContextNotPinned
+
+    env["s3"].put_object(Bucket=BUCKET, Key="runs/ledger/run-1/context.json", Body=json.dumps(SAVED_CONTEXT).encode())
+    store.put_run("run-1", {"project": "ledger", "status": "STARTED"})
+    with pytest.raises(ContextNotPinned, match="contextVersionId"):
+        handler(_post_event())
+
+
+def test_post_refuses_a_recorded_version_that_does_not_exist(env, store):
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import ContextNotPinned
+
+    _save_context(env)
+    store.update_run("run-1", {"contextVersionId": "not-a-version"})
+    with pytest.raises(ContextNotPinned):
+        handler(_post_event())
+
+
+def test_post_reads_the_context_of_the_project_recorded_on_the_run(env, store):
+    """The project comes from RUN#, not from the post input: another project's prefix is never read."""
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import ContextNotPinned
+
+    _pin_context(env, json.dumps(SAVED_CONTEXT).encode(), project="cards")
+    out = handler(_post_event())
+    assert out["runId"] == "run-1"
+    store.update_run("run-1", {"project": "ledger"})
+    with pytest.raises(ContextNotPinned):
+        handler(_post_event())
 
 
 def test_resolve_context_post_mode_loads_the_saved_run_and_the_success(env, store):
     from lambdas.resolve_context.handler import handler
 
-    _save_context(env)
     store.put_run("run-1", {"project": "ledger", "status": "STARTED", "executionArn": EXEC_ARN})
+    _save_context(env)
     outcome = {"kind": "SUCCESS", "outcome": "COMPLETED", "error": None, "cause": "full load finished", "task": {}}
     event = {
         "mode": "post",
@@ -519,7 +589,7 @@ def test_resolve_context_post_mode_reads_a_context_saved_as_a_json_string(env, s
     from lambdas.resolve_context.handler import handler
 
     body = json.dumps(json.dumps(SAVED_CONTEXT)).encode()
-    env["s3"].put_object(Bucket=BUCKET, Key="runs/run-1/context.json", Body=body)
+    _pin_context(env, body)
     outcome = {"kind": "SUCCESS", "outcome": "COMPLETED", "error": None, "cause": "full load finished", "task": {}}
     event = {
         "mode": "post",
@@ -608,7 +678,7 @@ def test_write_report_resumed_is_quiet_and_lists_both_executions(env, store):
     use(dms=FakeDms(FINISHED))
     out = _report(handler, "RESUMED", {"onSuccess": True, "onFailure": True})
     assert out["notify"] is False
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-1/report.json")["Body"].read())
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-1/report.json")["Body"].read())
     assert report["executions"] == {"migrate": EXEC_ARN, "post": post_arn}
     assert store.get_run("run-1")["phase"] == "done"
 
@@ -805,9 +875,9 @@ def test_write_report_manual_is_notified_as_high_with_the_diff(env, store):
     assert out["notify"] is True and "MANUAL" in out["subject"]
     msg = json.loads(out["message"])
     assert msg["severity"] == "high" and msg["verdict"] == "manual" and msg["status"] == "MANUAL"
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-m/report.json")["Body"].read())
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-m/report.json")["Body"].read())
     assert report["preflight"]["diff"]["extra"] == ["app.junk"]
-    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-m/report.md")["Body"].read().decode()
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-m/report.md")["Body"].read().decode()
     assert "## Pre-flight" in md and "app.junk" in md and "app.tx" in md
 
 
@@ -846,7 +916,7 @@ def test_write_report_records_the_baseline_and_the_table_copy_at_the_end_of_post
         "app.a": "Table completed",
         "app.b": "Table error",
     }
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-b/report.json")["Body"].read())
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-b/report.json")["Body"].read())
     assert report["baseline"]["fingerprintHash"] == "sha256:abc" and json.loads(out["message"])["severity"] == "high"
 
 
@@ -889,7 +959,7 @@ def test_write_report_baseline_mode_records_without_writing_a_report(env, store)
     assert out["recorded"]["fingerprintHash"] == "sha256:r"
     assert store.get_target_baseline("ledger/core")["runId"] == "run-r"
     assert [t["table"] for t in store.get_table_states("ledger/core")] == ["app.a"]
-    keys = env["s3"].list_objects_v2(Bucket=BUCKET, Prefix="runs/run-r/").get("KeyCount", 0)
+    keys = env["s3"].list_objects_v2(Bucket=BUCKET, Prefix="runs/ledger/run-r/").get("KeyCount", 0)
     assert keys == 0
 
 
@@ -1159,7 +1229,7 @@ def _save_repeat_context(env) -> None:
         "inspect": {"state": "fresh", "completionSpec": {"mode": "task-stopped"}},
         "startedAt": "2026-10-27T10:00:00Z",  # before FINISHED stopped
     }
-    env["s3"].put_object(Bucket=BUCKET, Key="runs/run-1/context.json", Body=json.dumps(saved).encode())
+    _pin_context(env, json.dumps(saved).encode())
 
 
 def _job(table, name: str, index: int, status: str) -> None:
@@ -1295,8 +1365,8 @@ def test_write_report_advises_the_snapshot_method_above_the_threshold(env, store
             "attempt": 1,
         }
     )
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-adv/report.json")["Body"].read())
-    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-adv/report.md")["Body"].read().decode()
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-adv/report.json")["Body"].read())
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-adv/report.md")["Body"].read().decode()
     found = [a for a in report["advice"] if "dump.method=snapshot" in a]
     assert bool(found) is advised
     assert ("dump.method=snapshot" in md) is advised

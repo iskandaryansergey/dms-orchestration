@@ -5,14 +5,15 @@ Item layout (pk / sk):
 * ``LOCK#<taskArn>`` / ``LOCK`` — one active run per task (written by the state
   machine; ``gsi2pk = LOCK#ACTIVE`` lets the watchdog list locks). Held from migrate to the
   end of post; ``executionArn`` names the execution that owns it now.
-* ``RUN#<runId>`` / ``META`` — run metadata (``gsi1pk = PROJECT#<project>``).
+* ``RUN#<runId>`` / ``META`` — run metadata (``gsi1pk = PROJECT#<project>``); ``contextVersionId``
+  is the S3 version of ``context.json`` that migrate saved, the only one post loads.
 * ``RUN#<runId>`` / ``EVENT#<ts>#<seq>`` — timeline.
 * ``RUN#<runId>`` / ``JOB#<phase>#<nn>#<name>`` — job results.
 * ``MIGRATION#<taskArn>`` / ``ACTIVE`` — DMS was started by ``migrate`` and ``post`` has not
   started yet: ``status`` ``armed`` → ``claimed`` (one winner) → ``posted``
   (``gsi2pk = MIGRATION#ACTIVE`` until posted). ``post`` deletes it once it owns the lock.
 * ``TARGET#<project>/<taskKey>`` / ``BASELINE`` — fingerprint of the target after the last ``post``
-  (hash and S3 URI; the full JSON lives in ``runs/<runId>/target-fingerprint.json``).
+  (hash and S3 URI; the full JSON lives under ``runs/<project>/<runId>/jobs/``).
 * ``TABLE#<project>/<taskKey>`` / ``<schema>.<table>`` — our copy of ``DescribeTableStatistics``;
   outlives a DMS task that was destroyed and created again (keyed by the registration, not
   the task ARN: Terraform gives a recreated task a new ARN).
@@ -21,6 +22,7 @@ Item layout (pk / sk):
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from datetime import UTC, datetime
@@ -34,6 +36,9 @@ ACTIVE_LOCKS = "LOCK#ACTIVE"
 ACTIVE_MIGRATIONS = "MIGRATION#ACTIVE"
 EVENT_TTL_DAYS = 90
 EVENT_DETAIL_MAX = 4000
+# Project keys as validated by the module (variables.tf); anything else never names a prefix.
+PROJECT_KEY = re.compile(r"[a-z][a-z0-9-]{0,39}")
+UNREGISTERED_PROJECT = "_unregistered"
 
 
 def now_iso() -> str:
@@ -59,6 +64,17 @@ def target_baseline_key(task_id: str) -> dict[str, str]:
 
 def table_pk(task_id: str) -> str:
     return f"TABLE#{task_id}"
+
+
+def run_prefix(project: Any, run_id: str) -> str:
+    """S3 prefix of a run's artifacts: ``runs/<project>/<runId>`` (context, report, ``jobs/``).
+
+    Job roles may write only ``runs/<their project>/*/jobs/*``. A project that is not a
+    valid project key (a request rejected before it was resolved) gets a prefix no job
+    role can write.
+    """
+    p = project if isinstance(project, str) and PROJECT_KEY.fullmatch(project) else UNREGISTERED_PROJECT
+    return f"runs/{p}/{run_id}"
 
 
 def run_key(run_id: str) -> dict[str, str]:

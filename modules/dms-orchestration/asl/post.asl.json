@@ -6,7 +6,7 @@
   "States": {
     "LoadRun": {
       "Type": "Task",
-      "Comment": "The run migrate saved (runs/<runId>/context.json) plus the DMS outcome from the handoff.",
+      "Comment": "The run migrate saved (runs/<project>/<runId>/context.json, the version pinned on RUN#) plus the DMS outcome from the handoff.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Arguments": {
         "FunctionName": "${resolve_context_arn}",

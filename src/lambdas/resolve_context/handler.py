@@ -28,8 +28,8 @@ from typing import Any
 from botocore.exceptions import ClientError
 
 from shared import aws, jobset, log, validation
-from shared.errors import InvalidRunRequest, JobSetNotFound, RunAlreadyActive, UnknownTask
-from shared.store import Store, now_iso
+from shared.errors import ContextNotPinned, InvalidRunRequest, JobSetNotFound, RunAlreadyActive, UnknownTask
+from shared.store import Store, now_iso, run_prefix
 
 LOGGER = log.get_logger("resolve_context")
 DEFAULT_AUTO_RESUME_CATEGORIES = ["TRANSIENT_SOURCE_CONN", "TRANSIENT_TARGET_CONN", "DMS_RESTART"]
@@ -256,9 +256,49 @@ def build(request: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
     return {"runId": run_id, "request": req, "ctx": ctx, "attempt": int(req.get("attempt") or 1)}
 
 
-def context_key(run_id: str) -> str:
-    """Saved by migrate (``SaveContext``) for post: request, ctx, inspect, jobCtx, attempt, startedAt."""
-    return f"runs/{run_id}/context.json"
+def context_key(project: str, run_id: str) -> str:
+    """Saved by migrate (``SaveContext``) for post: request, ctx, inspect, jobCtx, attempt, startedAt.
+
+    migrate records the S3 version it wrote on ``RUN#`` (``RecordContextVersion``);
+    post loads exactly that version (:func:`load_saved_context`).
+    """
+    return f"{run_prefix(project, run_id)}/context.json"
+
+
+def load_saved_context(run_id: str) -> dict[str, Any]:
+    """The context.json version migrate recorded, under the project recorded on ``RUN#``.
+
+    Review finding 1: a later write to the key (by anything that can write the prefix)
+    is never read; neither is the prefix of a project named in the post input.
+    """
+    store = Store(aws.table())
+    run = store.get_run(run_id)
+    if not run:
+        raise InvalidRunRequest(f"no run {run_id}")
+    version = run.get("contextVersionId")
+    if not version or version == "null":
+        raise ContextNotPinned(
+            f"run {run_id} has no contextVersionId: migrate did not record the context it saved "
+            "(the artifacts bucket must be versioned)"
+        )
+    bucket = aws.env("ARTIFACTS_BUCKET")
+    key = context_key(run.get("project"), run_id)
+    try:
+        body = aws.client("s3").get_object(Bucket=bucket, Key=key, VersionId=str(version))["Body"].read()
+    except ClientError as err:
+        code = err.response.get("Error", {}).get("Code")
+        if code in ("NoSuchKey", "NoSuchVersion", "404", "400", "InvalidArgument", "AccessDenied"):
+            raise ContextNotPinned(
+                f"no saved context for run {run_id} at s3://{bucket}/{key} version {version} ({code})"
+            ) from err
+        raise
+    saved = json.loads(body)
+    if isinstance(saved, str):
+        # Written by an older migrate with a string Body, which the S3 integration encoded again.
+        saved = json.loads(saved)
+    if not isinstance(saved, dict) or saved.get("runId") != run_id:
+        raise ContextNotPinned(f"the saved context at s3://{bucket}/{key} is not the context of run {run_id}")
+    return saved
 
 
 def _outcome_fields(outcome: dict[str, Any], by: str) -> tuple[Any, Any]:
@@ -363,17 +403,7 @@ def load_post(event: dict[str, Any]) -> dict[str, Any]:
     run_id = str(data.get("runId") or "")
     if not run_id:
         raise InvalidRunRequest("post needs runId")
-    bucket = aws.env("ARTIFACTS_BUCKET")
-    try:
-        body = aws.client("s3").get_object(Bucket=bucket, Key=context_key(run_id))["Body"].read()
-    except ClientError as err:
-        if err.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "AccessDenied"):
-            raise InvalidRunRequest(f"no saved context for run {run_id} (s3://{bucket}/{context_key(run_id)})") from err
-        raise
-    saved = json.loads(body)
-    if isinstance(saved, str):
-        # Written by an older migrate with a string Body, which the S3 integration encoded again.
-        saved = json.loads(saved)
+    saved = load_saved_context(run_id)
     by = data.get("startedBy") or "unknown"
     if data.get("operation") == "post":
         return repeat_post(data, saved, execution, by)
