@@ -520,6 +520,14 @@ locals {
         Resource = ["${local.bucket_arn}/runs/*/report.json", "${local.bucket_arn}/runs/*/report.md"]
       },
       {
+        # The wildcard above also matches a report.json a job writes among its artifacts
+        # (runs/<project>/<runId>/jobs/...): what jobs write is never read back (review item N1).
+        Sid      = "NoJobArtifacts"
+        Effect   = "Deny"
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
+        Resource = ["${local.bucket_arn}/runs/*/jobs/*"]
+      },
+      {
         # orch.py dumps: manifests only; the dumps themselves are read by the project job role
         Sid      = "ReadDumpManifests"
         Effect   = "Allow"

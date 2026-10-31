@@ -353,9 +353,19 @@ run "operator_cannot_publish_job_sets" {
 
   assert {
     condition = alltrue(flatten([
-      for st in jsondecode(output.operator_policy_json).Statement : [for r in flatten([st.Resource]) : !strcontains(r, "/jobs/")]
+      for st in jsondecode(output.operator_policy_json).Statement : [for r in flatten([st.Resource]) : !strcontains(r, "/jobs/")] if st.Effect == "Allow"
     ]))
     error_message = "the operator policy does not reach job sets"
+  }
+
+  # Review item N1: a job may write a file named report.json among its artifacts
+  # (runs/<project>/<runId>/jobs/...); the ReadReports wildcard would match it.
+  assert {
+    condition = anytrue([
+      for st in jsondecode(output.operator_policy_json).Statement :
+      st.Effect == "Deny" && contains(flatten([st.Action]), "s3:GetObject") && contains(flatten([st.Resource]), "arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runs/*/jobs/*")
+    ])
+    error_message = "the operator cannot read what jobs write under runs/<project>/<runId>/jobs/"
   }
 
   assert {
@@ -554,6 +564,12 @@ run "resolve_context_knows_the_fargate_images" {
   assert {
     condition     = jsondecode(aws_lambda_function.this["resolve_context"].environment[0].variables.FARGATE_IMAGES) == ["sql-runner"]
     error_message = "resolve_context gets the image keys (no URIs needed)"
+  }
+
+  # Review item N1: prepare_job looks every job up again in the registration's pinned job set.
+  assert {
+    condition     = aws_lambda_function.this["prepare_job"].environment[0].variables.SSM_PREFIX == aws_lambda_function.this["resolve_context"].environment[0].variables.SSM_PREFIX
+    error_message = "prepare_job reads the task registration (SSM_PREFIX)"
   }
 }
 
