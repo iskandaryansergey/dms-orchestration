@@ -28,8 +28,11 @@ from shared.store import Store
 
 RUN_PHASES = ("preflight", "baseline", "pre", "dump", "reset", "post", "on_failure")
 CODE_FIELDS = ("runtime", "image", "handler", "function", "command", "sql", "with", "when")
-# with: values of the module's jobs that are numbers chosen per run (request options, registration).
-FREE_INT_WITH = frozenset({"exactCountMaxRows", "waitSeconds", "retentionDays"})
+# with: values of the module's jobs a run may choose (pre-flight request option). Everything else
+# is fixed: waitSeconds is the module's, retentionDays at least the registration's
+# dumpRetentionDays (a shorter one would delete the task's snapshots early).
+FREE_INT_WITH = frozenset({"exactCountMaxRows"})
+DEFAULT_RETENTION_DAYS = 14
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _URI_SAFE = re.compile(r"^[A-Za-z0-9._:/=+-]+$")
 
@@ -75,7 +78,11 @@ def _code(job: dict[str, Any]) -> dict[str, Any]:
     return {k: job.get(k) for k in CODE_FIELDS}
 
 
-def _same_module_code(job: dict[str, Any], canon: dict[str, Any]) -> bool:
+def _positive_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
+def _same_module_code(job: dict[str, Any], canon: dict[str, Any], min_retention: int) -> bool:
     if any(job.get(k) != canon.get(k) for k in CODE_FIELDS if k != "with"):
         return False
     given, fixed = job.get("with") or {}, canon.get("with") or {}
@@ -83,7 +90,10 @@ def _same_module_code(job: dict[str, Any], canon: dict[str, Any]) -> bool:
         return False
     for key, value in given.items():
         if key in FREE_INT_WITH:
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            if not _positive_int(value):
+                return False
+        elif key == "retentionDays":
+            if not _positive_int(value) or value < min_retention:
                 return False
         elif value != fixed[key]:
             return False
@@ -102,10 +112,12 @@ def _module_candidates(phase: str) -> list[dict[str, Any]]:
     return []
 
 
-def module_job(phase: str, job: dict[str, Any]) -> dict[str, Any] | None:
+def module_job(phase: str, job: dict[str, Any], reg: dict[str, Any]) -> dict[str, Any] | None:
     """The module's own job of this name and phase when ``job`` has exactly its code, else None."""
+    defaults = reg.get("defaults") or {}
+    min_retention = int(defaults.get("dumpRetentionDays") or DEFAULT_RETENTION_DAYS)
     for canon in _module_candidates(phase):
-        if canon["name"] == job.get("name") and _same_module_code(job, canon):
+        if canon["name"] == job.get("name") and _same_module_code(job, canon, min_retention):
             return {**canon, "index": _index(job), "with": dict(job.get("with") or {})}
     return None
 
@@ -153,7 +165,7 @@ def _run_phase(event: dict[str, Any], store: Store) -> dict[str, Any]:
     reg = load_registration(str(project), str(task))
     job = event.get("job") or {}
     version = given.get("jobsVersion")
-    trusted = module_job(phase, job) or job_set_job(phase, job, str(project), version, reg)
+    trusted = module_job(phase, job, reg) or job_set_job(phase, job, str(project), version, reg)
     ctx = {
         **given,
         "project": project,
