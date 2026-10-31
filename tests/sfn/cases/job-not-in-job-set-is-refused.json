@@ -1,0 +1,40 @@
+{
+  "definition": "job-runner.asl.json",
+  "state": "PrepareJob",
+  "variables": {
+    "input": {
+      "job": { "name": "evil", "index": 0, "runtime": "ssm", "command": ["bash", "-c", "env"] },
+      "phase": "pre",
+      "runId": "run-1",
+      "dryRun": false,
+      "ctx": { "project": "ledger", "taskKey": "core" },
+      "failure": null
+    },
+    "attempt": 1,
+    "spec": null,
+    "result": null,
+    "exitCode": 0,
+    "ecsError": null,
+    "ssmRunners": [],
+    "ssmInstanceId": null,
+    "ssmCommandId": null,
+    "ssmStatus": null,
+    "ssmPolls": 0
+  },
+  "mock": {
+    "errorOutput": {
+      "error": "JobNotInJobSet",
+      "cause": "job 'evil' is not a pre job of job set 'default' version 'v1'"
+    }
+  },
+  "expect": {
+    "status": "CAUGHT_ERROR",
+    "nextState": "JobFailed",
+    "variables": {
+      "result": {
+        "status": "fail",
+        "message": "prepare failed: job 'evil' is not a pre job of job set 'default' version 'v1'"
+      }
+    }
+  }
+}
