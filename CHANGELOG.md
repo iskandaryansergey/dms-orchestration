@@ -149,6 +149,9 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
 - `truncateScope` and `psql-run --truncate-scope` (PostgreSQL) skip tables missing on the target
   and name them (`skippedMissing`, a NOTICE): a reset list from the DMS statistics of an earlier
   run no longer fails on tables dropped since (941d281, 5a8c2ed).
+- A stopped task whose `StartDate` is after the start request stays pending while
+  `DescribeReplicationTasks` still shows the previous run's `StopDate`; a load longer than the
+  900 s grace no longer ends `DmsTaskNotStarted` on such a lag (3e79b81).
 - Sandbox: the SQL Lambda reaches S3 through the gateway endpoint (25af970); interface endpoint
   keys come from the sandbox variables, so `terraform validate` has no cycle (aa19e10); the task
   turned `fail_on_validation_errors` off for its table without a primary key (e53fcec), no longer
