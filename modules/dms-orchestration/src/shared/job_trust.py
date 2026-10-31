@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from shared import aws, jobset, module_jobs
+from shared import aws, jobset, module_jobs, preflight
 from shared.errors import JobNotInJobSet
 from shared.registry import load_jobs, load_registration
 from shared.store import Store
@@ -246,15 +246,31 @@ def _restore_job(job: dict[str, Any], project: str, task: str) -> dict[str, Any]
     raise _refuse(f"restore: job {job.get('name')!r} is not a restore job of the module")
 
 
-def _selection_rules(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list) or not all(
-        isinstance(r, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in r.items()) for r in value
-    ):
-        raise _refuse("restore: selectionRules must be a list of string maps")
-    return value
+def _task_selection_rules(task_arn: str) -> list[dict[str, str]]:
+    """The scope of the restore baseline: the DMS task's table mapping, never the caller's rules."""
+    tasks = (
+        aws.client("dms")
+        .describe_replication_tasks(Filters=[{"Name": "replication-task-arn", "Values": [task_arn]}])
+        .get("ReplicationTasks")
+        or []
+    )
+    if not tasks:
+        raise _refuse(f"restore: DMS task {task_arn} not found")
+    return preflight.selection_rules(tasks[0].get("TableMappings") or "{}")
 
 
-def _restore(event: dict[str, Any]) -> dict[str, Any]:
+def _hold_by_this_restore(store: Store, task_arn: str, run_id: str, execution_arn: Any) -> None:
+    """orch.py restore holds LOCK#<taskArn> with its restore id and the job-runner execution it
+    started (TaskLock): a restore started any other way, or while a run holds the lock, is refused."""
+    lock = store.get_lock(task_arn) or {}
+    if not execution_arn or lock.get("runId") != run_id or lock.get("executionArn") != execution_arn:
+        raise _refuse(
+            f"restore: the task lock of {task_arn} is not held by this restore execution "
+            f"(held by {lock.get('runId')!r}); restores run through orch.py restore"
+        )
+
+
+def _restore(event: dict[str, Any], store: Store) -> dict[str, Any]:
     run_id = str(event.get("runId") or "")
     if not run_id.startswith("restore-") or not _NAME.match(run_id):
         raise _refuse(f"restore: run id {run_id!r} is not a restore-… id (orch.py restore)")
@@ -263,6 +279,7 @@ def _restore(event: dict[str, Any]) -> dict[str, Any]:
     task = _name(given.get("taskKey"), "task")
     reg = load_registration(project, task)
     job = _restore_job(event.get("job") or {}, project, task)
+    _hold_by_this_restore(store, reg["taskArn"], run_id, event.get("executionArn"))
     ctx: dict[str, Any] = {
         "project": project,
         "taskKey": task,
@@ -270,8 +287,8 @@ def _restore(event: dict[str, Any]) -> dict[str, Any]:
         "environment": reg.get("environment") or aws.env("ENVIRONMENT", ""),
         "connections": reg.get("connections") or {},
     }
-    if given.get("selectionRules") is not None:
-        ctx["selectionRules"] = _selection_rules(given["selectionRules"])
+    if job["name"] == RESTORE_VERIFY_JOB["name"]:
+        ctx["selectionRules"] = _task_selection_rules(reg["taskArn"])
     return {**event, "job": job, "ctx": ctx, "failure": None}
 
 
@@ -279,7 +296,7 @@ def authorize(event: dict[str, Any], store: Store) -> dict[str, Any]:
     """The event with the job and context prepare_job may use, or JobNotInJobSet."""
     phase = event.get("phase")
     if phase == "restore":
-        return _restore(event)
+        return _restore(event, store)
     if phase not in RUN_PHASES:
         raise _refuse(f"unknown phase {phase!r}")
     return _run_phase(event, store)

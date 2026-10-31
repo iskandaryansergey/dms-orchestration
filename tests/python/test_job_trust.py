@@ -14,8 +14,9 @@ from typing import Any
 
 import boto3
 import pytest
-from conftest import TASK_ARN
+from conftest import TASK_ARN, FakeDms, dms_task
 
+from shared import aws as shared_aws
 from shared import bundle as jobs_bundle
 
 BUCKET = "dms-orch-artifacts-test"
@@ -47,6 +48,14 @@ JOBSET = {
 }
 JOBSET_BODY = json.dumps(JOBSET).encode()
 PIN = jobs_bundle.total({"jobset.json": jobs_bundle.digest(JOBSET_BODY)})
+RULES = [{"schema": "public", "table": "%"}]
+DECISION = {
+    "startType": "reload-target",
+    "resetScope": "tables",
+    "resetTables": ["public.a"],
+    "resetTablesCount": 1,
+    "resetTablesUri": None,
+}
 
 
 def registration(project: str = "ledger", task: str = "core", **kw: Any) -> dict[str, Any]:
@@ -82,8 +91,21 @@ def env(table, store, monkeypatch):
     ssm = boto3.client("ssm", region_name="eu-west-2")
     ssm.put_parameter(Name=f"{PREFIX}/ledger/core", Type="String", Value=json.dumps(registration()))
     ssm.put_parameter(Name=f"{PREFIX}/cards/extra", Type="String", Value=json.dumps(registration("cards", "extra")))
-    store.put_run("run-1", {"project": "ledger", "taskKey": "core", "status": "RUNNING", "jobsVersion": "v1"})
-    return {"s3": s3, "ssm": ssm, "store": store}
+    store.put_run(
+        "run-1",
+        {
+            "project": "ledger",
+            "taskKey": "core",
+            "status": "RUNNING",
+            "jobsVersion": "v1",
+            "attempt": 1,
+            # What inspect_task decided for this run (InspectTask, then the pre-flight).
+            "jobInspect": {"migrationType": "full-load", "selectionRules": RULES},
+            "jobDecision": DECISION,
+        },
+    )
+    shared_aws.set_client("dms", FakeDms(dms_task("stopped")))
+    return {"s3": s3, "ssm": ssm, "store": store, "table": table}
 
 
 def ctx(**kw: Any) -> dict[str, Any]:
@@ -188,8 +210,17 @@ def test_a_job_set_with_another_hash_than_the_registration_is_refused(env):
 def test_an_unpinned_version_is_refused(env):
     from shared.errors import JobSetNotPinned
 
+    env["store"].update_run("run-1", {"jobsVersion": "v9"})
     with pytest.raises(JobSetNotPinned):
         prepare(event(pinned("pre", "create-tables"), ctx=ctx(jobsVersion="v9")))
+
+
+def test_the_job_set_version_is_the_one_recorded_on_the_run(env):
+    """Another registered version than the run's is refused, even when it is pinned."""
+    from shared.errors import JobNotInJobSet
+
+    with pytest.raises(JobNotInJobSet, match="v2"):
+        prepare(event(pinned("pre", "create-tables"), ctx=ctx(jobsVersion="v2")))
 
 
 def test_a_job_of_another_phase_is_refused(env):
@@ -233,6 +264,41 @@ def test_connections_come_from_the_registration_not_the_input(env):
     assert stored["ctx"]["connections"]["target"]["host"] == "target.cluster.local"
 
 
+def test_the_context_is_the_run_decision_not_the_input(env):
+    """A pinned reset job truncates the list inspect_task decided, not one the caller passes."""
+    forged = ctx(
+        resetTables=["public.accounts"],
+        resetTablesCount=1,
+        resetScope="all",
+        selectionRules=[{"schema": "x", "table": "y"}],
+        endpointArns=["arn:forged"],
+        anything="else",
+    )
+    prepare(event(pinned("reset", "reset-target"), phase="reset", ctx=forged))
+    stored = spec_json(env["s3"], "runs/ledger/run-1/jobs/reset/00-reset-target/spec.json")["ctx"]
+    assert stored["resetTables"] == ["public.a"] and stored["resetScope"] == "tables"
+    assert stored["selectionRules"] == RULES and stored["migrationType"] == "full-load"
+    assert stored["endpointArns"] == [] and "anything" not in stored
+    assert stored["startType"] == "reload-target" and stored["attempt"] == 1
+
+
+def test_a_reset_list_in_s3_is_read_only_from_the_inspect_prefix_of_the_run(env):
+    from shared.errors import JobFailed
+
+    key = "runs/ledger/run-1/inspect/reset-tables.json"
+    env["s3"].put_object(Bucket=BUCKET, Key=key, Body=json.dumps({"resetTables": ["public.big"]}))
+    uri = f"s3://{BUCKET}/{key}"
+    env["store"].update_run("run-1", {"jobDecision": {**DECISION, "resetTables": [], "resetTablesUri": uri}})
+    prepare(event(pinned("reset", "reset-target"), phase="reset"))
+    stored = spec_json(env["s3"], "runs/ledger/run-1/jobs/reset/00-reset-target/spec.json")["ctx"]
+    assert stored["resetTables"] == ["public.big"]
+    # A list elsewhere in the bucket (another run, another project) is never read.
+    other = f"s3://{BUCKET}/runs/cards/run-9/inspect/reset-tables.json"
+    env["store"].update_run("run-1", {"jobDecision": {**DECISION, "resetTables": [], "resetTablesUri": other}})
+    with pytest.raises(JobFailed, match="inspect"):
+        prepare(event(pinned("reset", "reset-target"), phase="reset"))
+
+
 def test_a_dry_run_cannot_be_turned_into_a_real_one(env):
     env["store"].update_run("run-1", {"dryRun": True})
     spec = prepare(event(pinned("pre", "create-tables"), dryRun=False))
@@ -253,6 +319,29 @@ def test_module_jobs_with_their_fixed_code_are_accepted(env):
     assert prepare(event(retention, phase="post"))["functionArn"] == BUILTIN
     (verify,) = module_jobs.preflight_jobs("lambda", {"exactCountMaxRows": 5})
     assert prepare(event(verify, phase="baseline"))["functionArn"] == BUILTIN
+
+
+def test_snapshot_retention_keeps_at_least_the_registered_days(env):
+    """The operator cannot delete the task's snapshots early with a short retentionDays."""
+    from shared import module_jobs
+    from shared.errors import JobNotInJobSet
+
+    with pytest.raises(JobNotInJobSet):
+        prepare(event(module_jobs.snapshot_retention_job(0, 1), phase="post"))
+    reg = registration(defaults={"dumpRetentionDays": 30})
+    env["ssm"].put_parameter(Name=f"{PREFIX}/ledger/core", Type="String", Value=json.dumps(reg), Overwrite=True)
+    with pytest.raises(JobNotInJobSet):
+        prepare(event(module_jobs.snapshot_retention_job(0, 14), phase="post"))
+    assert prepare(event(module_jobs.snapshot_retention_job(0, 30), phase="post"))["with"]["retentionDays"] == 30
+
+
+def test_snapshot_wait_is_the_module_value(env):
+    from shared import module_jobs
+    from shared.errors import JobNotInJobSet
+
+    (snap,) = module_jobs.dump_jobs({"enabled": True, "method": "snapshot"}, {"snapshotDumps": True})
+    with pytest.raises(JobNotInJobSet):
+        prepare(event({**snap, "with": {**snap["with"], "waitSeconds": 1}}, phase="dump"))
 
 
 @pytest.mark.parametrize(
@@ -316,14 +405,38 @@ def verify_job(dump: str = DUMP, **with_: Any) -> dict[str, Any]:
 
 
 RESTORE_ID = "restore-ledger-core-20261031T100000Z"
+RUNNER = "arn:aws:states:eu-west-2:111122223333:execution:dms-orch-test-job-runner"
+RESTORE_EXEC = f"{RUNNER}:{RESTORE_ID}"
 
 
 def restore_event(job: dict[str, Any], **kw: Any) -> dict[str, Any]:
     c = {"project": "ledger", "taskKey": "core", "taskArn": TASK_ARN, "environment": "test", "connections": {}}
-    return {"job": job, "phase": "restore", "runId": RESTORE_ID, "dryRun": False, "ctx": c, "failure": None, **kw}
+    return {
+        "job": job,
+        "phase": "restore",
+        "runId": RESTORE_ID,
+        "executionArn": RESTORE_EXEC,
+        "dryRun": False,
+        "ctx": c,
+        "failure": None,
+        **kw,
+    }
 
 
-def test_restore_runs_the_restore_job_of_the_module_with_the_registered_connections(env):
+def hold_lock(table: Any, run_id: str = RESTORE_ID, execution_arn: str = RESTORE_EXEC) -> None:
+    """As orch.py restore holds it (TaskLock): this restore's id, its current job-runner execution."""
+    table.put_item(
+        Item={"pk": f"LOCK#{TASK_ARN}", "sk": "LOCK", "entity": "LOCK", "runId": run_id, "executionArn": execution_arn}
+    )
+
+
+@pytest.fixture
+def locked(env):
+    hold_lock(env["table"])
+    return env
+
+
+def test_restore_runs_the_restore_job_of_the_module_with_the_registered_connections(env, locked):
     spec = prepare(restore_event(restore_job()))
     assert spec["jobRoleArn"] == LEDGER_ROLE and spec["runtime"] == "ssm"
     stored = spec_json(env["s3"], f"runs/ledger/{RESTORE_ID}/jobs/restore/00-restore-target/spec.json")
@@ -332,13 +445,34 @@ def test_restore_runs_the_restore_job_of_the_module_with_the_registered_connecti
     assert stored["idempotent"] is False and stored["maxAttempts"] == 1
 
 
-def test_restore_records_the_baseline_with_the_selection_rules_of_the_input(env):
-    rules = [{"schema": "app", "table": "%"}]
-    c = {"project": "ledger", "taskKey": "core", "selectionRules": rules, "connections": {}}
-    spec = prepare(restore_event(verify_job(), ctx=c))
+def test_restore_records_the_baseline_with_the_selection_rules_of_the_dms_task(env):
+    """The scope of the baseline is the task's table mapping, not rules the caller passes."""
+    from shared import preflight
+
+    baseline_exec = f"{RESTORE_EXEC}-baseline"
+    hold_lock(env["table"], execution_arn=baseline_exec)  # orch.py moves the lock to this execution
+    c = {"project": "ledger", "taskKey": "core", "selectionRules": [{"schema": "x", "table": "y"}], "connections": {}}
+    spec = prepare(restore_event(verify_job(), ctx=c, executionArn=baseline_exec))
     assert spec["functionArn"] == BUILTIN
     assert spec["with"]["recordBaseline"] == {"runId": "run-0", "dumpUri": DUMP}
+    rules = preflight.selection_rules(dms_task("stopped")["TableMappings"])
     assert spec["ctx"]["selectionRules"] == rules and spec["ctx"]["connections"] == {"target": TARGET}
+
+
+@pytest.mark.parametrize(
+    ("lock_run", "lock_exec"),
+    [(None, None), ("ledger-core-20261031T090000Z-ab12", RESTORE_EXEC), (RESTORE_ID, f"{RUNNER}:other")],
+    ids=["no-lock", "a-run-holds-it", "another-execution"],
+)
+def test_restore_needs_the_task_lock_held_by_this_restore_execution(env, lock_run, lock_exec):
+    """A direct StartExecution cannot restore under a running migration or record a baseline."""
+    from shared.errors import JobNotInJobSet
+
+    if lock_run:
+        hold_lock(env["table"], lock_run, lock_exec)
+    for job in (restore_job(), verify_job()):
+        with pytest.raises(JobNotInJobSet, match="lock"):
+            prepare(restore_event(job))
 
 
 @pytest.mark.parametrize(
@@ -366,14 +500,14 @@ def test_restore_records_the_baseline_with_the_selection_rules_of_the_input(env)
         "inline-sql",
     ],
 )
-def test_restore_accepts_nothing_else(env, job):
+def test_restore_accepts_nothing_else(locked, job):
     from shared.errors import JobNotInJobSet
 
     with pytest.raises(JobNotInJobSet):
         prepare(restore_event(job))
 
 
-def test_restore_needs_a_registered_task_and_a_restore_run_id(env):
+def test_restore_needs_a_registered_task_and_a_restore_run_id(locked):
     from shared.errors import JobNotInJobSet, UnknownTask
 
     with pytest.raises(UnknownTask):

@@ -31,6 +31,7 @@
           "job": "{% $input.job %}",
           "phase": "{% $input.phase %}",
           "runId": "{% $input.runId %}",
+          "executionArn": "{% $states.context.Execution.Id %}",
           "dryRun": "{% $input.dryRun %}",
           "ctx": "{% $input.ctx %}",
           "failure": "{% $input.failure %}"
