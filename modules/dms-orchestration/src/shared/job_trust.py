@@ -164,7 +164,9 @@ def _run_phase(event: dict[str, Any], store: Store) -> dict[str, Any]:
         )
     reg = load_registration(str(project), str(task))
     job = event.get("job") or {}
-    version = given.get("jobsVersion")
+    version = run.get("jobsVersion")
+    if given.get("jobsVersion") not in (None, version):
+        raise _refuse(f"job set version {given.get('jobsVersion')!r} is not the version of run {run_id} ({version!r})")
     trusted = module_job(phase, job, reg) or job_set_job(phase, job, str(project), version, reg)
     ctx = {
         **given,

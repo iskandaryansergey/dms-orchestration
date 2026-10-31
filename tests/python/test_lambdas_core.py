@@ -1449,6 +1449,8 @@ def test_post_repeat_can_take_the_post_jobs_of_a_fixed_job_set_version(env, stor
     (job,) = out["ctx"]["jobs"]["post"]
     assert job["command"] == ["psql-run", "--sql", "SELECT 1"]
     assert out["ctx"]["jobsVersion"] == "v2" and out["ctx"]["jobsS3Prefix"] == f"s3://{BUCKET}/jobs/ledger/v2/"
+    # prepare_job takes the job set version from RUN#, not from the job-runner input (review item N1).
+    assert store.get_run("run-1")["jobsVersion"] == "v2"
 
 
 # --- the report advises a snapshot dump for a big target -------------------

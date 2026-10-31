@@ -378,8 +378,16 @@ def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
     if event.get("mode") == "post":
         result = load_post(event)
         store = Store(aws.table())
+        # jobsVersion: a repeat of post may take a corrected version; prepare_job looks every job
+        # up in the version recorded here, never in the one the job-runner input names.
         store.update_run(
-            result["runId"], {"postExecutionArn": execution.get("arn"), "phase": "post", "status": "RUNNING"}
+            result["runId"],
+            {
+                "postExecutionArn": execution.get("arn"),
+                "phase": "post",
+                "status": "RUNNING",
+                "jobsVersion": result["ctx"].get("jobsVersion"),
+            },
         )
         store.append_event(
             result["runId"],
