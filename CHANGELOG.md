@@ -34,13 +34,18 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
 - Restore runs under the task lock, checks the manifest's project and task before downloading,
   restores only the manifest's tables and commits only after `pg_restore` succeeded.
 - The job-runner no longer trusts its input (the operator may start it for `orch.py restore`):
-  `prepare_job` runs a job only if it is in the run's pinned job set with the same code (looked up
-  again by name, bundle hash from the registration, not from the input) or is one of the module's
-  own jobs with its fixed code, for a `RUNNING` run of the project and task named; the restore
-  phase accepts only `pg-restore-s3` of that task's dumps and the restore baseline check.
-  Connections, task ARN and project come from the registration, a dry run stays dry; anything
-  else fails `JobNotInJobSet`. The operator policy denies reading `runs/*/jobs/*`, so a job
-  artifact named `report.json` is not readable either.
+  `prepare_job` runs a job only if it is in the job set version recorded on the run's `RUN#` with
+  the same code (looked up again by name, bundle hash from the registration, not from the input)
+  or is one of the module's own jobs with its fixed code (snapshot retention at least
+  `dump_retention_days`), for a `RUNNING` run of the project and task named. The job context is
+  built from the registration and `RUN#` only: `inspect_task` records the run's decision (start
+  type, reset scope and list, migration type, selection rules) on `RUN#`, and a reset list in S3
+  is read only under the run's `inspect/` prefix. The restore phase accepts only `pg-restore-s3`
+  of that task's dumps and the restore baseline check, under the task lock held by that restore
+  execution (the job-runner passes its execution id to `PrepareJob`). A dry run stays dry;
+  anything else fails `JobNotInJobSet`. The operator policy denies reading `runs/*/jobs/*`, so a
+  job artifact named `report.json` is not readable either; job results remain visible in the
+  execution history.
 - No reset without a target fingerprint; the reset scope comes from the fingerprint and the
   task's selection rules, not from the DMS table statistics.
 - The optional `sql-runner` image is built from a digest-pinned base, checksummed downloads and

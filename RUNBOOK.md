@@ -202,8 +202,9 @@ waits (`--wait` is accepted and changes nothing). `pg-restore-s3` runs on the SS
 module has it (`ssm.enabled`, the registration says so), otherwise in the Fargate image;
 `--runtime ssm|fargate` picks one, and a runtime the module lacks is refused before the lock.
 The job-runner accepts from the operator only these restore jobs, with a dump under
-`dumps/<project>/<task>/` of that very task, and takes the connections from the task
-registration; a job-runner execution started by hand with any other job fails `JobNotInJobSet`.
+`dumps/<project>/<task>/` of that very task, only while this restore holds the task lock for
+that execution, and takes the connections and the baseline scope from the task registration and
+the DMS task; a job-runner execution started by hand fails `JobNotInJobSet`.
 
 The job (`pg-restore-s3`) then, in this order, and stops with nothing changed at the first
 failure:

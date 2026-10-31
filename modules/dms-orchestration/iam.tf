@@ -521,7 +521,8 @@ locals {
       },
       {
         # The wildcard above also matches a report.json a job writes among its artifacts
-        # (runs/<project>/<runId>/jobs/...): what jobs write is never read back (review item N1).
+        # (runs/<project>/<runId>/jobs/...): job artifacts are not read back from S3 (review item
+        # N1). Job results stay visible in the execution history (GetExecutionHistory).
         Sid      = "NoJobArtifacts"
         Effect   = "Deny"
         Action   = ["s3:GetObject", "s3:GetObjectVersion"]
