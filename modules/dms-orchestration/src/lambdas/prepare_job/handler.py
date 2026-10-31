@@ -18,6 +18,9 @@
   template is refused, it would carry the whole list through the payload.
 
 Input: ``{"job", "phase", "runId", "dryRun", "ctx", "failure"}``. Output: ``{"spec": {...}}``.
+The input is not trusted (the operator may start the job-runner for ``orch.py restore``):
+:func:`shared.job_trust.authorize` replaces the job with the one of the run's pinned job set or
+the module's own, and the context with the registration's (review item N1).
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from shared import aws, expr, log
+from shared import aws, expr, job_trust, log
 from shared.errors import InvalidJobSet, JobFailed
 from shared.store import Store, run_prefix
 
@@ -184,6 +187,9 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
 
 def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
     store = Store(aws.table())
+    # Review item N1: the job and context of the input are checked against the run and the
+    # pinned job set (or the module's own jobs) before anything is rendered or written.
+    event = job_trust.authorize(event, store)
     out = prepare(event, store)
     spec = out["spec"]
     store.append_event(

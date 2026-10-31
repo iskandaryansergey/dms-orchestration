@@ -28,87 +28,13 @@ from typing import Any
 from botocore.exceptions import ClientError
 
 from shared import aws, jobset, log, validation
-from shared import bundle as bundle_hash
-from shared.errors import (
-    ContextNotPinned,
-    InvalidRunRequest,
-    JobSetNotFound,
-    JobSetNotPinned,
-    JobSetTampered,
-    RunAlreadyActive,
-    UnknownTask,
-)
+from shared.errors import ContextNotPinned, InvalidRunRequest, RunAlreadyActive
+from shared.module_jobs import dump_jobs, preflight_jobs, snapshot_retention_job
+from shared.registry import load_jobs, load_registration
 from shared.store import Store, now_iso, run_prefix
 
 LOGGER = log.get_logger("resolve_context")
 DEFAULT_AUTO_RESUME_CATEGORIES = ["TRANSIENT_SOURCE_CONN", "TRANSIENT_TARGET_CONN", "DMS_RESTART"]
-
-
-def load_registration(project: str, task_key: str) -> dict[str, Any]:
-    name = f"{aws.env('SSM_PREFIX').rstrip('/')}/{project}/{task_key}"
-    try:
-        value = aws.client("ssm").get_parameter(Name=name)["Parameter"]["Value"]
-    except ClientError as err:
-        if err.response.get("Error", {}).get("Code") == "ParameterNotFound":
-            raise UnknownTask(f"no task registered as {project}/{task_key} (SSM parameter {name})") from err
-        raise
-    return json.loads(value)
-
-
-def _get(bucket: str, key: str) -> bytes | None:
-    try:
-        return aws.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
-    except ClientError as err:
-        if err.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "AccessDenied"):
-            return None
-        raise
-
-
-def load_jobs(
-    bucket: str, prefix: str, version: str, job_set: str, jobs_cfg: dict[str, Any] | None = None
-) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any] | None]:
-    """The job set of one version, checked against the bundle hash Terraform registered.
-
-    ``jobs_cfg`` is the registration's ``jobs`` block: ``bundles`` maps a version to the total of
-    its ``bundle.sha256`` (``jobset_tool.py hash``); ``allowUnpinned`` lets a version run without
-    one (sandbox). A registered hash is always enforced. Returns the jobs, each stamped with
-    ``bundleSha256`` for the runtimes, and ``{"sha256", "files", "pinned"}`` (None: no manifest,
-    only when unpinned runs are allowed).
-    """
-    cfg = jobs_cfg or {}
-    pinned = (cfg.get("bundles") or {}).get(version)
-    if not pinned and not cfg.get("allowUnpinned"):
-        raise JobSetNotPinned(
-            f"job set version {version!r} has no bundle hash in the task registration "
-            "(projects.<p>.tasks.<t>.jobs.bundles; jobset_tool.py hash <bundle-dir>)"
-        )
-    base = f"{prefix.strip('/')}/{version}"
-    key = f"{base}/{jobset.jobset_file_name(job_set)}"
-    manifest = _get(bucket, f"{base}/{bundle_hash.MANIFEST}")
-    body = _get(bucket, key)
-    if body is None:
-        raise JobSetNotFound(f"job set not found at s3://{bucket}/{key} (run scripts/sync-jobs.sh)")
-    pin: dict[str, Any] | None = None
-    if manifest is None:
-        if pinned:
-            raise JobSetTampered(
-                f"s3://{bucket}/{base}/ has no {bundle_hash.MANIFEST}, but version {version} is pinned"
-            )
-    else:
-        files, total = bundle_hash.parse(manifest.decode("utf-8", errors="replace"))
-        if pinned and total != pinned:
-            raise JobSetTampered(
-                f"s3://{bucket}/{base}/ does not match the bundle hash pinned for version {version} "
-                f"(registered {pinned[:12]}…, found {total[:12]}…)"
-            )
-        bundle_hash.verify(jobset.jobset_file_name(job_set), body, files)
-        pin = {"sha256": total, "files": files, "pinned": bool(pinned)}
-    jobs = jobset.normalize(json.loads(body))
-    for items in jobs.values():
-        for job in items:
-            job["bundleSha256"] = pin["sha256"] if pin else None
-    return jobs, pin
-
 
 FARGATE_ABOVE_TABLES = 500
 FARGATE_ABOVE_BYTES = 50 * 2**30
@@ -140,102 +66,6 @@ def verify_runtime(
     if has_image and (big or not reachable):
         return "fargate"
     return "lambda" if reachable else None
-
-
-def preflight_jobs(runtime: str | None, options: dict[str, Any]) -> list[dict[str, Any]]:
-    """The target check of pre-flight and of the baseline (ADR 0006), not part of the job set.
-
-    Lambda: ``checks/target_verify`` through the Data API. Fargate: ``verify-target`` (psql),
-    the same fingerprint. No runtime: the list is empty and the verdict comes from the DMS state
-    alone (the report says so).
-    """
-    if runtime is None:
-        return []
-    common = {
-        "name": "target-verify",
-        "index": 0,
-        "with": {
-            "connection": "target",
-            "source": "source",
-            "exactCountMaxRows": int(options.get("exactCountMaxRows", 1_000_000)),
-        },
-        "retry": {"maxAttempts": 2, "backoffSeconds": 30},
-        "idempotent": True,
-        "onError": "fail",
-    }
-    if runtime == "fargate":
-        return [
-            {
-                **common,
-                "runtime": "fargate",
-                "image": "sql-runner",
-                "command": ["verify-target"],
-                "timeoutSeconds": 7200,
-            }
-        ]
-    return [{**common, "runtime": "lambda", "handler": "builtin:checks/target_verify", "timeoutSeconds": 600}]
-
-
-SNAPSHOT_WAIT_SECONDS = 600  # one Lambda polls this long; 3 attempts cover the 30 min of a snapshot
-
-
-def dump_jobs(options: dict[str, Any], defaults: dict[str, Any]) -> list[dict[str, Any]]:
-    """Dump of the target before a reset.
-
-    ``pg-dump`` (default): pg_dump of the scope streamed to S3, on an SSM runner instance when the
-    module's SSM runtime is on (``SSM_JOBS``), in the Fargate sql-runner otherwise.
-    ``snapshot``: an Aurora cluster snapshot (built-in Lambda job, polled until available);
-    only for tasks registered with ``snapshot_dumps`` (the project job role has the rights).
-    """
-    if not options.get("enabled", bool(defaults.get("dumpBeforeReset", False))):
-        return []
-    method = options.get("method", "pg-dump")
-    if method == "snapshot":
-        if not defaults.get("snapshotDumps"):
-            raise InvalidRunRequest(
-                "dump.method=snapshot needs snapshot_dumps = true on the task (module variable projects)"
-            )
-        return [
-            {
-                "name": "snapshot-target",
-                "index": 0,
-                "runtime": "lambda",
-                "handler": "builtin:dump/cluster_snapshot",
-                "with": {"connection": "target", "waitSeconds": SNAPSHOT_WAIT_SECONDS},
-                "timeoutSeconds": SNAPSHOT_WAIT_SECONDS + 240,
-                "retry": {"maxAttempts": 3, "backoffSeconds": 10},
-                "idempotent": True,
-                "onError": "fail",
-            }
-        ]
-    where = {"runtime": "ssm"} if aws.env("SSM_JOBS", "0") == "1" else {"runtime": "fargate", "image": "sql-runner"}
-    return [
-        {
-            "name": "dump-target",
-            "index": 0,
-            **where,
-            "command": ["pg-dump-s3", "--connection", "target"],
-            "timeoutSeconds": 21600,
-            "retry": {"maxAttempts": 1, "backoffSeconds": 60},
-            "idempotent": True,
-            "onError": "fail",
-        }
-    ]
-
-
-def snapshot_retention_job(index: int, retention_days: int) -> dict[str, Any]:
-    """Post job: delete this task's snapshots older than dump_retention_days (S3 dumps expire by lifecycle)."""
-    return {
-        "name": "snapshot-retention",
-        "index": index,
-        "runtime": "lambda",
-        "handler": "builtin:cleanup/cluster_snapshots",
-        "with": {"connection": "target", "retentionDays": retention_days},
-        "timeoutSeconds": 300,
-        "retry": {"maxAttempts": 2, "backoffSeconds": 30},
-        "idempotent": True,
-        "onError": "warn",
-    }
 
 
 def assessment_settings(registered: dict[str, Any] | None, asked: dict[str, Any]) -> dict[str, Any]:

@@ -597,6 +597,10 @@ def env(table, monkeypatch):
     monkeypatch.setenv("TASK_DEFINITIONS", "{}")
     monkeypatch.setenv("JOB_LAMBDA_ARNS", "[]")
     monkeypatch.setenv("JOB_ROLE_ARNS", json.dumps({"ledger": ROLE}))
+    # Routing and rendering of sql jobs; which job may run at all is test_job_trust.py.
+    from shared import job_trust
+
+    monkeypatch.setattr(job_trust, "authorize", lambda ev, _store: ev)
     s3 = boto3.client("s3", region_name="eu-west-2")
     s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
     shared_aws.set_client("s3", s3)

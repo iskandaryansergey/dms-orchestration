@@ -52,3 +52,8 @@ class RunAlreadyActive(OrchestratorError):  # noqa: N818
 
 class ContextNotPinned(OrchestratorError):  # noqa: N818
     """post found no context.json version recorded by migrate (RUN# contextVersionId), or not that version."""
+
+
+class JobNotInJobSet(OrchestratorError):  # noqa: N818
+    """A job-runner execution asked for a job that is neither in the run's pinned job set nor one of
+    the module's own jobs with their fixed code (review item N1), or for a run that is not running."""

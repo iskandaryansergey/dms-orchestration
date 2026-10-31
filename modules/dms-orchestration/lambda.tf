@@ -85,6 +85,8 @@ locals {
         JOB_LAMBDA_ARNS  = jsonencode(var.job_lambda_arns)
         JOB_ROLE_ARNS    = jsonencode(local.job_role_arns)
         SSM_JOBS         = local.ssm_enabled ? "1" : "0"
+        # Review item N1: the job is looked up again in the pinned job set of the registration.
+        SSM_PREFIX = local.ssm_prefix
       }
     }
     dms_event_handler = {

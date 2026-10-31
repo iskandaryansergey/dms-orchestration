@@ -42,6 +42,11 @@ def jobs_env(table, monkeypatch):
     monkeypatch.setenv(
         "JOB_ROLE_ARNS", json.dumps({"ledger": "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"})
     )
+    # These tests are about rendering and routing; which job may run at all (the pinned job set,
+    # the module's own jobs, restore) is test_job_trust.py.
+    from shared import job_trust
+
+    monkeypatch.setattr(job_trust, "authorize", lambda ev, _store: ev)
     s3 = boto3.client("s3", region_name="eu-west-2")
     s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
     return s3
