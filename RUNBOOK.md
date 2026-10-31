@@ -201,6 +201,9 @@ watchdog releases the lock once the execution ended and `lock_grace_seconds` pas
 waits (`--wait` is accepted and changes nothing). `pg-restore-s3` runs on the SSM runner when the
 module has it (`ssm.enabled`, the registration says so), otherwise in the Fargate image;
 `--runtime ssm|fargate` picks one, and a runtime the module lacks is refused before the lock.
+The job-runner accepts from the operator only these restore jobs, with a dump under
+`dumps/<project>/<task>/` of that very task, and takes the connections from the task
+registration; a job-runner execution started by hand with any other job fails `JobNotInJobSet`.
 
 The job (`pg-restore-s3`) then, in this order, and stops with nothing changed at the first
 failure:

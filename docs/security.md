@@ -81,7 +81,8 @@ runs the `.tftest.hcl` files with a mock provider; the Python tests run with mot
 | Target dumps: SSE-KMS only, expire after `dump_retention_days` | `defaults.tftest.hcl::dumps_are_kms_only_and_expire` |
 | Job roles reach only `runs/<project>/*/jobs/*`; `ecs-job` and `lambda-jobs` no run artifacts | `iam.tftest.hcl::per_project_job_roles`, `test_jobs_lambdas.py::test_builtin_jobs_write_artifacts_as_the_project_job_role` |
 | post loads only the `context.json` version migrate recorded on `RUN#`, under the project on `RUN#` | `test_lambdas_core.py::test_post_loads_the_pinned_version_not_a_later_overwrite`, `test_lambdas_core.py::test_post_refuses_a_context_without_a_recorded_version`, `test_asl.py::test_migrate_without_a_context_version_stops_before_dms` |
-| Operator: no job set uploads, reads only reports, writes only `LOCK#` items; job set publishing per project | `iam.tftest.hcl::operator_cannot_publish_job_sets` |
+| Operator: no job set uploads, reads only reports (never `runs/*/jobs/*`), writes only `LOCK#` items; job set publishing per project | `iam.tftest.hcl::operator_cannot_publish_job_sets` |
+| job-runner input is not trusted: a job runs only if it is in the run's pinned job set (hash from the registration) with the same code, or is one of the module's own jobs with its fixed code, for a `RUNNING` run of the project named; restore runs only `pg-restore-s3` of that task's dumps and the restore baseline check; connections come from the registration; anything else is `JobNotInJobSet` | `test_job_trust.py::test_an_inline_job_is_refused`, `test_job_trust.py::test_a_job_set_name_with_another_body_is_refused`, `test_job_trust.py::test_the_project_of_the_input_must_be_the_project_of_the_run`, `test_job_trust.py::test_connections_come_from_the_registration_not_the_input`, `test_job_trust.py::test_restore_accepts_nothing_else`, `test_job_trust.py::test_the_jobs_resolve_context_builds_are_accepted_as_they_are`, TestState `job-not-in-job-set-is-refused` |
 | Restore baseline: written only in the `restore` phase, through `dynamodb:LeadingKeys` on `TARGET#` | `iam.tftest.hcl::least_privilege`, `test_jobs_lambdas.py::test_only_the_restore_phase_may_record_a_baseline` |
 | Job container: uid 10001, read-only root, the init container gets no input or secrets | `defaults.tftest.hcl::lambda_and_events` |
 | SSM runtime: `SendCommand` only of the module document to the configured runners; the runner role trusted by the job roles, never passed; instance profile reads `runtime/*` only; document parameters pattern-checked; runtime zip checked by SHA-256; jobs as `runner_user`, never root; off by default | `iam.tftest.hcl::ssm_runtime_least_privilege`, `iam.tftest.hcl::ssm_runtime_with_target_tags`, `options.tftest.hcl::ssm_runtime_with_a_platform_document`, `options.tftest.hcl::ssm_runtime_never_runs_jobs_as_root`, `defaults.tftest.hcl::no_ssm_runtime_by_default` |
@@ -94,7 +95,7 @@ Projects trust the orchestrator, not each other.
 
 | Principal | Trusted with | Cannot |
 |---|---|---|
-| Operator role (`operator_policy_json`, CLI / CI of the workspace) | start/stop runs and restores for **every** project of the environment; read run reports; `LOCK#` items (`dynamodb:LeadingKeys`) | read secrets, upload job sets, change IAM |
+| Operator role (`operator_policy_json`, CLI / CI of the workspace) | start/stop runs and restores for **every** project of the environment, i.e. run the reviewed (pinned) jobs of every project and restore its target from its own dumps; read run-level reports; `LOCK#` items (`dynamodb:LeadingKeys`) | read secrets; run a job that is not in a pinned job set or the module's own; read what jobs write (`runs/*/jobs/*`, explicit Deny); upload job sets; change IAM |
 | Job set publisher (`jobset_publisher_policy_json[<project>]`, one per project) | write and list that project's job set prefixes (`jobs/<project>/`) | another project's job sets; run artifacts; secrets |
 | Orchestration roles (migrate, post, job-runner, core and handoff Lambdas) | DMS describe; DMS start only for migrate on registered tasks; DynamoDB, run artifacts (`runs/`); StartExecution of post (handoff) or migrate (auto-resume) | read any database secret |
 | Job role `<name>-<env>-job-<project>` (one per project, `job_roles.tf`) | that project's secrets (`connections[*].secret_arn`), its Data API clusters, its job sets (`jobs/<project>/`), its runs' job specs, results and artifacts (`runs/<project>/*/jobs/*`) | read another project's secrets, job sets or run artifacts; write `context.json` or reports |
@@ -111,8 +112,28 @@ How a job gets its project role:
   of this account) and orch-job, as `ssm.runner_user`, assumes it from the instance profile and
   checks the session identity before it reads the spec; the document runs only a runtime zip
   whose SHA-256 Terraform recorded in it;
-* `prepare_job` takes `jobRoleArn` from the module's map by `ctx.project`; a project
-  without a role fails the job set before anything runs.
+* `prepare_job` takes `jobRoleArn` from the module's map by the project of the run's `RUN#`
+  item (restore: the registered task the input names); a project without a role fails the job
+  set before anything runs.
+
+Who may start the job-runner: migrate and post (nested executions) and the operator role, for
+`orch.py restore`. Its input is therefore not trusted (review item N1). Before anything is
+rendered or written, `prepare_job` (`shared/job_trust.py`):
+
+* run phases (`preflight`, `baseline`, `pre`, `dump`, `reset`, `post`, `on_failure`): needs a
+  `RUN#` item that is `RUNNING` — only the module's roles write `RUN#` — for the project and task
+  the input names; looks the job up again by name in the job set version of the run, whose
+  bundle hash it checks against the registration (`jobs.bundles`), and refuses a job whose code
+  (`runtime`, `image`, `handler`, `function`, `command`, `sql`, `with`, `when`) differs; or accepts
+  one of the module's own jobs (target check, dump, snapshot retention) only with exactly its
+  code. The job that runs is the one loaded, not the one passed;
+* `restore`: only `pg-restore-s3 --connection target --from <dump> --confirm` with a dump under
+  `dumps/<project>/<task>/` of the artifacts bucket, and `checks/target_verify` recording the
+  restore baseline for such a dump; the run id must be a `restore-…` id;
+* always: project, task, task ARN and connections from the registration (a forged connection
+  host never receives a password); a run recorded as a dry run stays dry.
+
+Anything else fails the job-runner with `JobNotInJobSet` (the execution's `JobFailed` cause).
 
 The restore baseline (ADR 0006): `checks/target_verify` writes `TARGET#BASELINE` only in
 the `restore` phase, which a job set cannot declare — `orch.py restore` starts it after a
@@ -129,20 +150,28 @@ Residual risk, stated plainly:
 
 * Job-set code runs with the project's job role and therefore can read that project's secrets.
   Whoever can publish a project's job sets can, in effect, read its secrets; attach the
-  publisher policy only to principals trusted with them. Job sets are not yet pinned by hash
-  (a later change), so a publisher can also replace a version that a run will load.
-* The operator role still starts runs and restores for every project of the environment and
-  can read every project's run report (`runs/*/report.*`; IAM `*` also matches a job artifact
-  named `report.json` under `jobs/`). Reports carry job summaries; a job output that prints a
-  secret reaches them until job output is kept out of results (a later change). A project that
-  needs its own run boundary needs its own operator role per module instance.
+  publisher policy only to principals trusted with them. A version runs only when its bundle
+  hash is registered in Terraform (`jobs.bundles`; uploads are create-only), so what runs is
+  what was reviewed and registered — unless `jobs.allow_unpinned` is on (sandbox only).
+* The operator role still starts runs and restores for every project of the environment: it can
+  run any job of any version registered for a task, at a time it chooses, and restore a target
+  from that task's dumps. It can also start a job-runner execution against a run that is
+  `RUNNING` and choose the template values the job set reads from `ctx` and `failure` (e.g. a
+  reset list); a job set that renders them into commands or SQL relies on the runtimes' quoting.
+  A project that needs its own run boundary needs its own operator role per module instance.
+* The operator reads every project's run report (`runs/*/report.*`, never `runs/*/jobs/*`).
+  Job output is not in results or execution causes (a failed job names its exit code and log
+  stream only), but reports carry the `summary` a job writes, so a job set should not put
+  secrets in its summary.
 * SSM runtime: the runner instance profile may assume every project's job role, and jobs run
   under one local user (`ssm.runner_user`) that can reach the instance metadata service. A job of
   one project running on a runner can therefore act as another project's job role; anyone with
   an SSM session or `SendCommand` on a runner can do the same and, while a job runs, read its
   files and its connections file (0600, removed at the end). Projects sharing runners share
-  this trust boundary: give a project that needs its own boundary its own runners and module
-  instance, and keep session access to the runners as narrow as access to the job roles.
+  this trust boundary. One module instance has one runner selection and one instance role, so
+  this is not configurable per project today: a project that needs its own boundary needs its
+  own module instance (and runners), and session access to the runners should be as narrow as
+  access to the job roles.
 * A project's job can overwrite its own run's job results and artifacts (`runs/<project>/*/jobs/*`),
   so results of one project's jobs are only as trustworthy as that project's job sets. It cannot
   reach `context.json` or reports, and post reads `context.json` by its pinned version.

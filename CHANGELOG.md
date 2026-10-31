@@ -33,6 +33,14 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
   project or not tagged yet; no project name may be a prefix of another.
 - Restore runs under the task lock, checks the manifest's project and task before downloading,
   restores only the manifest's tables and commits only after `pg_restore` succeeded.
+- The job-runner no longer trusts its input (the operator may start it for `orch.py restore`):
+  `prepare_job` runs a job only if it is in the run's pinned job set with the same code (looked up
+  again by name, bundle hash from the registration, not from the input) or is one of the module's
+  own jobs with its fixed code, for a `RUNNING` run of the project and task named; the restore
+  phase accepts only `pg-restore-s3` of that task's dumps and the restore baseline check.
+  Connections, task ARN and project come from the registration, a dry run stays dry; anything
+  else fails `JobNotInJobSet`. The operator policy denies reading `runs/*/jobs/*`, so a job
+  artifact named `report.json` is not readable either.
 - No reset without a target fingerprint; the reset scope comes from the fingerprint and the
   task's selection rules, not from the DMS table statistics.
 - The optional `sql-runner` image is built from a digest-pinned base, checksummed downloads and

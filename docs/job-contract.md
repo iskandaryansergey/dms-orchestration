@@ -169,9 +169,12 @@ Each run checks the job set against that hash:
 | `ResolveContext` | `bundle.sha256` exists, its total is the registered one, `jobset.json` matches | `JobSetTampered` |
 | Fargate jobs (`sql-runner`) | every downloaded file matches, no file outside the list, none missing; the command does not start otherwise | `JobSetTampered` (job result) |
 | built-in Lambda jobs, sql jobs | every bundle file they read matches; a sql job opens no session otherwise | `JobSetTampered` |
+| `PrepareJob` (every job) | the job is looked up again by name in the run's version (hash checked as above) and has the same code; the run is `RUNNING`; or it is one of the module's own jobs with its fixed code | `JobNotInJobSet` (job fails before it starts) |
 
 The run context keeps the hashes (`ctx.jobsBundle`: `sha256`, `files`), and each job carries
-`bundleSha256` to its runtime, so a file changed after the run started is refused too.
+`bundleSha256` to its runtime, so a file changed after the run started is refused too. The hash a
+runtime checks is the one `PrepareJob` read from the registration, never a value in the
+job-runner's input (security.md, review item N1).
 `jobs.allow_unpinned = true` (sandbox, development) lets versions without a hash run; files are
 still checked against a `bundle.sha256` uploaded with them, and a registered hash always wins.
 
