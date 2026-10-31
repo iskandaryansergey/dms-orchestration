@@ -219,7 +219,7 @@ def test_inspect_fresh_task(table):
     assert "describe_table_statistics" not in [c[0] for c in dms.calls]
 
 
-def test_inspect_interrupted_task_resets_partial_tables(table):
+def test_inspect_interrupted_task_resets_partial_tables(table, store):
     from lambdas.inspect_task.handler import handler
 
     task = dms_task("stopped", "Stop Reason NORMAL", StartDate="2026-10-26T10:00:00Z")
@@ -232,6 +232,9 @@ def test_inspect_interrupted_task_resets_partial_tables(table):
     assert out["state"] == "interrupted"
     assert out["decision"]["startType"] == "resume-processing"
     assert out["decision"]["resetTables"] == ["public.b"]
+    run = store.get_run("r1")
+    assert run["jobDecision"]["resetTables"] == ["public.b"] and run["jobDecision"]["startType"] == "resume-processing"
+    assert run["jobInspect"]["migrationType"] == "full-load" and run["jobInspect"]["selectionRules"]
 
 
 def test_inspect_rejects_running_task(table):
@@ -813,6 +816,10 @@ def test_preflight_fresh_task_with_rows_in_the_target_is_manual_or_reset(env, st
     out = _preflight(handler, state="fresh", decision=start, verify=verify, request=_req(allowReset=True))
     assert out["verdict"] == "reset" and out["decision"]["resetTables"] == ["app.a"]
     assert any(e.get("phase") == "preflight" for e in store.run_items("r2", "EVENT#"))
+    # The decision the reset jobs act on is recorded on RUN#: prepare_job takes it from there,
+    # never from the job-runner input (review item N1).
+    recorded = store.get_run("r2")["jobDecision"]
+    assert recorded["resetTables"] == ["app.a"] and recorded["resetTablesCount"] == 1
 
 
 def test_preflight_interrupted_task_compares_with_the_baseline(env, store):

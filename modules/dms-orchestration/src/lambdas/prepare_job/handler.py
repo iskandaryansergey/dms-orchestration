@@ -47,14 +47,18 @@ def previous_results(store: Store, run_id: str) -> dict[str, dict[str, Any]]:
     return out
 
 
-def expand_reset_tables(ctx: dict[str, Any]) -> dict[str, Any]:
-    """ctx with the full reset list when inspect_task put it in S3 (``resetTablesUri``)."""
+def expand_reset_tables(ctx: dict[str, Any], run_id: str) -> dict[str, Any]:
+    """ctx with the full reset list when inspect_task put it in S3 (``resetTablesUri``).
+
+    Only the list of this run (``runs/<project>/<runId>/inspect/``) is read: the Lambda never
+    reads another object of the bucket on a caller's behalf."""
     uri = ctx.get("resetTablesUri")
     if not uri:
         return ctx
     bucket = aws.env("ARTIFACTS_BUCKET")
-    if not str(uri).startswith(f"s3://{bucket}/"):
-        raise JobFailed(f"reset list {uri} is not in the artifacts bucket")
+    own = f"s3://{bucket}/{run_prefix(ctx.get('project'), run_id)}/inspect/"
+    if not str(uri).startswith(own) or ".." in str(uri):
+        raise JobFailed(f"reset list {uri} is not under the inspect prefix of this run ({own})")
     key = str(uri).removeprefix(f"s3://{bucket}/")
     tables = json.loads(aws.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()).get("resetTables")
     count = int(ctx.get("resetTablesCount") or 0)
@@ -98,7 +102,7 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
     phase = event["phase"]
     run_id = event["runId"]
     payload_ctx = event.get("ctx") or {}
-    ctx = expand_reset_tables(payload_ctx)
+    ctx = expand_reset_tables(payload_ctx, run_id)
     dry_run = bool(event.get("dryRun"))
     index = int(job.get("index", 0))
     base = f"{run_prefix(ctx.get('project'), run_id)}/jobs/{phase}/{index:02d}-{job['name']}"

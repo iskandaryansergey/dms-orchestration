@@ -294,10 +294,23 @@ def run_preflight(event: dict[str, Any], store: Store) -> dict[str, Any]:
     return out
 
 
+DECISION_FIELDS = ("startType", "resetScope", "resetTables", "resetTablesCount", "resetTablesUri")
+
+
+def job_decision(decision: dict[str, Any] | None) -> dict[str, Any]:
+    """The decision fields migrate passes to its jobs (jobCtx), as recorded on ``RUN#``.
+
+    prepare_job builds the job context from this record, never from the job-runner input, so a
+    reset job truncates only the tables this run decided (review item N1)."""
+    return {k: (decision or {}).get(k) for k in DECISION_FIELDS}
+
+
 def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
     if event.get("mode") == "preflight":
         store = Store(aws.table())
         out = run_preflight(event, store)
+        if event.get("runId"):
+            store.update_run(event["runId"], {"jobDecision": job_decision(out.get("decision"))})
         store.append_event(
             event.get("runId"),
             "sfn",
@@ -308,6 +321,17 @@ def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
         return out
     result = inspect(event, aws.client("dms"))
     run_id = event.get("runId")
+    if run_id:
+        Store(aws.table()).update_run(
+            run_id,
+            {
+                "jobInspect": {
+                    "migrationType": result.get("migrationType"),
+                    "selectionRules": result.get("selectionRules"),
+                },
+                "jobDecision": job_decision(result.get("decision")),
+            },
+        )
     Store(aws.table()).append_event(
         run_id,
         "sfn",

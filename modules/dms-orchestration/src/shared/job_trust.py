@@ -27,6 +27,7 @@ from shared.registry import load_jobs, load_registration
 from shared.store import Store
 
 RUN_PHASES = ("preflight", "baseline", "pre", "dump", "reset", "post", "on_failure")
+RUN_DECISION_FIELDS = ("startType", "resetScope", "resetTables", "resetTablesCount", "resetTablesUri")
 CODE_FIELDS = ("runtime", "image", "handler", "function", "command", "sql", "with", "when")
 # with: values of the module's jobs a run may choose (pre-flight request option). Everything else
 # is fixed: waitSeconds is the module's, retentionDays at least the registration's
@@ -168,14 +169,26 @@ def _run_phase(event: dict[str, Any], store: Store) -> dict[str, Any]:
     if given.get("jobsVersion") not in (None, version):
         raise _refuse(f"job set version {given.get('jobsVersion')!r} is not the version of run {run_id} ({version!r})")
     trusted = module_job(phase, job, reg) or job_set_job(phase, job, str(project), version, reg)
+    # Only these fields, each from the registration or what the module recorded on RUN#; nothing
+    # of the input's ctx is kept (review item N1).
+    inspected, decision = run.get("jobInspect") or {}, run.get("jobDecision") or {}
     ctx = {
-        **given,
         "project": project,
         "taskKey": task,
+        "environment": reg.get("environment") or aws.env("ENVIRONMENT", ""),
         "taskArn": reg["taskArn"],
+        "replicationInstanceArn": reg.get("replicationInstanceArn"),
+        "endpointArns": reg.get("endpointArns") or [],
         "connections": reg.get("connections") or {},
         "jobsS3Prefix": _jobs_prefix(reg, str(project), version),
+        "jobsVersion": version,
+        "attempt": int(run.get("attempt") or 1),
+        "migrationType": inspected.get("migrationType"),
+        "selectionRules": inspected.get("selectionRules"),
+        **{k: decision.get(k) for k in RUN_DECISION_FIELDS},
     }
+    if not ctx["resetTables"]:
+        ctx["resetTables"] = []
     dry_run = bool(event.get("dryRun")) or bool(run.get("dryRun"))
     return {**event, "job": trusted, "ctx": ctx, "dryRun": dry_run}
 

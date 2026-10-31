@@ -91,7 +91,7 @@ def test_prepare_fargate_job_renders_command_and_writes_spec(jobs_env):
 
 
 LONG = [f"app.t{i:04d}" for i in range(600)]
-LONG_KEY = "runs/run-1/inspect/reset-tables.json"
+LONG_KEY = "runs/ledger/run-1/inspect/reset-tables.json"
 
 
 def _long_ctx(jobs_env, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -136,7 +136,7 @@ def test_prepare_refuses_a_reset_list_that_does_not_match_its_count(jobs_env):
             event(job(command=["psql-run", "--truncate-scope"]), ctx=_long_ctx(jobs_env, {"resetTables": LONG[:3]}))
         )
     other = {**CTX, "resetTables": [], "resetTablesCount": 600, "resetTablesUri": "s3://elsewhere/x.json"}
-    with pytest.raises(JobFailed, match="artifacts bucket"):
+    with pytest.raises(JobFailed, match="inspect prefix"):
         handler(event(job(command=["psql-run", "--truncate-scope"]), ctx=other))
 
 
