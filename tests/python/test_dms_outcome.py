@@ -262,6 +262,14 @@ def test_stale_stopped_state_from_previous_run_is_pending():
     assert res.kind == "PENDING"
 
 
+def test_stopped_task_with_this_start_but_old_stop_date_is_pending_after_grace():
+    # Seen live: the STOPPED event of a load that ran 22 min; Describe gave the new StartDate
+    # but still the StopDate of the previous run and no StopReason. The task did start.
+    task = dms_task("stopped", None, StartDate="2026-10-27T10:00:30Z", StopDate=BEFORE)
+    res = d.evaluate_outcome(task, FULL_LOAD, started_at=STARTED, now="2026-10-27T10:30:00Z")
+    assert res.kind == "PENDING"
+
+
 def test_task_that_never_picks_up_start_fails_after_grace():
     task = dms_task("ready")
     res = d.evaluate_outcome(task, FULL_LOAD, started_at=STARTED, now="2026-10-27T10:20:00Z")

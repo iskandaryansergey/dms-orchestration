@@ -486,6 +486,12 @@ def evaluate_outcome(
         )
 
     if status in ("stopped", "failed", "failed-move") and started and stop_date and stop_date < started:
+        # A StartDate after the start request means the task did pick it up: the StopDate is the
+        # previous run's because Describe has not caught up with this stop yet (seen live with the
+        # STOPPED event of a 22-minute load). Wait for it instead of failing DmsTaskNotStarted.
+        start_date = as_dt(stats.get("StartDate") or stats.get("FreshStartDate"))
+        if start_date and start_date >= started:
+            return Outcome("PENDING", cause=f"task is {status}; DMS has not updated StopDate yet", task=summary)
         return _pending_or_not_started(summary, started, now_dt)
 
     if status in ("failed", "failed-move"):
