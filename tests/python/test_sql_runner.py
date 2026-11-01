@@ -525,7 +525,7 @@ def test_dockerfile_base_image_is_a_build_arg_pinned_by_digest() -> None:
 def test_dockerfile_takes_every_source_as_a_build_arg_for_internal_mirrors() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
     args = _build_args(text)
-    for arg in ("PGDG_APT_URL", "PGDG_KEY_URL", "PIP_INDEX_URL", "RDS_CA_URL", "POWERSHELL_DEB_URL"):
+    for arg in ("PGDG_APT_URL", "PGDG_GPG_URL", "PIP_INDEX_URL", "RDS_CA_URL", "POWERSHELL_DEB_URL"):
         assert args.get(arg, "").startswith("https://"), arg
         assert "${" + arg + "}" in text, f"{arg} is declared but not used"
     # No source is hard-coded outside its build arg.
@@ -538,12 +538,12 @@ def test_dockerfile_checks_every_download() -> None:
     args = _build_args(text)
     assert re.fullmatch(r"[0-9a-f]{64}", args.get("RDS_CA_SHA256", ""))
     assert re.fullmatch(r"[0-9a-f]{64}", args.get("POWERSHELL_DEB_SHA256", ""))
-    assert re.fullmatch(r"[0-9A-F]{40}", args.get("PGDG_KEY_FINGERPRINT", ""))
+    assert re.fullmatch(r"[0-9A-F]{40}", args.get("PGDG_GPG_FPR", ""))
     # Three downloads (PGDG key, RDS CA bundle, PowerShell .deb), each checked before use.
     assert len(re.findall(r"\bcurl\b[^\n]*-o ", text)) == 3
     assert "${RDS_CA_SHA256}" in text and "${POWERSHELL_DEB_SHA256}" in text
     assert text.count("sha256sum -c") == 2
-    assert '"${PGDG_KEY_FINGERPRINT}"' in text
+    assert '"${PGDG_GPG_FPR}"' in text
     # One RDS CA bundle across runtimes: the one the Lambda SQL runtime pins.
     sqlclient = (REPO_ROOT / "modules/dms-orchestration/src/shared/sqlclient.py").read_text(encoding="utf-8")
     assert f'CA_BUNDLE_SHA256 = "{args["RDS_CA_SHA256"]}"' in sqlclient

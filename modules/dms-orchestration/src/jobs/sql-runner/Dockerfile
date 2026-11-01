@@ -8,7 +8,7 @@
 #   docker build -f modules/dms-orchestration/src/jobs/sql-runner/Dockerfile -t sql-runner:<git-sha> .
 # Every source is a build arg, so a platform without internet access builds from its mirrors:
 #   --build-arg BASE_IMAGE=<registry mirror>/python:<tag>@sha256:<digest>
-#   --build-arg PGDG_APT_URL=... PGDG_KEY_URL=... PIP_INDEX_URL=... RDS_CA_URL=... POWERSHELL_DEB_URL=...
+#   --build-arg PGDG_APT_URL=... PGDG_GPG_URL=... PIP_INDEX_URL=... RDS_CA_URL=... POWERSHELL_DEB_URL=...
 # Every download is checked (sha256 or the signing key fingerprint), Python packages install by
 # hash only (requirements.txt, compiled from requirements.in). Mirrors serve the same bytes,
 # so the checksums stay. CI (only when vars.BUILD_SQL_RUNNER_IMAGE is 'true') lints it with
@@ -20,8 +20,8 @@ FROM ${BASE_IMAGE}
 
 ARG PG_MAJOR=17
 ARG PGDG_APT_URL=https://apt.postgresql.org/pub/repos/apt
-ARG PGDG_KEY_URL=https://www.postgresql.org/media/keys/ACCC4CF8.asc
-ARG PGDG_KEY_FINGERPRINT=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+ARG PGDG_GPG_URL=https://www.postgresql.org/media/keys/ACCC4CF8.asc
+ARG PGDG_GPG_FPR=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
 # The bundle the Lambda SQL runtime pins too (modules/dms-orchestration/src/shared/sqlclient.py CA_BUNDLE_SHA256).
 ARG RDS_CA_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 ARG RDS_CA_SHA256=90a6f1a7978a1b1b096dca6c57511ca48d3b8cf052f8e704baf358f34ea2f21b
@@ -39,9 +39,9 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release libssl3 openssl \
  && GNUPGHOME="$(mktemp -d)" && export GNUPGHOME \
- && curl -fsSL -o /tmp/pgdg.asc "${PGDG_KEY_URL}" \
+ && curl -fsSL -o /tmp/pgdg.asc "${PGDG_GPG_URL}" \
  && fprs="$(gpg --batch --show-keys --with-colons /tmp/pgdg.asc | awk -F: '$1 == "pub" {getline; print $10}')" \
- && test "${fprs}" = "${PGDG_KEY_FINGERPRINT}" \
+ && test "${fprs}" = "${PGDG_GPG_FPR}" \
  && install -d /usr/share/postgresql-common/pgdg \
  && install -m 0644 /tmp/pgdg.asc /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
  && rm -rf /tmp/pgdg.asc "${GNUPGHOME}" \

@@ -43,7 +43,7 @@ Three runtimes, chosen per job (`runtime: lambda | ssm | fargate`):
   (or a prebuilt one, `lambda.artifact_s3_*`) and, for Fargate, a pre-pushed image URI, pinned
   by digest. Whoever builds the image builds it from the hardened Dockerfile
   (`modules/dms-orchestration/src/jobs/sql-runner/Dockerfile`): base image pinned by digest through `BASE_IMAGE`, every
-  source a build arg for internal mirrors (`PGDG_APT_URL`, `PGDG_KEY_URL`, `PIP_INDEX_URL`,
+  source a build arg for internal mirrors (`PGDG_APT_URL`, `PGDG_GPG_URL`, `PIP_INDEX_URL`,
   `RDS_CA_URL`, `POWERSHELL_DEB_URL`), every download checked (PGDG key fingerprint, CA bundle
   and PowerShell `.deb` by sha256), Python wheels by hash only, PowerShell off by default. CI
   builds and scans it only when the repository variable `BUILD_SQL_RUNNER_IMAGE` is `true`; the
