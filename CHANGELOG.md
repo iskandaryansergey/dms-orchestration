@@ -71,9 +71,10 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
   scenario `s19-chain-dump`, which relied on it and never reproduced live, is replaced by an
   offline test of the chain retry → dump → restore ([testing.md](docs/testing.md)).
 - A post retry with `--from-job` skips a post job before it only if its `JOB#` record is `ok`
-  *and* carries the run's own `dryRun` (a record without the flag counts as a real run). Upgrade: a `JOB#` written before
-  the fix by a dry re-run of a real run's job (run 11 overwrote a real run's record with a dry
-  `ok`) is no longer trusted, and that job runs again on the next post retry.
+  *and* carries the run's own `dryRun` (a record without the flag counts as a real run); without
+  `--from-job` every post job runs again. Upgrade: a `JOB#` written before the fix by a dry
+  re-run of a real run's job (run 11 overwrote a real run's record with a dry `ok`) is no longer
+  trusted, and that job runs again on the next post retry.
 - **Breaking:** runs saved by 0.1.0 are refused by `post` and `orch.py post` (`ContextNotPinned`:
   the run item has no context version and the artifacts moved under the project). Bucket
   `versioning` is now required: without a version id `migrate` stops before DMS.
