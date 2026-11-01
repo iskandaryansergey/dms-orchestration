@@ -288,7 +288,14 @@ def repeat_post(data: dict[str, Any], saved: dict[str, Any], execution: dict[str
     from_job = data.get("fromJob")
     if from_job and from_job not in names:
         raise InvalidRunRequest(f"fromJob {from_job!r} is not a post job of run {run_id} (have: {names})")
-    ok = {j.get("name") for j in store.job_results(run_id) if j.get("phase") == "post" and j.get("status") == "ok"}
+    # A job is done only if its ok was recorded with the run's own flag: a JOB# written before the
+    # dryRun fix by a dry re-run of a real run's job (run 11, finding 2) is not the run's result.
+    dry = bool((saved.get("request") or {}).get("dryRun", False))
+    ok = {
+        j.get("name")
+        for j in store.job_results(run_id)
+        if j.get("phase") == "post" and j.get("status") == "ok" and bool(j.get("dryRun", False)) == dry
+    }
     start = names.index(from_job) if from_job else 0
     selected = [j for i, j in enumerate(jobs) if i >= start or j["name"] not in ok]
     ctx["jobs"] = {**(ctx.get("jobs") or {}), "post": selected}

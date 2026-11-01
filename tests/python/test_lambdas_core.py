@@ -1379,9 +1379,16 @@ def _save_repeat_context(env) -> None:
     _pin_context(env, json.dumps(saved).encode())
 
 
-def _job(table, name: str, index: int, status: str) -> None:
+def _job(table, name: str, index: int, status: str, **extra) -> None:
     table.put_item(
-        Item={"pk": "RUN#run-1", "sk": f"JOB#post#{index:02d}#{name}", "phase": "post", "name": name, "status": status}
+        Item={
+            "pk": "RUN#run-1",
+            "sk": f"JOB#post#{index:02d}#{name}",
+            "phase": "post",
+            "name": name,
+            "status": status,
+            **extra,
+        }
     )
 
 
@@ -1417,6 +1424,39 @@ def test_post_repeat_runs_again_every_earlier_job_that_is_not_ok(env, store, tab
     # indexes failed and row-counts never ran: both run again; cleanup is where the operator starts
     assert [j["name"] for j in out["ctx"]["jobs"]["post"]] == ["indexes", "row-counts", "cleanup"]
     assert out["skippedJobs"] == []
+
+
+def test_post_repeat_does_not_skip_an_ok_job_recorded_with_another_dry_run_flag(env, store, table):
+    """Run 11 finding 2, defense in depth: a JOB# written before the dryRun fix by a dry re-run of a
+    real run's job says ok, but it is not the run's result, so the post retry runs that job again."""
+    from lambdas.resolve_context.handler import handler
+
+    _save_repeat_context(env)  # a real run (request.dryRun false)
+    _job(table, "indexes", 0, "ok", dryRun=True)
+    _job(table, "row-counts", 1, "ok", dryRun=False)
+    use(dms=FakeDms(FINISHED), sfn=FakeSfn())
+    out = _repeat(handler, from_job="cleanup")
+    assert [j["name"] for j in out["ctx"]["jobs"]["post"]] == ["indexes", "cleanup"]
+    assert out["skippedJobs"] == ["row-counts"]
+
+
+def test_post_repeat_of_a_dry_run_skips_only_its_dry_ok_jobs(env, store, table):
+    from lambdas.resolve_context.handler import handler
+
+    saved = {
+        **SAVED_CONTEXT,
+        "request": {**SAVED_CONTEXT["request"], "dryRun": True},
+        "ctx": {**SAVED_CONTEXT["ctx"], "taskKey": "core", "jobs": {"post": POST_JOBS}},
+        "inspect": {"state": "fresh", "completionSpec": {"mode": "task-stopped"}},
+        "startedAt": "2026-10-27T10:00:00Z",
+    }
+    _pin_context(env, json.dumps(saved).encode())
+    _job(table, "indexes", 0, "ok", dryRun=True)
+    _job(table, "row-counts", 1, "ok")  # no flag: a real result
+    use(dms=FakeDms(FINISHED), sfn=FakeSfn())
+    out = _repeat(handler, from_job="cleanup")
+    assert [j["name"] for j in out["ctx"]["jobs"]["post"]] == ["row-counts", "cleanup"]
+    assert out["skippedJobs"] == ["indexes"]
 
 
 def test_post_repeat_is_refused_while_another_run_or_the_first_post_holds_the_lock(env, store, table):
