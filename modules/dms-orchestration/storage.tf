@@ -120,6 +120,13 @@ locals {
       NoncurrentVersionExpiration    = { NoncurrentDays = 1 }
       AbortIncompleteMultipartUpload = { DaysAfterInitiation = 1 }
     },
+    # Parts of an upload that never completed are billed and invisible: drop them bucket-wide.
+    {
+      ID                             = "abort-incomplete-uploads"
+      Status                         = "Enabled"
+      Filter                         = { Prefix = "" }
+      AbortIncompleteMultipartUpload = { DaysAfterInitiation = 7 }
+    },
   ]
 }
 
@@ -210,6 +217,18 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
     }
     abort_incomplete_multipart_upload {
       days_after_initiation = local.bucket_lifecycle_rules[2].AbortIncompleteMultipartUpload.DaysAfterInitiation
+    }
+  }
+
+  rule {
+    id     = local.bucket_lifecycle_rules[3].ID
+    status = "Enabled"
+    # Literal, not the local: checkov reads an unresolved expression as a non-empty prefix (CKV_AWS_300).
+    filter {
+      prefix = ""
+    }
+    abort_incomplete_multipart_upload {
+      days_after_initiation = local.bucket_lifecycle_rules[3].AbortIncompleteMultipartUpload.DaysAfterInitiation
     }
   }
 }

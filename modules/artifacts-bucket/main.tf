@@ -104,6 +104,18 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
     }
   }
 
+  # Parts of an upload that never completed are billed and invisible: drop them bucket-wide.
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+    filter {
+      prefix = ""
+    }
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
   depends_on = [aws_s3_bucket_versioning.this]
 }
 

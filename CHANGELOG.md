@@ -133,6 +133,9 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
 - `orch.py restore` holds the task lock (`LOCK#`) for its whole duration and takes
   `--runtime ssm|fargate` (SSM by default when the module has it); `orch.py report` takes
   `--project` or reads it from the run item.
+- The artifacts bucket (created by the module or by `modules/artifacts-bucket`) aborts incomplete
+  multipart uploads bucket-wide after 7 days (lifecycle rule `abort-incomplete-uploads`; `dumps/`
+  keeps 1 day). `bucket_requirements` lists the rule, so a brought bucket should add it too.
 
 ### Added
 - Lambda SQL runtime: `sql` jobs (connection, file or inline SQL, vars, `singleTransaction`,

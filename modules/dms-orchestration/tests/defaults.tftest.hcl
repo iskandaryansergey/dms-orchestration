@@ -372,6 +372,11 @@ run "dumps_are_kms_only_and_expire" {
   }
 
   assert {
+    condition     = one([for r in aws_s3_bucket_lifecycle_configuration.artifacts[0].rule : r.abort_incomplete_multipart_upload[0].days_after_initiation if r.id == "abort-incomplete-uploads" && r.filter[0].prefix == ""]) == 7
+    error_message = "incomplete multipart uploads are aborted bucket-wide after 7 days"
+  }
+
+  assert {
     condition     = strcontains(aws_s3_bucket_policy.artifacts[0].policy, "DenyDumpsWithoutKms")
     error_message = "dumps/ accept only SSE-KMS"
   }

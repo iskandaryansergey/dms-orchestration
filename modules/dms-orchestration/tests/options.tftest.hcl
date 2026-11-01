@@ -83,8 +83,9 @@ run "bring_your_own_bucket_topic_cluster_sg" {
       one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.Expiration.Days if r.Filter.Prefix == "runs/"]) == 365,
       one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.Expiration.Days if r.Filter.Prefix == "dumps/"]) == 14,
       one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.NoncurrentVersionExpiration.NoncurrentDays if r.Filter.Prefix == "jobs/"]) == 90,
+      one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.AbortIncompleteMultipartUpload.DaysAfterInitiation if r.Filter.Prefix == ""]) == 7,
     ])
-    error_message = "lifecycle rules carry the module's retention values for runs/, dumps/ and jobs/"
+    error_message = "lifecycle rules carry the module's retention values for runs/, dumps/ and jobs/ and abort incomplete uploads bucket-wide"
   }
 
   assert {

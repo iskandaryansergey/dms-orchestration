@@ -61,8 +61,9 @@ run "bucket_has_the_required_controls" {
       one([for r in aws_s3_bucket_lifecycle_configuration.this[0].rule : r.abort_incomplete_multipart_upload[0].days_after_initiation if r.filter[0].prefix == "dumps/"]) == 1,
       one([for r in aws_s3_bucket_lifecycle_configuration.this[0].rule : r.expiration[0].days if r.filter[0].prefix == "runs/"]) == 365,
       one([for r in aws_s3_bucket_lifecycle_configuration.this[0].rule : r.noncurrent_version_expiration[0].noncurrent_days if r.filter[0].prefix == "jobs/"]) == 90,
+      one([for r in aws_s3_bucket_lifecycle_configuration.this[0].rule : r.abort_incomplete_multipart_upload[0].days_after_initiation if r.filter[0].prefix == ""]) == 7,
     ])
-    error_message = "dumps/ expire after dump_retention_days (14), runs/ after report_retention_days (365), old job set versions after 90 days"
+    error_message = "dumps/ expire after dump_retention_days (14), runs/ after report_retention_days (365), old job set versions after 90 days, incomplete uploads bucket-wide after 7 days"
   }
 
   assert {
