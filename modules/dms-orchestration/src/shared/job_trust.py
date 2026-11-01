@@ -281,6 +281,11 @@ def _restore(event: dict[str, Any], store: Store) -> dict[str, Any]:
     run_id = str(event.get("runId") or "")
     if not run_id.startswith("restore-") or not _NAME.match(run_id):
         raise _refuse(f"restore: run id {run_id!r} is not a restore-… id (orch.py restore)")
+    # The operator's flag (no RUN# here), but only a real boolean: prepare_job does bool(dryRun),
+    # so the string "false" would become a dry run. Identity, since 0 == False and 1 == True.
+    dry = event.get("dryRun")
+    if dry is not None and dry is not True and dry is not False:
+        raise _refuse(f"restore: dryRun {dry!r} is not true, false or absent")
     given = event.get("ctx") or {}
     project = _name(given.get("project"), "project")
     task = _name(given.get("taskKey"), "task")

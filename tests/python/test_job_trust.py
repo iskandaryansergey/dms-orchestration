@@ -524,6 +524,23 @@ def test_restore_accepts_nothing_else(locked, job):
         prepare(restore_event(job))
 
 
+@pytest.mark.parametrize("given", [None, True, False])
+def test_restore_takes_the_dry_run_flag_of_the_operator(locked, given):
+    """A restore has its own restore-… id under its own lock, no RUN# of a run: the flag is the operator's."""
+    assert prepare(restore_event(restore_job(), dryRun=given))["dryRun"] is bool(given)
+
+
+@pytest.mark.parametrize("given", ["false", "true", 0, 1, "", [], {}])
+def test_restore_refuses_a_dry_run_flag_that_is_not_a_boolean(locked, given):
+    """prepare_job does bool(dryRun): the string "false" would become a dry run."""
+    from shared.errors import JobNotInJobSet
+
+    with pytest.raises(JobNotInJobSet, match="dryRun"):
+        prepare(restore_event(restore_job(), dryRun=given))
+    listed = locked["s3"].list_objects_v2(Bucket=BUCKET, Prefix="runs/").get("Contents") or []
+    assert listed == []  # no spec.json
+
+
 def test_restore_needs_a_registered_task_and_a_restore_run_id(locked):
     from shared.errors import JobNotInJobSet, UnknownTask
 

@@ -142,7 +142,9 @@ rendered or written, `prepare_job` (`shared/job_trust.py`):
   restore baseline for such a dump, scoped by the DMS task's table mapping; the run id must be a
   `restore-…` id, and `LOCK#<taskArn>` must be held by that restore id and by this very
   job-runner execution (as `orch.py restore` holds it), so a restore never runs under a run's
-  lock;
+  lock; in `restore` the `dryRun` flag is the operator's (a restore has its own `restore-…` run
+  under its own lock, no `RUN#` of another run to take it from), accepted only as `true`,
+  `false` or absent — anything else (the string `"false"` would turn into a dry run) is refused;
 * `dryRun` is the one recorded on `RUN#`: an input that says otherwise is refused, and the
   job-runner executes and records (`JOB#…`) with the flag `PrepareJob` returned, never the
   input's. A dry re-run of a job of a real run therefore cannot overwrite the run's `JOB#` record
