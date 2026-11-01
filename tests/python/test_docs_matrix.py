@@ -28,6 +28,34 @@ def matrix_scenarios() -> list[str]:
     return [re.match(r"\| `([^`]+)`", ln).group(1) for ln in rows]
 
 
+def planned_scenarios() -> list[str]:
+    """First cells of the table under '## Planned scenarios': named, not yet in e2e.py."""
+    text = TESTING.read_text(encoding="utf-8")
+    section = text.split("## Planned scenarios", 1)[1].split("\n## ", 1)[0]
+    rows = [ln for ln in section.splitlines() if ln.startswith("| `")]
+    return [re.match(r"\| `([^`]+)`", ln).group(1) for ln in rows]
+
+
+# Scenarios the 0.2 changes call for; each is either in e2e.py (and the matrix) or planned.
+SCENARIOS_0_2 = {
+    "s1ssm",
+    "dry-ro",
+    "s4big",
+    "s17-lock-lost",
+    "s18-recheck",
+    "s20-tampered-jobset",
+    "s21-validation",
+}
+
+
+def test_planned_scenarios_are_not_in_e2e_and_cover_the_0_2_changes():
+    planned = planned_scenarios()
+    assert len(planned) == len(set(planned)), "a scenario is planned twice"
+    names = e2e_scenarios()
+    assert set(planned) & names == set(), "implemented scenarios belong in the matrix, not the plan"
+    assert SCENARIOS_0_2 - names - set(planned) == set(), "a 0.2 scenario is neither run nor planned"
+
+
 def test_e2e_parser_finds_the_known_scenarios():
     names = e2e_scenarios()
     assert {"s1", "s1p", "idem-sfn", "s10snap", "s8fargate", "s1iam", "postdie", "s16"} <= names
@@ -47,3 +75,23 @@ def test_testing_doc_covers_every_level():
     for level in ("pytest", "moto", "asl_runner.py", "terraform test", "TestState", "e2e.py", "denylist", "trivy"):
         assert level in text, level
     assert "## Adding a scenario" in text and "## Adding a state machine case" in text
+
+
+# Scenarios dropped from e2e.py because they cannot be reproduced live, with the offline test
+# that covers the same chain (docs/testing.md, "Replaced by offline tests").
+REPLACED = {
+    "s19-chain-dump": (
+        "test_asl.py",
+        "test_a_resume_chain_dumps_before_its_first_reset_and_that_dump_can_be_restored",
+    ),
+}
+
+
+def test_replaced_scenarios_are_gone_from_e2e_and_their_offline_tests_exist():
+    names = e2e_scenarios() | set(matrix_scenarios()) | set(planned_scenarios())
+    assert set(REPLACED) & names == set(), "a replaced scenario is still run, listed or planned"
+    text = TESTING.read_text(encoding="utf-8")
+    section = text.split("## Replaced by offline tests", 1)[1].split("\n## ", 1)[0]
+    for name, (module, test) in REPLACED.items():
+        assert f"`{name}`" in section and f"`{module}::{test}`" in section
+        assert f"def {test}(" in (ROOT / "tests" / "python" / module).read_text(encoding="utf-8")

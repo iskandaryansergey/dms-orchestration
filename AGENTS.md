@@ -10,9 +10,10 @@ them: [`docs/ai-assisted-development.md`](docs/ai-assisted-development.md).
 | [`modules/dms-orchestration/`](modules/dms-orchestration/) | the Terraform module: state machines, Lambdas, IAM, storage, checks |
 | [`modules/dms-orchestration/asl/`](modules/dms-orchestration/asl/) | state machine definitions (ASL, JSONata): `migrate`, `post`, `job-runner` |
 | [`modules/dms-orchestration/tests/`](modules/dms-orchestration/tests/) | `terraform test` with a mock provider (no AWS) |
-| [`src/lambdas/`](src/lambdas/) | Lambda handlers, one directory each |
-| [`src/shared/`](src/shared/) | shared library: store, DMS outcome, pre-flight, job sets, schemas |
-| [`src/jobs/sql-runner/`](src/jobs/sql-runner/) | Fargate job image (psql, mysql, python, bash, pwsh) |
+| [`modules/artifacts-bucket/`](modules/artifacts-bucket/) | optional artifacts bucket for a long-lived workspace, with the controls of `bucket_requirements` |
+| [`modules/dms-orchestration/src/lambdas/`](modules/dms-orchestration/src/lambdas/) | Lambda handlers, one directory each |
+| [`modules/dms-orchestration/src/shared/`](modules/dms-orchestration/src/shared/) | shared library: store, DMS outcome, pre-flight, job sets, schemas |
+| [`modules/dms-orchestration/src/jobs/sql-runner/`](modules/dms-orchestration/src/jobs/sql-runner/) | Fargate job image (psql, mysql, python, bash, pwsh) |
 | [`scripts/`](scripts/) | operator CLI (`orch.py`), job set tool, teardown check, denylist gate |
 | [`examples/sandbox/`](examples/sandbox/) | throw-away stack for live e2e runs |
 | [`examples/jobs/`](examples/jobs/) | example job sets |
@@ -55,13 +56,16 @@ and `UPSTREAM_MODULES_REF` (see `examples/sandbox/upstream.env.example`).
   links to material outside the repository, in code, docs, tests, file names and commit
   messages. Commits carry no tool attribution trailers.
 - **No secrets** in files, test fixtures, prompts or logs: secret ARNs only.
+- **The module is self-contained**: code it packages lives under `modules/dms-orchestration/src/`,
+  never `${path.module}/..`. Every resource is gated on `create`; inputs are `nullable = false`
+  with `""` for unset optional strings ([conventions](docs/configuration.md#conventions)).
 - Descriptions of module inputs and outputs live in `variables.tf` / `outputs.tf`; run
   `make docs` after changing them.
 
 ## Contracts
 
-- Run requests: `src/shared/schemas/run_request.schema.json`.
-- Job sets: `src/shared/schemas/jobset.schema.json` ([`docs/job-contract.md`](docs/job-contract.md)).
+- Run requests: `modules/dms-orchestration/src/shared/schemas/run_request.schema.json`.
+- Job sets: `modules/dms-orchestration/src/shared/schemas/jobset.schema.json` ([`docs/job-contract.md`](docs/job-contract.md)).
 - State machines: `modules/dms-orchestration/asl/` ([`docs/state-machine.md`](docs/state-machine.md));
   cases in `tests/sfn/cases/`.
 - Module inputs and outputs: [`docs/configuration.md`](docs/configuration.md).

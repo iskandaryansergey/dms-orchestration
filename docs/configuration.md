@@ -6,6 +6,29 @@ are out of date (`make docs-check`). Edit the descriptions in the `.tf` files, n
 This hand-written part explains what a table cannot: the nested `projects` object, the
 advisory checks and the outputs meant for other teams.
 
+## Conventions
+
+The module follows the conventions of a shared modules registry:
+
+- `create` (default `true`) gates every resource: with `create = false` nothing is created or
+  packaged, and every output is empty (`null`, `{}`, `[]` or `"[]"`).
+- No input is nullable (`nullable = false`): passing `null` means the default.
+- An unset optional string is `""`, never `null`: `kms_key_arn`, `permissions_boundary_arn`,
+  `artifacts_bucket_name`, `table_name`, `sns_topic_arn`, `fargate.cluster_arn`,
+  `dms.log_group_name`, the `lambda.artifact_s3_*` fields, `ssm.instance_role_arn`,
+  `ssm.document_name_override`, the string fields of `projects` and `assessment`
+  (`assessment.role_arn = ""` = no assessment step). The task registration in SSM keeps `null`
+  for them, as before.
+- Switches are booleans, not `null` sentinels: `https_egress_vpc_cidr` and
+  `https_egress_gateway_endpoints` (both `true`) open 443 to the VPC CIDR and to the S3/DynamoDB
+  gateway prefix lists; `https_egress_cidr_blocks` and `https_egress_prefix_list_ids` add more.
+  `lambda.reserved_concurrency = -1` means unreserved.
+- Every resource is tagged `ManagedBy = "terraform"` and `Module = "dms-orchestration"`, besides
+  `dms-orch:module`, `dms-orch:environment` and the caller's `tags`.
+
+`modules/artifacts-bucket` follows the same conventions (`create`, `kms_key_arn = ""`,
+`Module = "artifacts-bucket"`).
+
 ## `projects`: projects, tasks and their defaults
 
 `projects` is a map of project name → `{ tasks = { <taskKey> = {...} } }`. The project name
@@ -16,7 +39,7 @@ for the state machines. Per task:
 | Field | Default | Meaning |
 |---|---|---|
 | `tasks` | — | map of task key → task settings (the rows below) |
-| `task_arn_key` | the task key | key in `dms.task_arns` of the replication task this task key drives; must exist there |
+| `task_arn_key` | `""` = the task key | key in `dms.task_arns` of the replication task this task key drives; must exist there |
 | `connections` | `{}` | map of connection name → database metadata for jobs and pre-flight; names `source` and `target` have a meaning (pre-flight, dumps) |
 | `jobs` | `{}` | where the job set of the task lives in the artifacts bucket |
 | `defaults` | `{}` | run defaults; a run request can override most of them |
@@ -29,23 +52,25 @@ Metadata and secret ARNs only, never secret values. Every `secret_arn` must also
 | Field | Default | Meaning |
 |---|---|---|
 | `engine` | — (required) | database engine of the connection: `postgresql` (any engine name with `mysql` in it is treated as MySQL) |
-| `secret_arn` | — (required with `auth = "secret"`) | Secrets Manager secret with the credentials; jobs and pre-flight read it at run time |
-| `host` | from the secret | host name, when the secret does not carry it |
+| `secret_arn` | `""` (required with `auth = "secret"`) | Secrets Manager secret with the credentials; jobs and pre-flight read it at run time |
+| `host` | `""` = from the secret | host name, when the secret does not carry it |
 | `port` | from the secret | port, when the secret does not carry it |
-| `database` | from the secret | database name |
+| `database` | `""` = from the secret | database name |
 | `ssl_mode` | `verify-full` | TLS mode for `psql`-based jobs; lower it only in a sandbox |
-| `data_api_cluster_arn` | none | Aurora cluster ARN for RDS Data API jobs and the pre-flight target fingerprint |
-| `cluster_arn` | `data_api_cluster_arn` | cluster to snapshot for `dump.method = snapshot` |
+| `data_api_cluster_arn` | `""` | Aurora cluster ARN for RDS Data API jobs and the pre-flight target fingerprint |
+| `cluster_arn` | `""` = `data_api_cluster_arn` | cluster to snapshot for `dump.method = snapshot` |
 | `auth` | `secret` | how Fargate (`psql`) jobs log in: `secret` (credentials from `secret_arn`) or `iam` (a short-lived IAM database token, TLS only; DMS and the Data API keep using secrets) |
-| `iam_user` | none | database user for `auth = "iam"`; it must have the `rds_iam` role in the engine |
-| `iam_policy_arn` | none | policy with `rds-db:connect` for `iam_user` (the upstream aurora module outputs it per user); attached to the project's job role. `auth = "iam"` needs `engine = postgresql`, `host`, `iam_user` and `iam_policy_arn` |
+| `iam_user` | `""` | database user for `auth = "iam"`; it must have the `rds_iam` role in the engine |
+| `iam_policy_arn` | `""` | policy with `rds-db:connect` for `iam_user` (the upstream aurora module outputs it per user); attached to the project's job role. `auth = "iam"` needs `engine = postgresql`, `host`, `iam_user` and `iam_policy_arn` |
 
 ### `jobs`
 
 | Field | Default | Meaning |
 |---|---|---|
-| `s3_prefix` | `jobs/<project>` | prefix of the job set versions in the artifacts bucket |
-| `default_version` | none | job set version used when the request names none; no version → the run has no jobs |
+| `s3_prefix` | `""` = `jobs/<project>` | prefix of the job set versions in the artifacts bucket |
+| `default_version` | `""` | job set version used when the request names none; no version → the run has no jobs. It must be in `bundles` unless `allow_unpinned` |
+| `bundles` | `{}` | version → total of its `bundle.sha256` (`scripts/jobset_tool.py hash <bundle-dir>`). A run takes only a listed version (`JobSetNotPinned`), and every file must match (`JobSetTampered`) |
+| `allow_unpinned` | `false` | let versions without a hash run (sandbox, development); files are still checked against a `bundle.sha256` found with them, and a listed hash is always enforced |
 
 ### `defaults`
 
@@ -55,8 +80,9 @@ Metadata and secret ARNs only, never secret values. Every `secret_arn` must also
 | `target_reset_policy` | `if-interrupted` | reset the target before a load: `never`, `if-interrupted` (after an interrupted load only) or `always` |
 | `run_timeout_seconds` | module `run_timeout_seconds` | hard limit of one run; the watchdog stops runs that exceed it |
 | `auto_resume_max_attempts` | `1` | how many times a run resumes by itself after a retryable failure |
-| `auto_resume_categories` | `TRANSIENT_SOURCE_CONN`, `TRANSIENT_TARGET_CONN`, `DMS_RESTART` | failure categories that may resume by themselves |
+| `auto_resume_categories` | `TRANSIENT_SOURCE_CONN`, `TRANSIENT_TARGET_CONN`, `DMS_RESTART` | failure categories that may resume by themselves (a run request may narrow them with `autoResume.onlyCategories`); only retryable categories ever resume, and `EXTERNAL_STOP` is refused here and in the run request (someone stopped the task on purpose) |
 | `fail_on_table_errors` | `true` | a load that finishes with tables in error fails the run instead of `COMPLETED_WITH_TABLE_ERRORS` |
+| `fail_on_validation_errors` | `true` | DMS validation mismatches (`ValidationState` not `Validated`, failed records or full-load error rows) fail the run instead of `COMPLETED_WITH_VALIDATION_ERRORS`; a table DMS cannot validate (`No primary key`) never fails the run, the report lists it in `validationSkippedTables` |
 | `dump_before_reset` | `false` | take a target dump before every reset (as `dump.enabled` in the request) |
 | `snapshot_dumps` | `false` | allow `dump.method = snapshot`: grants the job role cluster snapshot rights; needs `connections.target.cluster_arn` (or `data_api_cluster_arn`) |
 
@@ -75,8 +101,7 @@ sandbox).
 | `no_cmk` | `kms_key_arn` is not set: data at rest uses AWS managed keys |
 | `include_execution_data` | `include_execution_data = true`: state input and output go to CloudWatch Logs |
 | `fargate_image_tags` | a `fargate.images` entry has no tag or `:latest` (cannot be acknowledged; use an immutable tag) |
-| `no_fargate_images` | `fargate.images` is empty: only Lambda jobs are possible |
-| `lambda_reserved_concurrency` | `lambda.reserved_concurrency` is not set |
+| `lambda_reserved_concurrency` | `lambda.reserved_concurrency` is `-1` (unreserved) |
 | `own_sns_topic_outside_sandbox` | `sns_topic_arn` is empty outside `environment = "sandbox"` |
 | `state_in_the_dms_workspace` | `table_name` / `artifacts_bucket_name` are empty outside the sandbox: state would be destroyed with the DMS workspace |
 | `dumps_without_cmk` | target dumps outside the sandbox use the AWS managed S3 key |
@@ -85,11 +110,37 @@ sandbox).
 
 - `network_contract`: what the network must provide; the module creates no VPC endpoints.
   Required and optional interface endpoints, egress rules, the jobs security group to allow on
-  the databases.
-- `kms_key_policy_requirements`: JSON list of key policy statements a customer managed key
-  needs when `kms_key_arn` is set; the module does not manage the key policy.
+  the databases. `rds` is required as soon as one task has `defaults.snapshot_dumps = true`.
+- `bucket_requirements`: JSON list of the controls the artifacts bucket must have when it is
+  brought through `artifacts_bucket_name` (the module manages only a bucket it creates):
+  - `Versioning` enabled — required: `post` loads `context.json` by the version id `migrate`
+    recorded and refuses a run whose context was overwritten (`ContextNotPinned`);
+  - `DefaultEncryption`: SSE-KMS with `kms_key_arn` (or the AWS managed key `aws/s3`), bucket key on;
+  - `DenyInsecureTransport` and `DenyDumpsWithoutKms`: the bucket policy statements, with the
+    bucket ARN filled in;
+  - `Lifecycle`: rules for `runs/` (`report_retention_days`), `jobs/` (old versions after 90 days)
+    and `dumps/` (`dump_retention_days`, incomplete uploads after one day), in the S3 API shape.
+
+  Job sets are published create-only (`jobset_publisher_policy_json`), so the bucket needs no
+  object lock for them. `modules/artifacts-bucket` creates a bucket with all five controls for a
+  long-lived workspace; pass its `bucket_name` output as `artifacts_bucket_name`.
+- `kms_key_policy_requirements`: what a customer managed key must allow when `kms_key_arn` is
+  set, as the KMS key policy contract v2: a JSON list of items
+  `{sid, principals = {services, arns, roles}, actions, conditions, purpose}`. `roles` are
+  symbolic and resolved by the key module: `deployer` (the identity that applies this module:
+  it creates the encrypted resources) and `module` (the module's roles, whose ARNs are in
+  `arns`). The module does not manage the key policy.
+- `kms_key_policy_statements`: the same requirements as key policy statements (v1: `Sid`,
+  `Principal`, `Action`, `Condition`), concrete principals only, for a key policy written by
+  hand. Both are `"[]"` without `kms_key_arn`.
 - `operator_policy_json`: IAM policy for the operator role (CLI or CI): start, watch and stop
-  runs, read reports, sync job sets. Not attached by the module.
+  runs, read reports, take the task lock for `orch.py restore`. It cannot upload job sets. Not
+  attached by the module.
+- `jobset_publisher_policy_json`: map of project key to an IAM policy for whoever publishes that
+  project's job sets (`scripts/sync-jobs.sh`): write and list `jobs/<project>/` only, and write
+  only new objects (`PutObject` must carry `If-None-Match`), so a published version is never
+  overwritten. Job set code runs with the project's job role, so this grant is separate from
+  running migrations.
 
 ## Generated reference
 
@@ -113,16 +164,17 @@ sandbox).
 
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
-| <a name="input_dms"></a> [dms](#input\_dms) | Outputs of the DMS module: replication instance, task ARNs and resource ids, endpoints, log group. | <pre>object({<br/>    replication_instance_arn = string<br/>    replication_instance_id  = string<br/>    task_arns                = map(string)<br/>    task_resource_ids        = optional(map(string), {})<br/>    endpoint_arns            = optional(map(string), {})<br/>    log_group_name           = optional(string)<br/>  })</pre> | n/a | yes |
+| <a name="input_dms"></a> [dms](#input\_dms) | Outputs of the DMS module: replication instance, task ARNs and resource ids, endpoints, log group. | <pre>object({<br/>    replication_instance_arn = string<br/>    replication_instance_id  = string<br/>    task_arns                = map(string)<br/>    task_resource_ids        = optional(map(string), {})<br/>    endpoint_arns            = optional(map(string), {})<br/>    log_group_name           = optional(string, "")<br/>  })</pre> | n/a | yes |
 | <a name="input_environment"></a> [environment](#input\_environment) | Environment name: sandbox, dev, stage, qa or prod. | `string` | n/a | yes |
-| <a name="input_projects"></a> [projects](#input\_projects) | Projects and their DMS tasks. The map key of a task is the taskKey used in run requests.<br/>task\_arn\_key defaults to the task key and must exist in dms.task\_arns.<br/>connections hold metadata and secret ARNs only — never secret values. | <pre>map(object({<br/>    tasks = map(object({<br/>      task_arn_key = optional(string)<br/>      connections = optional(map(object({<br/>        engine               = string<br/>        secret_arn           = optional(string) # required with auth = "secret"<br/>        host                 = optional(string)<br/>        port                 = optional(number)<br/>        database             = optional(string)<br/>        ssl_mode             = optional(string, "verify-full")<br/>        data_api_cluster_arn = optional(string)<br/>        cluster_arn          = optional(string) # dump.method = snapshot; default data_api_cluster_arn<br/>        # auth = "iam": Fargate jobs log in as iam_user with an IAM token (psql only, TLS); the<br/>        # policy with rds-db:connect (upstream aurora module, iam_database_auth.users[u].policy_arn)<br/>        # is attached to the project's job role. DMS and the Data API keep using secrets.<br/>        auth           = optional(string, "secret")<br/>        iam_user       = optional(string)<br/>        iam_policy_arn = optional(string)<br/>      })), {})<br/>      jobs = optional(object({<br/>        s3_prefix       = optional(string)<br/>        default_version = optional(string)<br/>      }), {})<br/>      defaults = optional(object({<br/>        completion               = optional(string, "auto")<br/>        target_reset_policy      = optional(string, "if-interrupted")<br/>        run_timeout_seconds      = optional(number)<br/>        auto_resume_max_attempts = optional(number, 1)<br/>        auto_resume_categories   = optional(list(string), ["TRANSIENT_SOURCE_CONN", "TRANSIENT_TARGET_CONN", "DMS_RESTART"])<br/>        fail_on_table_errors     = optional(bool, true)<br/>        dump_before_reset        = optional(bool, false)<br/>        snapshot_dumps           = optional(bool, false) # allow dump.method = snapshot (job role snapshot rights)<br/>      }), {})<br/>    }))<br/>  }))</pre> | n/a | yes |
+| <a name="input_projects"></a> [projects](#input\_projects) | Projects and their DMS tasks. The map key of a task is the taskKey used in run requests.<br/>task\_arn\_key defaults to the task key and must exist in dms.task\_arns.<br/>connections hold metadata and secret ARNs only — never secret values. | <pre>map(object({<br/>    tasks = map(object({<br/>      task_arn_key = optional(string, "")<br/>      connections = optional(map(object({<br/>        engine               = string<br/>        secret_arn           = optional(string, "") # required with auth = "secret"<br/>        host                 = optional(string, "")<br/>        port                 = optional(number)<br/>        database             = optional(string, "")<br/>        ssl_mode             = optional(string, "verify-full")<br/>        data_api_cluster_arn = optional(string, "")<br/>        cluster_arn          = optional(string, "") # dump.method = snapshot; default data_api_cluster_arn<br/>        # auth = "iam": Fargate jobs log in as iam_user with an IAM token (psql only, TLS); the<br/>        # policy with rds-db:connect (upstream aurora module, iam_database_auth.users[u].policy_arn)<br/>        # is attached to the project's job role. DMS and the Data API keep using secrets.<br/>        auth           = optional(string, "secret")<br/>        iam_user       = optional(string, "")<br/>        iam_policy_arn = optional(string, "")<br/>      })), {})<br/>      jobs = optional(object({<br/>        s3_prefix       = optional(string, "")<br/>        default_version = optional(string, "")<br/>        # version => total of its bundle.sha256 (scripts/jobset_tool.py hash <bundle-dir>). A run<br/>        # takes only a version listed here, and its runtimes check every file against the hash.<br/>        bundles = optional(map(string), {})<br/>        # Run versions not listed in bundles (sandbox, development). A listed hash is still enforced.<br/>        allow_unpinned = optional(bool, false)<br/>      }), {})<br/>      defaults = optional(object({<br/>        completion                = optional(string, "auto")<br/>        target_reset_policy       = optional(string, "if-interrupted")<br/>        run_timeout_seconds       = optional(number)<br/>        auto_resume_max_attempts  = optional(number, 1)<br/>        auto_resume_categories    = optional(list(string), ["TRANSIENT_SOURCE_CONN", "TRANSIENT_TARGET_CONN", "DMS_RESTART"])<br/>        fail_on_table_errors      = optional(bool, true)<br/>        fail_on_validation_errors = optional(bool, true) # validation mismatches fail the run; tables without a primary key are reported<br/>        dump_before_reset         = optional(bool, false)<br/>        snapshot_dumps            = optional(bool, false) # allow dump.method = snapshot (job role snapshot rights)<br/>      }), {})<br/>    }))<br/>  }))</pre> | n/a | yes |
 | <a name="input_subnet_ids"></a> [subnet\_ids](#input\_subnet\_ids) | Private subnets (database or application tier) for Lambda and Fargate; at least two. | `list(string)` | n/a | yes |
 | <a name="input_vpc_id"></a> [vpc\_id](#input\_vpc\_id) | VPC for Lambda functions and Fargate jobs. | `string` | n/a | yes |
 | <a name="input_acknowledged_checks"></a> [acknowledged\_checks](#input\_acknowledged\_checks) | Advisory checks to silence, e.g. ["no\_cmk"] in a sandbox. | `list(string)` | `[]` | no |
 | <a name="input_artifacts_bucket_name"></a> [artifacts\_bucket\_name](#input\_artifacts\_bucket\_name) | Existing bucket for job sets and run reports. Empty = create <name>-<environment>-artifacts-<account>. | `string` | `""` | no |
 | <a name="input_artifacts_force_destroy"></a> [artifacts\_force\_destroy](#input\_artifacts\_force\_destroy) | Allow destroying the created artifacts bucket with objects in it (sandbox only). | `bool` | `false` | no |
-| <a name="input_assessment"></a> [assessment](#input\_assessment) | DMS premigration assessment as a step of migrate, from the upstream<br/>module.dms.premigration\_assessment: role\_arn, bucket, folder (the task key is appended),<br/>kms\_key\_arn when the results use SSE-KMS. enabled = default for runs (a request may<br/>override it); fail\_on\_warning = a warning stops the run. null = no assessment step. | <pre>object({<br/>    role_arn        = string<br/>    bucket          = string<br/>    folder          = optional(string, "premigration-assessment")<br/>    kms_key_arn     = optional(string)<br/>    enabled         = optional(bool, false)<br/>    fail_on_warning = optional(bool, true)<br/>  })</pre> | `null` | no |
+| <a name="input_assessment"></a> [assessment](#input\_assessment) | DMS premigration assessment as a step of migrate, from the upstream<br/>module.dms.premigration\_assessment: role\_arn, bucket, folder (the task key is appended),<br/>kms\_key\_arn when the results use SSE-KMS. enabled = default for runs (a request may<br/>override it); fail\_on\_warning = a warning stops the run. role\_arn = "" = no assessment step. | <pre>object({<br/>    role_arn        = optional(string, "")<br/>    bucket          = optional(string, "")<br/>    folder          = optional(string, "premigration-assessment")<br/>    kms_key_arn     = optional(string, "")<br/>    enabled         = optional(bool, false)<br/>    fail_on_warning = optional(bool, true)<br/>  })</pre> | `{}` | no |
 | <a name="input_container_insights"></a> [container\_insights](#input\_container\_insights) | Container Insights on the ECS cluster the module creates. Off by default: its log group outlives destroy. | `bool` | `false` | no |
+| <a name="input_create"></a> [create](#input\_create) | Create the module's resources. false = nothing is created or packaged and every output is empty. | `bool` | `true` | no |
 | <a name="input_create_alarms"></a> [create\_alarms](#input\_create\_alarms) | Create CloudWatch alarms (state machine failures, Lambda errors, DLQ, watchdog not running). | `bool` | `true` | no |
 | <a name="input_create_security_group"></a> [create\_security\_group](#input\_create\_security\_group) | Create the jobs security group (no ingress). When false, pass security\_group\_ids. | `bool` | `true` | no |
 | <a name="input_database_cidr_blocks"></a> [database\_cidr\_blocks](#input\_database\_cidr\_blocks) | CIDR blocks of the database subnets for egress on database\_ports. | `list(string)` | `[]` | no |
@@ -130,23 +182,26 @@ sandbox).
 | <a name="input_database_security_group_ids"></a> [database\_security\_group\_ids](#input\_database\_security\_group\_ids) | Security groups of the databases for egress on database\_ports (preferred over CIDRs). | `list(string)` | `[]` | no |
 | <a name="input_dump_retention_days"></a> [dump\_retention\_days](#input\_dump\_retention\_days) | Days to keep target dumps: dumps/ in the created bucket (pg-dump-s3, S3 lifecycle) and cluster snapshots of dump.method = snapshot (deleted by the post job snapshot-retention). | `number` | `14` | no |
 | <a name="input_enable_xray"></a> [enable\_xray](#input\_enable\_xray) | X-Ray tracing for state machines and Lambda. | `bool` | `false` | no |
-| <a name="input_fargate"></a> [fargate](#input\_fargate) | Fargate jobs. images maps an image key (used as 'image' in job sets) to an image URI with an immutable tag. | <pre>object({<br/>    cluster_arn          = optional(string)<br/>    images               = optional(map(string), {})<br/>    cpu                  = optional(number, 1024)<br/>    memory               = optional(number, 2048)<br/>    ephemeral_storage_gb = optional(number, 21)<br/>    platform_version     = optional(string, "1.4.0")<br/>    assign_public_ip     = optional(bool, false)<br/>    ecr_repository_arns  = optional(list(string), [])<br/>  })</pre> | `{}` | no |
-| <a name="input_https_egress_cidr_blocks"></a> [https\_egress\_cidr\_blocks](#input\_https\_egress\_cidr\_blocks) | IPv4 CIDRs the jobs security group may reach on 443 (interface VPC endpoints, a proxy). null = the VPC CIDR. 0.0.0.0/0 is refused: give a job that needs the internet an extra group via security\_group\_ids. | `list(string)` | `null` | no |
-| <a name="input_https_egress_prefix_list_ids"></a> [https\_egress\_prefix\_list\_ids](#input\_https\_egress\_prefix\_list\_ids) | Prefix lists the jobs security group may reach on 443. null = the AWS managed S3 and DynamoDB prefix lists (gateway endpoints); [] = none. | `list(string)` | `null` | no |
+| <a name="input_fargate"></a> [fargate](#input\_fargate) | Fargate jobs. images maps an image key (used as 'image' in job sets) to an image URI with an immutable tag. | <pre>object({<br/>    cluster_arn          = optional(string, "")<br/>    images               = optional(map(string), {})<br/>    cpu                  = optional(number, 1024)<br/>    memory               = optional(number, 2048)<br/>    ephemeral_storage_gb = optional(number, 21)<br/>    platform_version     = optional(string, "1.4.0")<br/>    assign_public_ip     = optional(bool, false)<br/>    ecr_repository_arns  = optional(list(string), [])<br/>  })</pre> | `{}` | no |
+| <a name="input_https_egress_cidr_blocks"></a> [https\_egress\_cidr\_blocks](#input\_https\_egress\_cidr\_blocks) | More IPv4 CIDRs the jobs security group may reach on 443 (interface VPC endpoints elsewhere, a proxy), besides the VPC CIDR of https\_egress\_vpc\_cidr. 0.0.0.0/0 is refused: give a job that needs the internet an extra group via security\_group\_ids. | `list(string)` | `[]` | no |
+| <a name="input_https_egress_gateway_endpoints"></a> [https\_egress\_gateway\_endpoints](#input\_https\_egress\_gateway\_endpoints) | Let the jobs security group reach the AWS managed S3 and DynamoDB prefix lists (gateway endpoints) on 443. false = only https\_egress\_prefix\_list\_ids. | `bool` | `true` | no |
+| <a name="input_https_egress_prefix_list_ids"></a> [https\_egress\_prefix\_list\_ids](#input\_https\_egress\_prefix\_list\_ids) | More prefix lists the jobs security group may reach on 443, besides the gateway endpoints of https\_egress\_gateway\_endpoints. | `list(string)` | `[]` | no |
+| <a name="input_https_egress_vpc_cidr"></a> [https\_egress\_vpc\_cidr](#input\_https\_egress\_vpc\_cidr) | Let the jobs security group reach the VPC CIDR on 443 (interface VPC endpoints). false = only https\_egress\_cidr\_blocks. | `bool` | `true` | no |
 | <a name="input_include_execution_data"></a> [include\_execution\_data](#input\_include\_execution\_data) | Log state input/output to CloudWatch Logs (ARNs, table names, job summaries, DMS messages; never secrets). Off by default; turn on for debugging (advisory check include\_execution\_data). | `bool` | `false` | no |
 | <a name="input_job_lambda_arns"></a> [job\_lambda\_arns](#input\_job\_lambda\_arns) | Project-owned Lambda functions that job sets may call with 'function:'. | `list(string)` | `[]` | no |
 | <a name="input_job_secret_arns"></a> [job\_secret\_arns](#input\_job\_secret\_arns) | Secrets Manager ARNs jobs may read (database users for pre/post jobs). Allow-list for IAM. | `list(string)` | `[]` | no |
-| <a name="input_kms_key_arn"></a> [kms\_key\_arn](#input\_kms\_key\_arn) | Customer managed KMS key for DynamoDB, S3, SNS, SQS, logs, Lambda env and Step Functions. null = AWS managed keys (sandbox only; see check no\_cmk). Key policy requirements are in output kms\_key\_policy\_requirements. | `string` | `null` | no |
-| <a name="input_lambda"></a> [lambda](#input\_lambda) | Lambda settings. artifact = prebuilt zip in S3 instead of packaging src/ with archive\_file. | <pre>object({<br/>    runtime              = optional(string, "python3.13")<br/>    architecture         = optional(string, "arm64")<br/>    memory_mb            = optional(number, 512)<br/>    reserved_concurrency = optional(number)<br/>    artifact_s3_bucket   = optional(string)<br/>    artifact_s3_key      = optional(string)<br/>    artifact_source_hash = optional(string)<br/>  })</pre> | `{}` | no |
+| <a name="input_kms_key_arn"></a> [kms\_key\_arn](#input\_kms\_key\_arn) | Customer managed KMS key for DynamoDB, S3, SNS, SQS, logs, Lambda env and Step Functions. Empty = AWS managed keys (sandbox only; see check no\_cmk). Key policy requirements are in outputs kms\_key\_policy\_requirements (contract v2) and kms\_key\_policy\_statements (v1). | `string` | `""` | no |
+| <a name="input_lambda"></a> [lambda](#input\_lambda) | Lambda settings. artifact\_s3\_* = prebuilt zip in S3 instead of packaging src/ with archive\_file (empty = package). reserved\_concurrency = reserved concurrency of the DMS event handler and the watchdog (-1 = unreserved). sql\_jobs\_enabled = the Lambda SQL runtime for sql: jobs (pg8000 in the zip, 900 s, 1024 MB; ADR 0011). | <pre>object({<br/>    runtime              = optional(string, "python3.13")<br/>    architecture         = optional(string, "arm64")<br/>    memory_mb            = optional(number, 512)<br/>    sql_jobs_enabled     = optional(bool, true)<br/>    reserved_concurrency = optional(number, -1)<br/>    artifact_s3_bucket   = optional(string, "")<br/>    artifact_s3_key      = optional(string, "")<br/>    artifact_source_hash = optional(string, "")<br/>  })</pre> | `{}` | no |
 | <a name="input_lock_grace_seconds"></a> [lock\_grace\_seconds](#input\_lock\_grace\_seconds) | Age after which the watchdog may remove a lock whose execution is no longer running. | `number` | `300` | no |
 | <a name="input_log_retention_days"></a> [log\_retention\_days](#input\_log\_retention\_days) | Retention of all log groups created by the module. | `number` | `90` | no |
 | <a name="input_name"></a> [name](#input\_name) | Base name for all resources (prefix is <name>-<environment>). | `string` | `"dms-orch"` | no |
-| <a name="input_permissions_boundary_arn"></a> [permissions\_boundary\_arn](#input\_permissions\_boundary\_arn) | Permissions boundary for every IAM role created by the module. | `string` | `null` | no |
+| <a name="input_permissions_boundary_arn"></a> [permissions\_boundary\_arn](#input\_permissions\_boundary\_arn) | Permissions boundary for every IAM role created by the module. Empty = none. | `string` | `""` | no |
 | <a name="input_report_retention_days"></a> [report\_retention\_days](#input\_report\_retention\_days) | Days to keep run reports under runs/ in the created bucket. | `number` | `365` | no |
 | <a name="input_run_timeout_seconds"></a> [run\_timeout\_seconds](#input\_run\_timeout\_seconds) | Expected maximum duration of one DMS run; the watchdog raises MigrationOverdue after it (per-task override: projects.*.tasks.*.defaults.run\_timeout\_seconds). | `number` | `604800` | no |
 | <a name="input_security_group_ids"></a> [security\_group\_ids](#input\_security\_group\_ids) | Extra (or, with create\_security\_group = false, the only) security groups for Lambda and Fargate. | `list(string)` | `[]` | no |
 | <a name="input_sfn_log_level"></a> [sfn\_log\_level](#input\_sfn\_log\_level) | Step Functions log level: ALL, ERROR, FATAL or OFF. | `string` | `"ALL"` | no |
 | <a name="input_sns_topic_arn"></a> [sns\_topic\_arn](#input\_sns\_topic\_arn) | Existing SNS topic for run notifications and alarms. Empty = create one. | `string` | `""` | no |
+| <a name="input_ssm"></a> [ssm](#input\_ssm) | SSM Run Command runtime (runtime ssm) for long jobs: pg-dump, orch.py restore, long DDL, bash<br/>or pwsh scripts. Runner instances come from the team AMI (psql, pg\_dump, pg\_restore, bash,<br/>python3 with boto3; pwsh optional) and are managed by SSM. Select them with instance\_ids or<br/>target\_tags (one of the two). instance\_role\_arn is the role of their instance profile: every<br/>project job role trusts it (output ssm\_runner\_policy\_json lists what it needs).<br/>document\_name\_override names an existing document (content in output ssm\_document\_content)<br/>instead of the module's <name>-<environment>-orch-job. runner\_user runs the job, never root.<br/>When enabled, pg-dump dumps and orch.py restore run on SSM by default. | <pre>object({<br/>    enabled                = optional(bool, false)<br/>    instance_ids           = optional(list(string), [])<br/>    target_tags            = optional(map(string), {})<br/>    instance_role_arn      = optional(string, "")<br/>    document_name_override = optional(string, "")<br/>    runner_user            = optional(string, "orch")<br/>  })</pre> | `{}` | no |
 | <a name="input_table_deletion_protection"></a> [table\_deletion\_protection](#input\_table\_deletion\_protection) | Deletion protection on the DynamoDB table. | `bool` | `true` | no |
 | <a name="input_table_name"></a> [table\_name](#input\_table\_name) | Existing DynamoDB table (same keys and indexes as this module creates). Empty = create <name>-<environment>. The target platform keeps it in a long-lived workspace so locks, runs and baselines outlive the DMS workspace. | `string` | `""` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags added to every resource. | `map(string)` | `{}` | no |
@@ -156,16 +211,22 @@ sandbox).
 
 | Name | Description |
 |------|-------------|
-| <a name="output_artifacts_bucket"></a> [artifacts\_bucket](#output\_artifacts\_bucket) | Bucket for job sets (jobs/<project>/<version>/) and run reports (runs/<runId>/). |
-| <a name="output_ecs_cluster_arn"></a> [ecs\_cluster\_arn](#output\_ecs\_cluster\_arn) | ECS cluster used for Fargate jobs. |
+| <a name="output_artifacts_bucket"></a> [artifacts\_bucket](#output\_artifacts\_bucket) | Bucket for job sets (jobs/<project>/<version>/) and run artifacts (runs/<project>/<runId>/). |
+| <a name="output_bucket_requirements"></a> [bucket\_requirements](#output\_bucket\_requirements) | JSON list of the controls the artifacts bucket must have when artifacts\_bucket\_name is set (the module does not manage a brought bucket): versioning, SSE-KMS default encryption, TLS only, DenyDumpsWithoutKms, lifecycle of runs/, jobs/ and dumps/. modules/artifacts-bucket creates a bucket that has them. |
+| <a name="output_ecs_cluster_arn"></a> [ecs\_cluster\_arn](#output\_ecs\_cluster\_arn) | ECS cluster used for Fargate jobs (the module's or fargate.cluster\_arn). null when fargate.images is empty: Fargate is an optional runtime. |
 | <a name="output_jobs_security_group_id"></a> [jobs\_security\_group\_id](#output\_jobs\_security\_group\_id) | Security group of Lambda and Fargate jobs. Add it to the Aurora ingress rules (upstream aurora module: ingress\_rules.referenced\_security\_group\_id). |
-| <a name="output_kms_key_policy_requirements"></a> [kms\_key\_policy\_requirements](#output\_kms\_key\_policy\_requirements) | JSON list of statements the CMK key policy must allow when kms\_key\_arn is set (the module does not manage the key policy). |
+| <a name="output_jobset_publisher_policy_json"></a> [jobset\_publisher\_policy\_json](#output\_jobset\_publisher\_policy\_json) | IAM policy per project for whoever publishes that project's job sets (scripts/sync-jobs.sh): write and list jobs/<project>/ only. Not attached by the module. |
+| <a name="output_kms_key_policy_requirements"></a> [kms\_key\_policy\_requirements](#output\_kms\_key\_policy\_requirements) | KMS key policy contract v2 (JSON list) when kms\_key\_arn is set: one item per need with sid, principals {services, arns, roles}, actions, conditions and purpose; roles are symbolic (deployer, module). The module does not manage the key policy. |
+| <a name="output_kms_key_policy_statements"></a> [kms\_key\_policy\_statements](#output\_kms\_key\_policy\_statements) | The same requirements as key policy statements (v1: Sid, Principal, Action, Condition) with concrete principals only; the deployer item of the v2 contract is left out. |
 | <a name="output_lambda_function_arns"></a> [lambda\_function\_arns](#output\_lambda\_function\_arns) | Lambda functions of the module. |
 | <a name="output_network_contract"></a> [network\_contract](#output\_network\_contract) | What the network must provide. The module creates no VPC endpoints (owned by the landing zone). |
-| <a name="output_operator_policy_json"></a> [operator\_policy\_json](#output\_operator\_policy\_json) | IAM policy for the operator role (CLI / CI): start, watch and stop runs, read reports, sync job sets. Not attached by the module. |
+| <a name="output_operator_policy_json"></a> [operator\_policy\_json](#output\_operator\_policy\_json) | IAM policy for the operator role (CLI / CI): start, watch and stop runs, read reports, restore under the task lock. No job set uploads (jobset\_publisher\_policy\_json). Not attached by the module. |
 | <a name="output_run_request_example"></a> [run\_request\_example](#output\_run\_request\_example) | Example input for the migrate state machine. |
 | <a name="output_sns_topic_arn"></a> [sns\_topic\_arn](#output\_sns\_topic\_arn) | Topic for run notifications and alarms. |
+| <a name="output_ssm_document_content"></a> [ssm\_document\_content](#output\_ssm\_document\_content) | Content (JSON) of the SSM Command document the job-runner sends; register it under ssm.document\_name\_override when the module does not create the document. null when ssm.enabled is false. |
+| <a name="output_ssm_document_name"></a> [ssm\_document\_name](#output\_ssm\_document\_name) | SSM document the job-runner sends for runtime ssm jobs (the module's <name>-<environment>-orch-job or ssm.document\_name\_override). null when ssm.enabled is false. |
 | <a name="output_ssm_parameter_names"></a> [ssm\_parameter\_names](#output\_ssm\_parameter\_names) | Task registrations per <project>/<taskKey>. |
+| <a name="output_ssm_runner_policy_json"></a> [ssm\_runner\_policy\_json](#output\_ssm\_runner\_policy\_json) | IAM policy for the instance profile role of the SSM runners (ssm.instance\_role\_arn), besides SSM management: read the runtime zip, assume the project job roles, write command output to the jobs log group. Not attached by the module. null when ssm.enabled is false. |
 | <a name="output_state_machine_arns"></a> [state\_machine\_arns](#output\_state\_machine\_arns) | Step Functions state machines: migrate (start runs here), post (started by the DMS event; operation=post repeats it) and job\_runner (internal). |
 | <a name="output_table_arn"></a> [table\_arn](#output\_table\_arn) | ARN of the DynamoDB table (for an apply-time lock check in the DMS workspace). |
 | <a name="output_table_name"></a> [table\_name](#output\_table\_name) | DynamoDB table with locks, runs, migrations, target baselines, events and job results. |

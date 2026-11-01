@@ -54,6 +54,7 @@
         "assessmentArn": null,
         "assessmentPolls": 0,
         "migration": null,
+        "recheckFor": null,
         "failure": null,
         "classification": null,
         "report": null,
@@ -282,7 +283,7 @@
       "Assign": {
         "preflight": "{% $states.result.Payload %}",
         "decision": "{% $states.result.Payload.decision %}",
-        "jobCtx": "{% $merge([$jobCtx, {'startType': $states.result.Payload.decision.startType, 'resetScope': $states.result.Payload.decision.resetScope, 'resetTables': $states.result.Payload.decision.resetTables}]) %}"
+        "jobCtx": "{% $merge([$jobCtx, {'startType': $states.result.Payload.decision.startType, 'resetScope': $states.result.Payload.decision.resetScope, 'resetTables': $states.result.Payload.decision.resetTables, 'resetTablesCount': $states.result.Payload.decision.resetTablesCount, 'resetTablesUri': $states.result.Payload.decision.resetTablesUri}]) %}"
       },
       "Next": "CheckVerdict"
     },
@@ -477,13 +478,54 @@
     },
     "CheckReset": {
       "Type": "Choice",
-      "Choices": [{ "Condition": "{% $decision.reset = true %}", "Next": "DumpJobs" }],
+      "Choices": [
+        {
+          "Comment": "A reset is about to truncate the target: dump it first when dump is enabled, unless a run of this chain already did (ctx.chain from the parent run; review finding 5).",
+          "Condition": "{% $decision.reset = true and $count($ctx.jobs.dump) > 0 and $not($ctx.chain.dumped = true) %}",
+          "Next": "RecheckTask",
+          "Assign": { "recheckFor": "dump" }
+        },
+        { "Condition": "{% $decision.reset = true %}", "Next": "RecheckTask", "Assign": { "recheckFor": "reset" } }
+      ],
       "Default": "PrepareStart"
+    },
+    "RecheckTask": {
+      "Type": "Task",
+      "Comment": "Read the task again right before the dump and before the reset (review finding 6): the decision came from InspectTask, the assessment and a dump may have taken hours since. One read, never a poll.",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+      "Arguments": {
+        "Filters": [{ "Name": "replication-task-arn", "Values": ["{% $ctx.taskArn %}"] }],
+        "WithoutSettings": true
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [{ "ErrorEquals": ["States.TaskFailed", "States.Timeout"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2, "JitterStrategy": "FULL" }],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "Next": "ClassifyFailure", "Assign": { "failure": "{% $states.errorOutput %}" } }
+      ],
+      "Next": "CheckTaskUnchanged"
+    },
+    "CheckTaskUnchanged": {
+      "Type": "Choice",
+      "Comment": "Running (any status but ready / stopped / failed), gone, or a status, stop reason or load counter other than InspectTask saw: stop before touching the target.",
+      "Choices": [
+        {
+          "Condition": "{% ( $t := $states.input.ReplicationTasks[0]; $was := $inspect.task; $v := function($x) { $exists($x) and $x != null ? $string($x) : '' }; $not($v($t.Status) in ['ready', 'stopped', 'failed']) or $v($t.Status) != $v($was.status) or $v($t.StopReason) != $v($was.stopReason) or $v($t.ReplicationTaskStats.FullLoadProgressPercent) != $v($was.stats.fullLoadProgressPercent) or $v($t.ReplicationTaskStats.TablesLoaded) != $v($was.stats.tablesLoaded) or $v($t.ReplicationTaskStats.TablesErrored) != $v($was.stats.tablesErrored) ) %}",
+          "Next": "ClassifyFailure",
+          "Assign": {
+            "failure": {
+              "Error": "TaskStateChanged",
+              "Cause": "{% 'the DMS task ' & $ctx.taskArn & ' is ' & ($exists($states.input.ReplicationTasks[0].Status) ? $states.input.ReplicationTasks[0].Status : 'not found') & ' (InspectTask saw ' & $string($inspect.task.status) & '): ' & ($recheckFor = 'dump' ? 'nothing was dumped or reset' : 'the dump was taken, nothing was reset') & '. Run plan again.' %}"
+            }
+          }
+        },
+        { "Condition": "{% $recheckFor = 'dump' %}", "Next": "DumpJobs" }
+      ],
+      "Default": "ResetJobs"
     },
     "DumpJobs": {
       "Type": "Map",
-      "Comment": "A reset is about to truncate the target: dump the scope to S3 first when dump is enabled (pg-dump-s3 on Fargate). Chained resumes skip it.",
-      "Items": "{% $attempt > 1 or $not($exists($ctx.jobs.dump)) ? [] : $ctx.jobs.dump %}",
+      "Comment": "A reset is about to truncate the target: dump the scope to S3 first (pg-dump-s3 on Fargate, or a cluster snapshot).",
+      "Items": "{% $exists($ctx.jobs.dump) ? $ctx.jobs.dump : [] %}",
       "MaxConcurrency": 1,
       "ItemSelector": {
         "job": "{% $states.context.Map.Item.Value %}",
@@ -516,7 +558,34 @@
           "Assign": { "failure": { "Error": "JobFailed", "Cause": "{% $string($states.errorOutput.Cause) %}", "phase": "dump" } }
         }
       ],
-      "Next": "ResetJobs"
+      "Assign": { "recheckFor": "reset" },
+      "Next": "RecordChainDump"
+    },
+    "RecordChainDump": {
+      "Type": "Task",
+      "Comment": "RUN#<runId>: this chain has a dump now (dumpS3Uri of pg-dump-s3, snapshotArn of a cluster snapshot); resolve_context passes it to a chained resume, which then does not dump the target it already reset. Bookkeeping only: on error the next resume dumps again.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": { "pk": { "S": "{% 'RUN#' & $runId %}" }, "sk": { "S": "META" } },
+        "UpdateExpression": "SET chainDumped = :d, dumpUri = :u",
+        "ExpressionAttributeValues": {
+          ":d": { "Bool": "{% $req.dryRun != true %}" },
+          ":u": { "S": "{% ( $s := $states.input[0].summary; $req.dryRun = true ? '' : ($exists($s.dumpS3Uri) ? $string($s.dumpS3Uri) : ($exists($s.snapshotArn) ? $string($s.snapshotArn) : '')) ) %}" }
+        }
+      },
+      "TimeoutSeconds": 10,
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDb.ProvisionedThroughputExceededException", "DynamoDb.InternalServerErrorException", "DynamoDb.RequestLimitExceededException", "DynamoDb.ThrottlingException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "RecheckTask" }],
+      "Next": "RecheckTask"
     },
     "ResetJobs": {
       "Type": "Map",
@@ -564,13 +633,43 @@
     },
     "SaveContext": {
       "Type": "Task",
-      "Comment": "Everything post needs to continue this run, in S3 (runs/<runId>/context.json); post loads it in its first state. Body is an object: the integration serializes it (a string Body is JSON-encoded once more).",
+      "Comment": "Everything post needs to continue this run, in S3 (runs/<project>/<runId>/context.json); post loads the version RecordContextVersion pins. Body is an object: the integration serializes it (a string Body is JSON-encoded once more).",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Arguments": {
         "Bucket": "${artifacts_bucket}",
-        "Key": "{% 'runs/' & $runId & '/context.json' %}",
+        "Key": "{% 'runs/' & $ctx.project & '/' & $runId & '/context.json' %}",
         "ContentType": "application/json",
         "Body": "{% {'runId': $runId, 'request': $req, 'ctx': $ctx, 'inspect': $inspect, 'jobCtx': $jobCtx, 'attempt': $attempt, 'startedAt': $startedAt, 'preflight': $preflight} %}"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2, "JitterStrategy": "FULL" }],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "Next": "ClassifyFailure", "Assign": { "failure": "{% $states.errorOutput %}" } }
+      ],
+      "Next": "CheckContextVersion"
+    },
+    "CheckContextVersion": {
+      "Type": "Choice",
+      "Comment": "post trusts only the version of context.json written here. Without a VersionId (bucket not versioned) it could not tell, so the run stops before DMS.",
+      "Choices": [
+        {
+          "Condition": "{% $not($exists($states.input.VersionId)) or $states.input.VersionId = 'null' %}",
+          "Next": "ClassifyFailure",
+          "Assign": { "failure": { "Error": "ContextNotPinned", "Cause": "the artifacts bucket returned no object version for context.json: enable versioning on the bucket" } }
+        }
+      ],
+      "Default": "RecordContextVersion"
+    },
+    "RecordContextVersion": {
+      "Type": "Task",
+      "Comment": "RUN#<runId>.contextVersionId: post loads context.json by this version only (review finding 1).",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": { "pk": { "S": "{% 'RUN#' & $runId %}" }, "sk": { "S": "META" } },
+        "UpdateExpression": "SET contextVersionId = :v",
+        "ConditionExpression": "attribute_exists(pk)",
+        "ExpressionAttributeValues": { ":v": { "S": "{% $states.input.VersionId %}" } }
       },
       "TimeoutSeconds": 30,
       "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2, "JitterStrategy": "FULL" }],
@@ -624,6 +723,7 @@
               "mode": { "S": "{% $string($inspect.completionSpec.mode) %}" },
               "migrationType": { "S": "{% $string($inspect.completionSpec.migrationType) %}" },
               "failOnTableErrors": { "Bool": "{% $inspect.completionSpec.failOnTableErrors = true %}" },
+              "failOnValidationErrors": { "Bool": "{% $not($inspect.completionSpec.failOnValidationErrors = false) %}" },
               "expectStop": { "Bool": "{% $inspect.completionSpec.expectStop = true %}" }
             }
           },
@@ -666,6 +766,7 @@
     },
     "StartReplicationTask": {
       "Type": "Task",
+      "Comment": "Retried only on errors DMS answered (the start did not happen). A timeout is not retried: the start may have reached DMS, so the handoff judges the task (review finding 13).",
       "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",
       "Arguments": {
         "ReplicationTaskArn": "{% $ctx.taskArn %}",
@@ -674,8 +775,9 @@
       "TimeoutSeconds": 60,
       "Retry": [
         { "ErrorEquals": ["DatabaseMigration.InvalidResourceStateException"], "MaxAttempts": 0 },
+        { "ErrorEquals": ["States.Timeout"], "MaxAttempts": 0 },
         {
-          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "ErrorEquals": ["States.TaskFailed"],
           "IntervalSeconds": 5,
           "MaxAttempts": 4,
           "BackoffRate": 2,
@@ -687,6 +789,12 @@
         {
           "Comment": "A retried start after a network timeout finds the task already starting. DMS decides: the handoff judges the task with this error (DmsStartRejected if it never moved).",
           "ErrorEquals": ["DatabaseMigration.InvalidResourceStateException"],
+          "Next": "RecordStartError",
+          "Assign": { "failure": "{% $states.errorOutput %}" }
+        },
+        {
+          "Comment": "No answer from DMS: the start may have happened. Not retried, not disarmed: the handoff judges the task with this error (DmsStartRejected if it never moved).",
+          "ErrorEquals": ["States.Timeout"],
           "Next": "RecordStartError",
           "Assign": { "failure": "{% $states.errorOutput %}" }
         },

@@ -2,29 +2,37 @@
 """Validate and build job set bundles.
 
     jobset_tool.py validate <bundle-dir>             # every jobset*.yaml against the schema
-    jobset_tool.py build <bundle-dir> <out-dir>      # copy the bundle, write jobset*.json next to it
+    jobset_tool.py build <bundle-dir> <out-dir>      # copy the bundle, write jobset*.json and bundle.sha256
+    jobset_tool.py hash <bundle-dir>                 # print the bundle total (jobs.bundles in Terraform)
 
 A bundle is a directory with ``jobset.yaml`` (job set "default") and optional
 ``jobset.<name>.yaml`` files plus the SQL/scripts they reference. The build
 output is what ``sync-jobs.sh`` uploads to ``s3://<artifacts>/jobs/<project>/<version>/``.
+``bundle.sha256`` lists the SHA-256 of every built file and a total over them; the
+task registration pins the total per version, and runs refuse a bundle that differs.
 
 Checks beyond the JSON Schema: duplicate job names, lambda/fargate fields,
 non-idempotent retries (shared.jobset.normalize), 'when' expressions parse, and
-every ``--file``/``--template`` path in a psql-run/mysql-run command exists in the bundle.
+every ``--file``/``--template`` path in a psql-run/mysql-run command and every ``sql.file``
+exists in the bundle.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules" / "dms-orchestration" / "src"))
 
+from shared import bundle as bundle_hash  # noqa: E402
 from shared import expr, jobset  # noqa: E402
 from shared.errors import InvalidJobSet  # noqa: E402
 
@@ -37,6 +45,8 @@ def jobset_files(bundle: Path) -> list[Path]:
 
 
 def referenced_paths(job: dict[str, Any]) -> list[str]:
+    if job.get("sql"):
+        return jobset.sql_files(job["sql"])
     cmd = job.get("command") or []
     if not cmd or Path(cmd[0]).name not in SQL_RUNNERS:
         return []
@@ -80,17 +90,45 @@ def validate(bundle: Path) -> int:
     return 1 if failed else 0
 
 
+def write_manifest(out: Path) -> str:
+    """Write bundle.sha256 over every file of a built bundle; returns the total."""
+    files = {
+        p.relative_to(out).as_posix(): bundle_hash.digest(p.read_bytes())
+        for p in sorted(out.rglob("*"))
+        if p.is_file() and p.relative_to(out).as_posix() != bundle_hash.MANIFEST
+    }
+    text = bundle_hash.render(files)
+    (out / bundle_hash.MANIFEST).write_bytes(text.encode())
+    return bundle_hash.total(files)
+
+
 def build(bundle: Path, out: Path) -> int:
     if validate(bundle):
         return 1
     if out.exists():
         shutil.rmtree(out)
-    shutil.copytree(bundle, out, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"))
+    shutil.copytree(
+        bundle, out, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store", bundle_hash.MANIFEST)
+    )
     for f in jobset_files(bundle):
         raw, _ = check(f)
         name = f.stem.removeprefix("jobset").lstrip(".") or "default"
-        (out / jobset.jobset_file_name(name)).write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        (out / jobset.jobset_file_name(name)).write_bytes(json.dumps(raw, indent=2).encode())
+    total = write_manifest(out)
     print(f"built {out}")
+    print(f"sha256 {total}")
+    return 0
+
+
+def hash_bundle(bundle: Path) -> int:
+    """Print the total a build of ``bundle`` gets (a source or an already built bundle)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "bundle"
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = build(bundle, out)
+        if code:
+            return code
+        print(bundle_hash.parse((out / bundle_hash.MANIFEST).read_text(encoding="utf-8"))[1])
     return 0
 
 
@@ -100,6 +138,8 @@ def main(argv: list[str] | None = None) -> int:
         return validate(Path(args[1]))
     if len(args) == 3 and args[0] == "build":
         return build(Path(args[1]), Path(args[2]))
+    if len(args) == 2 and args[0] == "hash":
+        return hash_bundle(Path(args[1]))
     print(__doc__, file=sys.stderr)
     return 2
 

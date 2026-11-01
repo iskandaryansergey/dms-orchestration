@@ -462,3 +462,39 @@ def test_post_execution_name_fits_the_80_character_limit():
     name = post_execution_name(long)
     assert len(name) == 80 and name.endswith("-post")
     assert post_execution_name(long) == name  # deterministic: the name is the idempotency key
+
+
+# --- review finding 7: validation gates the outcome handed to post ----------------------
+
+BAD_VALIDATION = [
+    {
+        "SchemaName": "app",
+        "TableName": "accounts",
+        "TableState": "Table completed",
+        "ValidationState": "Mismatched records",
+        "ValidationFailedRecords": 2,
+    }
+]
+
+
+@pytest.mark.parametrize(
+    "flag,kind,name",
+    [(True, "FAILURE", "DmsValidationErrors"), (False, "SUCCESS", "COMPLETED_WITH_VALIDATION_ERRORS")],
+)
+def test_finished_load_with_validation_errors_reaches_post_by_the_flag(store, flag, kind, name):
+    from lambdas.dms_event_handler.handler import handler
+
+    sfn = FakeSfn()
+    use(dms=FakeDms(FINISHED, BAD_VALIDATION), sfn=sfn)
+    store.arm_migration(
+        task_arn=TASK_ARN,
+        run_id="run-1",
+        execution_arn=EXEC_ARN,
+        completion={"mode": "task-stopped", "failOnTableErrors": True, "failOnValidationErrors": flag},
+        attempt=1,
+        started_at=STARTED_AT,
+    )
+    assert handler(STOP_EVENT)["results"][TASK_ARN] == "posted"
+    outcome = post_inputs(sfn)[0]["outcome"]
+    assert outcome["kind"] == kind and name in (outcome["error"], outcome["outcome"])
+    assert "app.accounts" in outcome["cause"]

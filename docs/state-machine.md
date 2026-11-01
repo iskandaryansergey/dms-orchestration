@@ -13,6 +13,8 @@ A run is `migrate <runId>` → DMS → `post <runId>-post`; an auto-resume conti
 
 ```
 ResolveContext ──fail──► FailInvalidRequest                          (nothing locked)
+  │      (attempt / parentRunId / parentStartedAt only from the execution post handed over to:
+  │       RUN#<parentRunId>.resumeChildRunId = this execution name, else InvalidRunRequest)
   │
 AcquireLock ──ConditionalCheckFailed──► MarkRunEndedWithoutLock ─► FailWithoutLock (RunAlreadyActive)
   │            (a lock handed over to this run id by post is taken over)
@@ -34,9 +36,17 @@ CheckAssessment ── enabled, not dry run ──► StartAssessment ⟲ Descri
   ▼
 ReadMigration (getItem MIGRATION#, consistent) ─► ArmGuard ── armed / claimed ──► ClassifyFailure (MigrationAlreadyArmed)
   │      ── nothing above truncates the target; a refusal above leaves it as it was ──
-CheckReset ── decision.reset ──► DumpJobs (Map; when dump is on) ─► ResetJobs (Map) ──error──► ClassifyFailure
+CheckReset ── decision.reset ──► RecheckTask (describeReplicationTasks) ─► CheckTaskUnchanged
+  │                                 ── running / gone / changed since InspectTask ──► ClassifyFailure (TaskStateChanged)
+  │                              ─► DumpJobs (Map; dump on and no dump in the chain yet: ctx.chain.dumped)
+  │                              ─► RecordChainDump (RUN# chainDumped, dumpUri) ─► RecheckTask ─► CheckTaskUnchanged
+  │                              ─► ResetJobs (Map) ──error──► ClassifyFailure
   │
-PrepareStart (startedAt = now) ─► SaveContext (runs/<runId>/context.json for post)
+PrepareStart (startedAt = now) ─► SaveContext (runs/<project>/<runId>/context.json for post)
+  │
+CheckContextVersion ── no VersionId ──► ClassifyFailure (ContextNotPinned: the bucket must be versioned)
+  │
+RecordContextVersion (RUN#.contextVersionId: post loads only this version)
   │
 CheckDryRun ── dryRun ──► StartPostDryRun (post runs its jobs in dry mode) ─► Started
   │
@@ -74,34 +84,47 @@ the same name; `ExecutionAlreadyExists` counts as started.
 ```
 LoadRun (resolve_context, mode post: saved context + outcome) ──fail──► FailLoad (release_lock frees the lock)
   │
-TakeOverLock (LOCK# executionArn = this execution) ─► DeleteMigration     (best effort, never fail the run)
+TakeOverLock (LOCK# executionArn = this execution; condition runId = this run)
+  │      ── ConditionalCheckFailed or retries exhausted ──► LockLost ─► WriteReport (MANUAL) ─► Notify ─► Failed
+  │         (ReleaseLock skipped: the lock is not this run's)
+DeleteMigration     (best effort, never fail the run)
   │
 CheckOutcome ── failure ──► ClassifyFailure
   ▼
 PostJobs (Map) ──error──► ClassifyFailure
   │  finalStatus = SUCCEEDED
   ▼
-WriteReport ─► CheckNotify ─► Notify ─► ReleaseLock ─► Done ─► Succeeded | Failed
+WriteReport ─► CheckNotify ─► Notify ─► CheckLockHeld ─► ReleaseLock ─► Done ─► Succeeded | Failed
 
-ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock (LOCK# runId = <runId>-r<n+1>)
+ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock (one transaction: LOCK# runId = <runId>-r<n+1>,
+                                                     RUN#<runId>.resumeChildRunId = <runId>-r<n+1>)
                                                   ─► StartResume (migrate, no .sync) ─► WriteReport (RESUMED)
-                                                     └─ start failed ─► GiveLockBack ─► OnFailureJobs
+                                                     └─ start failed ─► GiveLockBack (lock back, resumeChildRunId removed)
+                                                                        ─► OnFailureJobs
                                    └─► OnFailureJobs (Map, failures ignored) ─► WriteReport (FAILED)
 ```
 
 ## Invariants (checked by `tests/python/test_asl.py`)
 
-* no state waits for DMS: no `.waitForTaskToken`, no heartbeat, no DMS polling, no `Wait`
-  outside the job-runner retry backoff;
+* no state waits for DMS: no `.waitForTaskToken`, no heartbeat, no DMS polling (the one
+  `describeReplicationTasks` is `RecheckTask`, a single read), no `Wait` outside the job-runner
+  retry backoff and the assessment poll;
+* `DumpJobs` and `ResetJobs` are entered only from `CheckTaskUnchanged`, right after
+  `RecheckTask`: a task that runs, is gone, or whose status, stop reason or load counters differ
+  from what `InspectTask` saw stops the run (`TaskStateChanged`) before the target is touched;
 * migrate: every terminal after `AcquireLock` passes `ReleaseLock`, except `Started` (DMS or the
   dry-run post holds the lock); after `Arm` the lock is released only when the start is refused;
 * `StartReplicationTask` is reachable only through `Arm` (condition `attribute_not_exists(pk) OR status = posted`);
 * nothing destructive before every refusing check: `DumpJobs` and `ResetJobs` are reachable only
   through `CheckAssessment` (assessment passed or off) and the read-only Arm guard
   (`ReadMigration` → `ArmGuard`); `Arm` keeps its condition as the atomic write;
-* post: every terminal after `LoadRun` passes `ReleaseLock`; `StartResume` only after
-  `HandOverLock`, without `.sync`;
+* post: every terminal after `LoadRun` passes `ReleaseLock`, except after `LockLost` (only
+  `TakeOverLock` sets it); without the lock post runs no jobs and no resume; `StartResume` only
+  after `HandOverLock`, without `.sync`;
 * the lock-contention path never reaches `ReleaseLock`;
+* a chained resume dumps before its reset unless a run of the chain already dumped
+  (`ctx.chain`, from the parent's `RUN#`); the chain fields of a request come only from the
+  execution post handed the lock to (`test_lambdas_core.py`);
 * every `lambda:invoke` has the AWS-recommended Lambda retries and a Catch;
 * DynamoDB expressions alias reserved words; SDK attribute type names (`Bool`, not `BOOL`).
 
@@ -111,21 +134,23 @@ ClassifyFailure ─► CheckAutoResume ── autoResume ──► HandOverLock 
 |---|---|---|---|
 | both | `runId`, `req`, `ctx` | ResolveContext / LoadRun | run id (= migrate execution name), request with defaults, registration + jobs |
 | both | `inspect`, `jobCtx` | InspectTask / LoadRun | task state and completion spec, context passed to jobs |
-| both | `attempt` | ResolveContext / LoadRun | 1 + number of chained resumes (`req.attempt`) |
+| both | `attempt` | ResolveContext / LoadRun | 1 + number of chained resumes (`req.attempt`, accepted only from the execution post handed over to) |
 | both | `startedAt` | PrepareStart / LoadRun | time before the start call (the failed run's for `waitOnly`) |
 | migrate | `decision`, `waitOnly` | InspectTask, CheckDecision | start type / reset; arm without starting |
 | migrate | `migration` | ReadMigration | `{status, runId}` of an existing `MIGRATION#` item (Arm guard) or null |
+| migrate | `recheckFor` | CheckReset, DumpJobs | `dump` or `reset`: where `CheckTaskUnchanged` goes on to |
 | post | `dmsOutcome`, `failure` | LoadRun | DMS outcome from the handoff: success payload or `{Error, Cause}` |
 | post | `nextRunId` | CheckAutoResume | run id of the chained migrate |
-| both | `classification`, `finalStatus`, `report` | ClassifyFailure, several, WriteReport | category; STARTED, PLANNED, REJECTED, SUCCEEDED, RESUMED or FAILED; report |
+| both | `classification`, `finalStatus`, `report` | ClassifyFailure, several, WriteReport | category; STARTED, PLANNED, REJECTED, MANUAL, SUCCEEDED, RESUMED or FAILED; report |
 
 ## Retry and timeouts
 
 | State | Retry | On error |
 |---|---|---|
 | Lambda tasks | Lambda service errors, 6×, backoff 2, full jitter | ClassifyFailure (report states: still notify and unlock) |
-| AcquireLock / Arm / HandOverLock / ReleaseLock | DynamoDB throttling, 5× | contention → reject / classify; ReleaseLock errors → Done (safety nets clean up) |
-| StartReplicationTask | `InvalidResourceStateException` 0×; other task errors 4×, ≤ 60 s | InvalidResourceState → RecordStartError; else Disarm and classify |
+| AcquireLock / Arm / TakeOverLock / HandOverLock / ReleaseLock | DynamoDB throttling, 5× | contention → reject / classify; TakeOverLock → LockLost (MANUAL, lock left alone); ReleaseLock errors → Done (safety nets clean up) |
+| StartReplicationTask | `InvalidResourceStateException` 0×; other errors DMS answered (`States.TaskFailed`) 4×, ≤ 60 s; `States.Timeout` never (the start may have reached DMS) | InvalidResourceState or timeout → RecordStartError (the handoff judges the task); else Disarm and classify |
+| RecheckTask | task errors and timeout, 3× (read only) | ClassifyFailure |
 | StartPostDryRun / StartResume | execution limit, timeout 3× | `ExecutionAlreadyExists` = already started |
 | Notify | 3× | ignored |
 | execution | — | `TimeoutSeconds` = 7 days for jobs; the DMS run itself is limited by `runTimeoutSeconds` → watchdog `MigrationOverdue` |
@@ -152,6 +177,7 @@ Pre-flight verdicts on top of this table (dirty target → `manual`, `allowReset
 | DMS | Result |
 |---|---|
 | stopped, `FULL_LOAD_ONLY_FINISHED` | `COMPLETED` (or `COMPLETED_WITH_TABLE_ERRORS`; fails `DmsTableErrors` with `failOnTableErrors`, the default) |
+| load finished, a table not validated (validation on), `ValidationFailedRecords > 0` or `FullLoadErrorRows > 0` | fails `DmsValidationErrors` with `failOnValidationErrors` (the default, `defaults.fail_on_validation_errors`); with it off `COMPLETED_WITH_VALIDATION_ERRORS`, a success that lists the tables. `No primary key` (DMS cannot validate the table) is no mismatch: the cause names the table as not validated, the report lists it in `validationSkippedTables` |
 | stopped, `STOPPED_AFTER_FULL_LOAD` / `CACHED_EVENTS` / `DDL_APPLY` / `AT_SERVER_TIME` / `AT_COMMIT_TIME` | `STOPPED_AT_CHECKPOINT` |
 | stopped, `NORMAL` (not requested) | `DmsTaskStoppedUnexpectedly` |
 | stopped, `RECOVERABLE_ERROR` / `FATAL_ERROR` / low memory / low disk | `DmsTaskFailed` |
@@ -173,9 +199,13 @@ Init ─► PrepareJob ──error──► JobFailed
           │
 CheckSkip ── when false ──► RecordJob (skipped)
           │
-CheckRuntime ── lambda ──► InvokeLambdaJob ─────────────────────────────┐
-             └─ fargate ─► RunFargateJob ─► FetchFargateResult ─► Normalize ─┤
-                                                                          ▼
+CheckRuntime ── lambda ──► InvokeLambdaJob (built-in or sql_jobs) ─────────────────────┐
+             ── ssm ─────► FindSsmRunner ─► CheckSsmRunner ── none online ──────────────┤
+             │             ─► RunSsmJob (sendCommand, module document) ─► WaitSsm (30 s)  │
+             │             ─► GetSsmInvocation ─► CheckSsmStatus ── pending ─► WaitSsm    │
+             │                                    ── terminal or poll limit ─► FetchSsmResult ─► Normalize ─┤
+             └─ fargate ─► RunFargateJob ─► FetchFargateResult ─► Normalize ──────────────┤
+                                                                                        ▼
                                                   RecordJob (JOB# item) ─► CheckStatus
 CheckStatus ── ok | warn | skipped ─────────────────► JobSucceeded
             ── fail, attempt < max, idempotent ─────► WaitBeforeRetry (backoff) ─► CheckRuntime
@@ -184,7 +214,11 @@ CheckStatus ── ok | warn | skipped ─────────────�
 ```
 
 A Fargate job is `fail` when the container exit code is non-zero or ECS failed, whatever
-`result.json` says; no `result.json` is also a failure.
+`result.json` says; no `result.json` is also a failure. An SSM job is the same: the invocation
+status and `result.json` from S3 decide; the poll stops at the job timeout plus 900 s, and a
+retry takes the next online runner. `sql` jobs run in the `sql_jobs` Lambda (pg8000 over
+verified TLS, read-only sessions in a dry run); routing and runtimes:
+[job contract](job-contract.md), [ADR 0011](adr/0011-job-runtimes.md).
 
 ## Testing
 

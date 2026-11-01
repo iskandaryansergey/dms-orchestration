@@ -1,7 +1,7 @@
 # Pre-flight
 
 Before `migrate` starts DMS it checks the target and gives a verdict. Why and the full table:
-[ADR 0006](adr/0006-preflight-verdicts.md). Code: `src/shared/preflight.py` (pure),
+[ADR 0006](adr/0006-preflight-verdicts.md). Code: `modules/dms-orchestration/src/shared/preflight.py` (pure),
 built-in job `checks/target_verify`, `inspect_task` in `preflight` mode.
 
 ## What runs
@@ -13,13 +13,14 @@ InspectTask ─► TargetVerify (job-runner, builtin checks/target_verify) ─�
 ```
 
 * Runtime (`preflight.verifyRuntime`, ADR 0008): `lambda` runs `checks/target_verify` through
-  the Data API (connection `target` with `data_api_cluster_arn`); `fargate` runs `verify-target`
-  in the sql-runner image through psql, with the same SQL and the same fingerprint JSON and
-  summary (`src/shared/fingerprint.py`); `auto` (default) takes Fargate when the last baseline
-  had more than `fargateAboveTables` (500) tables or a database above `fargateAboveBytes`
-  (50 GiB), or the target has no Data API, provided the image exists, else the Lambda. With
-  neither the Data API nor the image no check runs: the verdict comes from the DMS state alone
-  and the report says so.
+  pg8000 over verified TLS when the connection `target` has a `host`, else through the Data API
+  (`data_api_cluster_arn`); `fargate` runs `verify-target` in the optional sql-runner image
+  through psql. All three give the same SQL, fingerprint JSON and summary
+  (`modules/dms-orchestration/src/shared/fingerprint.py`). `auto` (default) takes Fargate when
+  the image exists and the last baseline had more than `fargateAboveTables` (500) tables or a
+  database above `fargateAboveBytes` (50 GiB), or the Lambda cannot reach the target; else the
+  Lambda. When the Lambda cannot reach the target and there is no image, no check runs and
+  there is no fingerprint: see [Without a fingerprint](#without-a-fingerprint).
 * The scope is the task's table mapping (selection rules, include/exclude, `%`). Objects in the
   scanned schemas that the rules do not select are listed as warnings and left alone.
 * The expectation comes from the source catalogue (connection `source` with the Data API),
@@ -32,12 +33,39 @@ InspectTask ─► TargetVerify (job-runner, builtin checks/target_verify) ─�
 | `ready` | runs | first run, target empty in scope | — |
 | `resume` | runs | interrupted (or a CDC resume) and the target equals the baseline of the last run | — |
 | `prepare` | runs | tables missing; pre-jobs run, then the target is checked again | — |
-| `reset` | runs | the target was dirty and `allowReset` was given: truncate every table in scope, then `reload-target` (`start-replication` for a new task) | check the report: `decision.resetTables` |
+| `reset` | runs | the target was dirty and `allowReset` was given: truncate every table in scope (see [Reset scope](#reset-scope)), then `reload-target` (`start-replication` for a new task) | check the report: `decision.resetTables` / `resetTablesCount` |
 | `manual` | `MANUAL` (failed, severity high) | `TargetNotEmpty`, `TargetChanged`, `AlreadyCompleted`, `PreflightTablesMissing` or `ResetNotConfigured`; the report has the diff | find out who changed the target; then either undo it or run again with `--allow-reset` |
 | `manual` | `MANUAL` | `RestoredTarget`: the target was restored from a dump (`orch.py restore`) and DMS still reports loaded tables, so a resume would skip them | run again with `--allow-reset` (full `reload-target`, `RUNBOOK.md` §11) |
+| `manual` | `MANUAL` | `NoFingerprint`: no target check ran, so nothing says what is in the target; a reset (`allowReset`) or a first run would act on an unchecked target | give the target a check (connection `target` with a `host` or the Data API, or the sql-runner image); for a first run only, `preflight.allowNoFingerprint` |
 | `reject` | `REJECTED` | the task is running, busy or needs attention | as before |
 
 `plan` runs the check and reports the verdict without running anything.
+
+## Without a fingerprint
+
+* `allowReset` never resets without a fingerprint: the verdict is `manual` / `NoFingerprint`.
+* A fresh task (first run) is `manual` / `NoFingerprint`, unless the request sets
+  `preflight.allowNoFingerprint: true`: then it is `ready` (with a warning) and still never reset.
+* An interrupted task resumes on the DMS decision, with a warning; its partial-table reset is
+  the DMS `targetReset` policy, as before.
+
+## Reset scope
+
+A `reset` truncates the tables of the target fingerprint that the task's selection rules select
+(include/exclude, `%`), not the DMS table statistics. Above 500 tables the list goes to
+`<run prefix>/inspect/reset-tables.json` in the artifacts bucket: the decision carries
+`resetTables: []`, `resetTablesCount` and `resetTablesUri`, and `prepare_job` expands the list
+into the job's `spec.json` only. The reset job reads it there:
+
+```yaml
+reset:
+  - name: truncate-tables
+    command: [psql-run, --connection, target, --truncate-scope]
+```
+
+`--truncate-scope` checks the list against `resetTablesCount`. A `{{ ctx.resetTables }}` template
+works up to 500 tables; above that `prepare_job` refuses it (`InvalidJobSet`), as it would carry
+the whole list through the state payload. The report and the verdict reason give the full count.
 
 ## Baseline
 
@@ -64,6 +92,7 @@ whose baseline was overwritten by a later run exits 2 with the reasons.
 
 ## Runtimes of the check
 
-The psql variant (`verify-target` in the sql-runner image) and the Data API variant share
-`src/shared/fingerprint.py`; `preflight.verifyRuntime` picks one (see "What runs" and ADR 0008).
+The pg8000 and Data API variants in the Lambda and the psql variant (`verify-target` in the
+sql-runner image) share `modules/dms-orchestration/src/shared/fingerprint.py` and give the same
+hash; `preflight.verifyRuntime` picks one (see "What runs" and ADR 0008).
 Table mapping and task settings are checked by `inspect_task` before the start.

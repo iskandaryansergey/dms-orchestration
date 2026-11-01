@@ -4,7 +4,7 @@
     orch.py start  --project ledger --task core [--dry-run] [--operation plan] [--allow-reset] [--wait]
     orch.py status <runId | executionArn>
     orch.py stop   <runId | executionArn> [--stop-task] [--reason "..."]
-    orch.py report <runId | executionArn> [--format md|json]
+    orch.py report <runId | executionArn> [--format md|json] [--project ledger]
     orch.py list   --project ledger [--limit 20]
     orch.py gate   <runId>        # exit 0 only if the run may be promoted (ADR 0006)
     orch.py post   <runId> [--from-job <name>]   # repeat post; jobs already ok before it are skipped
@@ -99,7 +99,7 @@ def run_id_of(ref: str) -> str:
 
 
 def post_execution_name(run_id: str) -> str:
-    """Same rule as src/shared/handoff.py (the name is the idempotency key of the handoff)."""
+    """Same rule as modules/dms-orchestration/src/shared/handoff.py (the name is the idempotency key of the handoff)."""
     name = f"{run_id}-post"
     if len(name) <= 80:
         return name
@@ -274,7 +274,20 @@ def cmd_stop(args: argparse.Namespace, c: Clients, out: Any) -> int:
 def cmd_report(args: argparse.Namespace, c: Clients, out: Any) -> int:
     if not args.bucket:
         raise SystemExit("--bucket (or ORCH_BUCKET) is required")
-    key = f"runs/{run_id_of(args.run)}/report.{'md' if args.format == 'md' else 'json'}"
+    run_id = run_id_of(args.run)
+    project = args.project
+    if not project and args.table:
+        item = (
+            c.get("dynamodb")
+            .get_item(TableName=args.table, Key={"pk": {"S": f"RUN#{run_id}"}, "sk": {"S": "META"}})
+            .get("Item")
+        )
+        project = _attr(item or {}, "project")
+    if not project:
+        raise SystemExit(
+            "--project (or --table to read it from the run) is required: reports are under runs/<project>/"
+        )
+    key = f"runs/{project}/{run_id}/report.{'md' if args.format == 'md' else 'json'}"
     body = c.get("s3").get_object(Bucket=args.bucket, Key=key)["Body"].read().decode()
     print(body, file=out)
     return 0
@@ -377,19 +390,75 @@ def _dump_run_id(c: Clients, dump: str) -> str | None:
     return json.loads(c.get("s3").get_object(Bucket=bucket, Key=key)["Body"].read()).get("runId")
 
 
+def _conditional_failure(err: Exception) -> bool:
+    return getattr(err, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+
+
+class TaskLock:
+    """The task lock (LOCK#<taskArn>) held by orch.py restore like a run holds it (ADR 0004).
+
+    ``executionArn`` is the job-runner execution working at the moment: the watchdog releases
+    the lock once that execution ended and the grace period passed, so a lock left behind by a
+    killed CLI does not block the task for good."""
+
+    def __init__(self, ddb: Any, table: str, task_arn: str, run_id: str, project: str, task: str):
+        self.ddb, self.table, self.run_id = ddb, table, run_id
+        self.key = {"pk": {"S": f"LOCK#{task_arn}"}, "sk": {"S": "LOCK"}}
+        self.attrs = {"entity": {"S": "LOCK"}, "project": {"S": project}, "taskKey": {"S": task}}
+
+    def hold(self, execution_arn: str, *, first: bool) -> None:
+        """First: only if no lock exists. Later: move it to the next execution (or take it back
+        if the watchdog released it between two executions)."""
+        item = {
+            **self.key,
+            **self.attrs,
+            "runId": {"S": self.run_id},
+            "executionArn": {"S": execution_arn},
+            "acquiredAt": {"S": datetime.now(UTC).isoformat()},
+            "gsi2pk": {"S": "LOCK#ACTIVE"},
+            "gsi2sk": {"S": execution_arn},
+        }
+        cond: dict[str, Any] = {"ConditionExpression": "attribute_not_exists(pk)"}
+        if not first:
+            cond = {
+                "ConditionExpression": "attribute_not_exists(pk) OR runId = :me",
+                "ExpressionAttributeValues": {":me": {"S": self.run_id}},
+            }
+        try:
+            self.ddb.put_item(TableName=self.table, Item=item, **cond)
+        except Exception as err:
+            if _conditional_failure(err):
+                raise SystemExit("another run holds the task lock: restore after it ends") from None
+            raise
+
+    def release(self, out: Any) -> None:
+        try:
+            self.ddb.delete_item(
+                TableName=self.table,
+                Key=self.key,
+                ConditionExpression="runId = :me",
+                ExpressionAttributeValues={":me": {"S": self.run_id}},
+            )
+        except Exception as err:  # noqa: BLE001 - report, never mask the restore's own outcome
+            note = "no longer held by this restore" if _conditional_failure(err) else f"not released: {err}"
+            _print({"taskLock": note}, out)
+
+
 def cmd_restore(args: argparse.Namespace, c: Clients, out: Any) -> int:
-    """pg-restore-s3 as a job-runner execution with the project's job role.
+    """pg-restore-s3 as a job-runner execution with the project's job role, under the task lock.
 
     A successful restore puts the target in a known, intended state: the target is then
     fingerprinted (checks/target_verify, phase restore) and the fingerprint becomes the baseline
     with ``source=restore`` and the ``runId`` of the run that took the dump, so the next run does
-    not stop as ``TargetChanged`` (ADR 0006). The command always waits for both."""
+    not stop as ``TargetChanged`` (ADR 0006). The command always waits for both and holds the
+    task lock (``LOCK#<taskArn>``, only if none exists) from before the start to the end."""
     if not args.confirm:
         raise SystemExit("restore drops and recreates the objects of the dump: add --confirm")
     if not (args.table and args.ssm_prefix and args.state_machine_arn):
         raise SystemExit("restore needs --table, --ssm-prefix and --state-machine-arn (or the ORCH_* variables)")
     name = f"{args.ssm_prefix.rstrip('/')}/{args.project}/{args.task}"
     reg = json.loads(c.get("ssm").get_parameter(Name=name)["Parameter"]["Value"])
+    runtime = restore_runtime(args.runtime, reg)
     lock = (
         c.get("dynamodb")
         .get_item(TableName=args.table, Key={"pk": {"S": f"LOCK#{reg['taskArn']}"}, "sk": {"S": "LOCK"}})
@@ -404,11 +473,47 @@ def cmd_restore(args: argparse.Namespace, c: Clients, out: Any) -> int:
     record = bool((connections.get("target") or {}).get("dataApiClusterArn")) and not args.dry_run
     dump_run = _dump_run_id(c, args.dump) if record else None
     run_id = f"restore-{args.project}-{args.task}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"[:71]
+    lock = TaskLock(c.get("dynamodb"), args.table, reg["taskArn"], run_id, args.project, args.task)
+    lock.hold(execution_arn(job_runner, run_id), first=True)
+    try:
+        return _restore_locked(args, c, out, reg, job_runner, run_id, record, dump_run, lock, runtime)
+    finally:
+        lock.release(out)
+
+
+def restore_runtime(asked: str | None, reg: dict[str, Any]) -> str:
+    """Where pg-restore-s3 runs: ``--runtime``, else SSM when the module has it, else Fargate.
+
+    The registration says which runtimes the module has (``runtimes``); one it lacks is refused
+    before the task lock is taken. An older registration without ``runtimes`` is not checked."""
+    have = reg.get("runtimes") or {}
+    runtime = asked or ("ssm" if have.get("ssm") else "fargate")
+    if have and not have.get(runtime):
+        raise SystemExit(
+            f"restore --runtime {runtime}: the module has no {runtime} runtime "
+            "(ssm.enabled, or fargate.images with sql-runner)"
+        )
+    return runtime
+
+
+def _restore_locked(
+    args: argparse.Namespace,
+    c: Clients,
+    out: Any,
+    reg: dict[str, Any],
+    job_runner: str,
+    run_id: str,
+    record: bool,
+    dump_run: str | None,
+    lock: TaskLock,
+    runtime: str,
+) -> int:
+    connections = reg.get("connections") or {}
+    where = {"runtime": "ssm"} if runtime == "ssm" else {"runtime": "fargate", "image": "sql-runner"}
     job = {
         "name": "restore-target",
         "index": 0,
-        "runtime": "fargate",
-        "image": "sql-runner",
+        **where,
         "command": ["pg-restore-s3", "--connection", "target", "--from", args.dump, "--confirm"],
         "timeoutSeconds": 21600,
         "retry": {"maxAttempts": 1, "backoffSeconds": 60},
@@ -454,6 +559,7 @@ def cmd_restore(args: argparse.Namespace, c: Clients, out: Any) -> int:
     }
     vctx = {**ctx, "selectionRules": _selection_rules(task.get("TableMappings"))}
     body = {"job": verify, "phase": "restore", "runId": run_id, "dryRun": False, "ctx": vctx, "failure": None}
+    lock.hold(execution_arn(job_runner, f"{run_id}-baseline"), first=False)
     resp = sfn.start_execution(stateMachineArn=job_runner, name=f"{run_id}-baseline", input=json.dumps(body))
     vdesc = wait_for(sfn, resp["executionArn"], args.poll, out)
     if vdesc["status"] != "SUCCEEDED":
@@ -526,6 +632,7 @@ def parser() -> argparse.ArgumentParser:
         sp.add_argument("run", help="runId or executionArn")
         if name == "report":
             sp.add_argument("--format", choices=["md", "json"], default="md")
+            sp.add_argument("--project", help="project of the run (default: read from the run item with --table)")
         sp.set_defaults(func=func)
 
     st = sub.add_parser("stop", help="stop a run (and optionally the DMS task)")
@@ -547,9 +654,12 @@ def parser() -> argparse.ArgumentParser:
     d.add_argument("--task", required=True)
     d.set_defaults(func=cmd_dumps)
 
-    r = sub.add_parser("restore", help="restore a target dump (pg-restore-s3 on Fargate)")
+    r = sub.add_parser("restore", help="restore a target dump (pg-restore-s3 on an SSM runner or Fargate)")
     r.add_argument("--project", required=True)
     r.add_argument("--task", required=True)
+    r.add_argument(
+        "--runtime", choices=["ssm", "fargate"], help="where pg-restore-s3 runs (default: ssm when the module has it)"
+    )
     r.add_argument("--dump", required=True, help="s3://<bucket>/dumps/<project>/<taskKey>/<ts>-<runId>/")
     r.add_argument("--confirm", action="store_true", help="required: pg_restore --clean drops objects first")
     r.add_argument("--dry-run", action="store_true")

@@ -103,6 +103,9 @@ def test_template_only_uses_known_placeholders(name):
         "security_groups_json",
         "assign_public_ip",
         "artifacts_bucket",
+        "ssm_document_name",
+        "ssm_instance_filters_json",
+        "jobs_log_group_name",
     }
     assert template_variables(name) <= known
 
@@ -114,10 +117,14 @@ def test_no_machine_waits_for_dms():
                 resource = state.get("Resource", "")
                 assert not resource.endswith(".waitForTaskToken"), f"{name}:{state_name} waits for a token"
                 assert "HeartbeatSeconds" not in state, f"{name}:{state_name}"
-                assert "describeReplicationTasks" not in resource, f"{name}:{state_name} polls DMS"
-                # Only the job-runner retry backoff and the assessment poll (minutes) wait; never DMS.
+                if "describeReplicationTasks" in resource:
+                    # One read before the dump and the reset, never in a loop (review finding 6).
+                    assert (name, state_name) == (MIGRATE, "RecheckTask"), f"{name}:{state_name} polls DMS"
+                # Only the job-runner retry backoff, the SSM command poll and the assessment poll
+                # (minutes) wait; never DMS.
                 if state["Type"] == "Wait":
-                    assert (name, state_name) in {(JOB_RUNNER, "WaitBeforeRetry"), (MIGRATE, "WaitAssessment")}
+                    allowed = {(JOB_RUNNER, "WaitBeforeRetry"), (JOB_RUNNER, "WaitSsm"), (MIGRATE, "WaitAssessment")}
+                    assert (name, state_name) in allowed
 
 
 def test_migrate_releases_the_lock_on_every_path_that_ends_before_the_dms_start():
@@ -154,6 +161,17 @@ def test_start_replication_task_is_only_reachable_through_arm():
 DESTRUCTIVE = ("DumpJobs", "ResetJobs")
 
 
+def test_the_task_is_read_again_right_before_the_dump_and_the_reset():
+    """Review finding 6: the task state was read once, by InspectTask, and the reset ran hours
+    later (after the dump) on that reading."""
+    states = render(MIGRATE)["States"]
+    for target in DESTRUCTIVE:
+        assert [n for n, s in states.items() if target in _edges(s)] == ["CheckTaskUnchanged"], target
+    assert [n for n, s in states.items() if "CheckTaskUnchanged" in _edges(s)] == ["RecheckTask"]
+    assert states["RecheckTask"]["Resource"].endswith("databasemigration:describeReplicationTasks")
+    assert "RecheckTask" in _reachable(states, states["DumpJobs"]["Next"], blocked=frozenset({"ResetJobs"}))
+
+
 def test_nothing_touches_the_target_before_the_assessment_and_the_arm_guard_passed():
     """Seen live: the reset truncated the target before Arm and the assessment, so a refusal there left
     it empty. Every path to the dump or the reset now goes through the assessment choice and the
@@ -179,17 +197,51 @@ def test_nothing_touches_the_target_before_the_assessment_and_the_arm_guard_pass
 
 
 def test_every_terminal_path_of_post_passes_release_lock():
-    states = render(POST)["States"]
+    """Except when the lock was lost: then it belongs to someone else (review finding 8)."""
+    import copy
+
+    states = copy.deepcopy(render(POST)["States"])
+    held = states["CheckLockHeld"]
+    lost = "{% $exists($failure.Error) and $failure.Error = 'LockLost' %}"
+    assert [c["Condition"] for c in held["Choices"]] == [lost]
+    assert held["Default"] == "ReleaseLock"
+    # Only TakeOverLock can set that failure.
+    setters = {n for n, st in states.items() if '"Error": "LockLost"' in json.dumps(st)}
+    assert setters == {"TakeOverLock"}, setters
+    held["Choices"] = []
     after_load = states["LoadRun"]["Next"]
     without_release = _reachable(states, after_load, blocked=frozenset({"ReleaseLock"}))
     terminals = {n for n in without_release if states[n]["Type"] in TERMINAL}
     assert terminals == set(), f"terminal states reachable without ReleaseLock: {terminals}"
 
 
+def test_post_stops_when_it_cannot_take_the_lock_over():
+    """Review finding 8: post went on (post jobs, auto-resume) without the lock."""
+    states = render(POST)["States"]
+    catch = {e: c["Next"] for c in states["TakeOverLock"]["Catch"] for e in c["ErrorEquals"]}
+    assert catch == {"DynamoDb.ConditionalCheckFailedException": "LockLost", "States.ALL": "LockLost"}
+    assert _success_edges(states["TakeOverLock"]) == ["DeleteMigration"]
+    after = _reachable(states, "LockLost")
+    assert not after & {"DeleteMigration", "PostJobs", "ClassifyFailure", "HandOverLock", "StartResume"}
+
+
+def _sdk_calls(args: Any) -> list[dict[str, Any]]:
+    """The DynamoDB calls of a state: its Arguments, or each item of a transaction."""
+    if not isinstance(args, dict):
+        return []  # one JSONata expression: nothing static to check
+    items = args.get("TransactItems")
+    return [next(iter(i.values())) for i in items] if isinstance(items, list) else [args]
+
+
 def test_post_resumes_only_through_a_lock_hand_over():
     states = render(POST)["States"]
     assert [n for n, s in states.items() if "StartResume" in _edges(s)] == ["HandOverLock"]
-    assert states["HandOverLock"]["Arguments"]["ConditionExpression"] == "runId = :o"
+    hand = states["HandOverLock"]
+    assert hand["Resource"].endswith("dynamodb:transactWriteItems")
+    lock, run = _sdk_calls(hand["Arguments"])
+    assert lock["ConditionExpression"] == "runId = :o"
+    # The parent run names its only child: resolve_context accepts attempt/parentRunId only from it.
+    assert run["UpdateExpression"] == "SET resumeChildRunId = :n"
     assert states["StartResume"]["Resource"] == "arn:aws:states:::states:startExecution"  # no .sync
     assert "GiveLockBack" in _edges(states["StartResume"])
 
@@ -206,6 +258,29 @@ def test_lambda_tasks_retry_transient_lambda_errors():
 def test_start_does_not_retry_invalid_state():
     start = render(MIGRATE)["States"]["StartReplicationTask"]
     assert start["Retry"][0] == {"ErrorEquals": ["DatabaseMigration.InvalidResourceStateException"], "MaxAttempts": 0}
+
+
+def test_start_retries_only_task_failures_and_leaves_a_timeout_to_the_handoff():
+    """Review finding 13: a start that timed out may have reached DMS; a second start would be a
+    second run of the task. The handoff judges the task with the recorded error instead."""
+    start = render(MIGRATE)["States"]["StartReplicationTask"]
+    retried = {e for r in start["Retry"] if r.get("MaxAttempts", 3) > 0 for e in r["ErrorEquals"]}
+    assert retried == {"States.TaskFailed"}
+    catch = {e: c["Next"] for c in start["Catch"] for e in c["ErrorEquals"]}
+    assert catch["States.Timeout"] == "RecordStartError"
+    # Seen live (TestState against AWS): the States.TaskFailed retrier retried a States.Timeout.
+    # The first matching retrier wins, so the timeout gets its own MaxAttempts 0 ahead of it.
+    names = [r["ErrorEquals"] for r in start["Retry"]]
+    first_timeout = next(i for i, n in enumerate(names) if "States.Timeout" in n)
+    assert start["Retry"][first_timeout].get("MaxAttempts") == 0
+    assert first_timeout < next(i for i, n in enumerate(names) if "States.TaskFailed" in n)
+
+
+def test_migrate_start_timeout_records_the_error_and_keeps_the_lock():
+    run = run_migrate(migrate_mocks(StartReplicationTask=raises("States.Timeout", "Task timed out")))
+    assert run.status == "SUCCEEDED" and run.called("Disarm") == [] and run.called("ReleaseLock") == []
+    err = run.called("RecordStartError")[0]["ExpressionAttributeValues"][":e"]["M"]
+    assert err["Error"] == {"S": "States.Timeout"}
 
 
 DDB_RESERVED = {
@@ -234,12 +309,12 @@ def test_dynamodb_expressions_alias_reserved_words():
 
     for name in ALL:
         for state_name, state in render(name)["States"].items():
-            args = state.get("Arguments", {})
-            for key in ("UpdateExpression", "ConditionExpression"):
-                if key in args:
-                    words = set(re.findall(r"(?<![#:])\b([A-Za-z_][A-Za-z0-9_]*)\b", args[key]))
-                    words -= {"SET", "REMOVE", "AND", "OR", "NOT", "attribute_not_exists", "attribute_exists"}
-                    assert not (words & DDB_RESERVED), f"{state_name}.{key} uses reserved {words & DDB_RESERVED}"
+            for args in _sdk_calls(state.get("Arguments", {})):
+                for key in ("UpdateExpression", "ConditionExpression"):
+                    if key in args:
+                        words = set(re.findall(r"(?<![#:])\b([A-Za-z_][A-Za-z0-9_]*)\b", args[key]))
+                        words -= {"SET", "REMOVE", "AND", "OR", "NOT", "attribute_not_exists", "attribute_exists"}
+                        assert not (words & DDB_RESERVED), f"{state_name}.{key} uses reserved {words & DDB_RESERVED}"
 
 
 # --- shared fixtures for scenarios -------------------------------------------------
@@ -368,8 +443,11 @@ def migrate_mocks(req: dict[str, Any] | None = None, dec: dict[str, Any] | None 
         "RunPreJob": job_ok,
         "RunResetJob": job_ok,
         "RunOnFailureJob": job_ok,
-        "SaveContext": lambda _a: {},
+        "SaveContext": lambda _a: {"VersionId": "ctx-v1", "ETag": '"e"'},
+        "RecordContextVersion": lambda _a: {},
         "ReadMigration": lambda _a: {},
+        "RecheckTask": lambda _a: {"ReplicationTasks": [{"Status": "ready"}]},
+        "RecordChainDump": lambda _a: {},
         "StartPostDryRun": lambda a: {"ExecutionArn": "arn:post:" + a["Name"]},
         "Arm": lambda _a: {},
         "StartReplicationTask": lambda _a: {"ReplicationTask": {"Status": "starting"}},
@@ -392,6 +470,27 @@ def run_migrate(mocks: dict[str, Any], input_: Any = None):
     return Interpreter(render(MIGRATE), mocks).execute(input_ or {"project": "ledger", "taskKey": "core"})
 
 
+def test_migrate_records_the_version_of_the_saved_context_before_arming():
+    """Review finding 1: post loads only the context.json version migrate recorded on RUN#."""
+    run = run_migrate(migrate_mocks())
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    assert run.path.index("SaveContext") < run.path.index("RecordContextVersion") < run.path.index("Arm")
+    rec = run.called("RecordContextVersion")[0]
+    assert rec["Key"] == {"pk": {"S": "RUN#run-1"}, "sk": {"S": "META"}}
+    assert rec["UpdateExpression"] == "SET contextVersionId = :v"
+    assert rec["ExpressionAttributeValues"] == {":v": {"S": "ctx-v1"}}
+    assert rec["ConditionExpression"] == "attribute_exists(pk)"
+
+
+def test_migrate_without_a_context_version_stops_before_dms():
+    """An unversioned bucket returns no VersionId: post could not verify the context, so DMS is not started."""
+    run = run_migrate(migrate_mocks(SaveContext=lambda _a: {"ETag": '"e"'}))
+    assert run.called("RecordContextVersion") == [] and run.called("Arm") == []
+    assert run.called("StartReplicationTask") == []
+    failure = run.called("ClassifyFailure")[0]["Payload"]["failure"]
+    assert failure["Error"] == "ContextNotPinned" and "versioning" in failure["Cause"]
+
+
 def test_migrate_arms_then_starts_then_ends_without_waiting_or_unlocking():
     run = run_migrate(migrate_mocks())
     assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
@@ -409,7 +508,7 @@ def test_migrate_arms_then_starts_then_ends_without_waiting_or_unlocking():
     # and post read a quoted string back.
     saved = run.called("SaveContext")[0]["Body"]
     assert isinstance(saved, dict)
-    assert run.called("SaveContext")[0]["Key"] == "runs/run-1/context.json"
+    assert run.called("SaveContext")[0]["Key"] == "runs/ledger/run-1/context.json"
     assert saved["jobCtx"]["startType"] == "start-replication" and saved["startedAt"] == arm["startedAt"]["S"]
     assert "preflight" in saved  # post's final report carries the verdict (S4)
     assert run.called("ReportStarted")[0]["Payload"]["status"] == "STARTED"
@@ -672,7 +771,7 @@ def test_post_success_runs_post_jobs_reports_and_unlocks():
     run = run_post(post_mocks())
     assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
     assert run.path[:4] == ["LoadRun", "TakeOverLock", "DeleteMigration", "CheckOutcome"]
-    assert run.path[-4:] == ["Notify", "ReleaseLock", "Done", "Succeeded"]
+    assert run.path[-5:] == ["Notify", "CheckLockHeld", "ReleaseLock", "Done", "Succeeded"]
     load = run.called("LoadRun")[0]["Payload"]
     assert load["mode"] == "post" and load["input"] == POST_INPUT
     take = run.called("TakeOverLock")[0]
@@ -708,9 +807,12 @@ def test_post_failure_auto_resumes_as_a_new_migrate_with_the_lock_handed_over():
     run = run_post(mocks)
     assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
     assert run.output["status"] == "RESUMED" and run.output["nextRunId"] == "run-1-r2"
-    hand = run.called("HandOverLock")[0]["ExpressionAttributeValues"]
+    lock, parent = _sdk_calls(run.called("HandOverLock")[0])
+    hand = lock["ExpressionAttributeValues"]
     assert hand[":o"] == {"S": "run-1"} and hand[":n"] == {"S": "run-1-r2"}
     assert hand[":e"]["S"].endswith(":execution:dms-orch-test-migrate:run-1-r2")
+    assert parent["Key"] == {"pk": {"S": "RUN#run-1"}, "sk": {"S": "META"}}
+    assert parent["ExpressionAttributeValues"] == {":n": {"S": "run-1-r2"}}
     start = run.called("StartResume")[0]
     assert start["Name"] == "run-1-r2" and start["StateMachineArn"].endswith(":stateMachine:dms-orch-test-migrate")
     chained = start["Input"]
@@ -738,6 +840,9 @@ def test_post_takes_the_lock_back_when_the_new_migrate_does_not_start():
     )
     run = run_post(mocks)
     assert run.status == "FAILED" and run.called("GiveLockBack") and run.called("ReleaseLock")
+    lock, parent = _sdk_calls(run.called("GiveLockBack")[0])
+    assert lock["ConditionExpression"] == "runId = :n"
+    assert parent["Key"]["pk"] == {"S": "RUN#run-1"} and parent["UpdateExpression"] == "REMOVE resumeChildRunId"
     assert run.called("WriteReport")[0]["Payload"]["status"] == "FAILED"
 
 
@@ -753,10 +858,23 @@ def test_post_load_failure_fails_without_touching_anything():
     assert run.path == ["LoadRun", "FailLoad"]
 
 
+@pytest.mark.parametrize(
+    "error", ["DynamoDb.ConditionalCheckFailedException", "DynamoDb.ThrottlingException", "States.Timeout"]
+)
+def test_post_without_the_lock_reports_manual_notifies_and_leaves_the_lock_alone(error):
+    """The lock names another run (or could not be read after the retries): post runs nothing,
+    reports MANUAL with a notification and never deletes a lock it does not hold."""
+    run = run_post(post_mocks(TakeOverLock=raises(error)))
+    assert (run.status, run.error) == ("FAILED", "LockLost"), (run.error, run.path)
+    assert run.called("WriteReport")[0]["Payload"]["status"] == "MANUAL"
+    assert run.called("Notify") and run.called("ReleaseLock") == []
+    assert run.called("DeleteMigration") == [] and run.called("RunPostJob") == []
+    assert run.called("ClassifyFailure") == [] and run.called("HandOverLock") == []
+
+
 def test_post_lock_bookkeeping_failures_do_not_stop_the_run():
     run = run_post(
         post_mocks(
-            TakeOverLock=raises("DynamoDb.ConditionalCheckFailedException"),
             DeleteMigration=raises("DynamoDb.ConditionalCheckFailedException"),
             ReleaseLock=raises("DynamoDb.ConditionalCheckFailedException"),
         )
@@ -851,7 +969,7 @@ def test_skipped_job_does_not_run():
 
 
 def test_fargate_job_passes_command_and_env_and_reads_result():
-    run = run_job(job_mocks(spec(runtime="fargate")), {**JOB_INPUT, "dryRun": True})
+    run = run_job(job_mocks(spec(runtime="fargate", dryRun=True)), {**JOB_INPUT, "dryRun": True})
     assert run.status == "SUCCEEDED" and run.output["summary"] == {"rows": 10}
     args = run.called("RunFargateJob")[0]
     override = args["Overrides"]["ContainerOverrides"][0]
@@ -901,6 +1019,146 @@ def test_fargate_without_result_file_fails():
     )
     run = run_job(mocks)
     assert run.status == "FAILED" and "no result.json" in json.loads(run.cause)["message"]
+
+
+def _dry_flags(run: Any) -> dict[str, Any]:
+    flags: dict[str, Any] = {"record": run.called("RecordJob")[0]["Item"]["dryRun"]}
+    for c in run.called("RunFargateJob"):
+        env = {e["Name"]: e["Value"] for e in c["Overrides"]["ContainerOverrides"][0]["Environment"]}
+        flags["fargate"] = env["ORCH_DRY_RUN"]
+    for c in run.called("RunSsmJob"):
+        flags["ssm"] = c["Parameters"]["dryRun"]
+    return flags
+
+
+@pytest.mark.parametrize("runtime", ["lambda", "fargate", "ssm"])
+def test_the_job_runs_and_is_recorded_with_the_dry_run_flag_prepare_job_decided(runtime):
+    """Run 11 finding 2: the input's dryRun is the caller's; prepare_job takes it from RUN#."""
+    job_spec = spec(**(SSM_SPEC if runtime == "ssm" else {"runtime": runtime}), dryRun=False)
+    mocks = ssm_mocks(job_spec) if runtime == "ssm" else job_mocks(job_spec)
+    run = run_job(mocks, {**JOB_INPUT, "dryRun": True})
+    expected: dict[str, Any] = {"record": {"Bool": False}}
+    if runtime == "fargate":
+        expected["fargate"] = "0"
+    if runtime == "ssm":
+        expected["ssm"] = ["0"]
+    assert _dry_flags(run) == expected
+
+
+def test_a_refused_job_records_nothing():
+    run = run_job(job_mocks(spec(), PrepareJob=raises("JobNotInJobSet", "dryRun differs")))
+    assert (run.status, run.error) == ("FAILED", "JobFailed")
+    assert run.called("RecordJob") == [] and run.called("InvokeLambdaJob") == []
+
+
+def _job_dry_flags(node: Any) -> list[Any]:
+    """The dryRun of every job-runner input (an object with phase and dryRun) in a definition."""
+    if isinstance(node, list):
+        return [f for v in node for f in _job_dry_flags(v)]
+    if not isinstance(node, dict):
+        return []
+    own = [node["dryRun"]] if "dryRun" in node and "phase" in node else []
+    return own + [f for v in node.values() for f in _job_dry_flags(v)]
+
+
+def test_migrate_and_post_pass_the_dry_run_flag_of_the_run_to_every_job():
+    """No literal dryRun: prepare_job refuses a flag that is not the one on RUN#."""
+    for name in (MIGRATE, POST):
+        found = _job_dry_flags(render(name))
+        assert found and all(isinstance(v, str) and "$req.dryRun" in v for v in found), (name, found)
+
+
+# --- SSM Run Command runtime (runner instance from the team AMI) ---------------------
+
+SSM_SPEC = {"runtime": "ssm", "jobRoleArn": "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"}
+
+
+def ssm_mocks(job_spec: dict[str, Any], **over: Any) -> dict[str, Any]:
+    mocks = job_mocks(
+        job_spec,
+        FindSsmRunner=lambda _a: {"InstanceInformationList": [{"InstanceId": "i-0aaa"}]},
+        RunSsmJob=lambda a: {"Command": {"CommandId": "cmd-1", "InstanceIds": a["InstanceIds"]}},
+        GetSsmInvocation=sequence({"Status": "InProgress"}, {"Status": "Success", "ResponseCode": 0}),
+        FetchSsmResult=lambda _a: {"Body": json.dumps({"status": "ok", "summary": {"restored": 4}})},
+    )
+    mocks.update(over)
+    return mocks
+
+
+def test_ssm_job_sends_the_module_document_and_polls_until_terminal():
+    run = run_job(ssm_mocks(spec(**SSM_SPEC, timeoutSeconds=7200, dryRun=True)), {**JOB_INPUT, "dryRun": True})
+    assert run.status == "SUCCEEDED" and run.output["summary"] == {"restored": 4}
+    assert run.called("RunFargateJob") == [] and run.called("InvokeLambdaJob") == []
+    assert run.called("FindSsmRunner")[0]["Filters"] == [{"Key": "PingStatus", "Values": ["Online"]}]
+    send = run.called("RunSsmJob")[0]
+    assert send["DocumentName"] == "dms-orch-test-orch-job" and send["InstanceIds"] == ["i-0aaa"]
+    # The command itself is never a parameter: orch-job reads it from spec.json.
+    assert send["Parameters"] == {
+        "specS3Uri": ["s3://b/runs/r/jobs/pre/00-x/spec.json"],
+        "jobRoleArn": ["arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"],
+        "attempt": ["1"],
+        "dryRun": ["1"],
+        "executionTimeout": ["7200"],
+    }
+    assert send["CloudWatchOutputConfig"] == {
+        "CloudWatchOutputEnabled": True,
+        "CloudWatchLogGroupName": "/dms-orch/test/jobs",
+    }
+    assert run.called("GetSsmInvocation")[0] == {"CommandId": "cmd-1", "InstanceId": "i-0aaa"}
+    assert run.path.count("WaitSsm") == 2
+    assert run.called("FetchSsmResult")[0]["Key"] == "runs/r/jobs/pre/00-x/result.json"
+    assert run.called("RecordJob")[0]["Item"]["runtime"] == {"S": "ssm"}
+
+
+@pytest.mark.parametrize("status", ["Failed", "TimedOut", "Cancelled"])
+def test_ssm_terminal_failure_is_a_job_failure_even_if_result_says_ok(status):
+    inv = sequence({"Status": status, "ResponseCode": 3})
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), GetSsmInvocation=inv))
+    assert (run.status, run.error) == ("FAILED", "JobFailed")
+    message = json.loads(run.cause)["message"]
+    assert f"SSM command cmd-1 {status}" in message and "exit code 3" in message
+
+
+def test_ssm_without_a_runner_online_fails_without_sending():
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), FindSsmRunner=lambda _a: {"InstanceInformationList": []}))
+    assert run.status == "FAILED" and run.called("RunSsmJob") == []
+    assert "no SSM runner instance online" in json.loads(run.cause)["message"]
+
+
+def test_ssm_send_failure_is_a_job_failure():
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), RunSsmJob=raises("Ssm.InvalidInstanceIdException", "not managed")))
+    assert run.status == "FAILED" and "not managed" in json.loads(run.cause)["message"]
+    assert run.called("GetSsmInvocation") == []
+
+
+def test_ssm_retry_takes_the_next_runner():
+    runners = lambda _a: {"InstanceInformationList": [{"InstanceId": "i-0bbb"}, {"InstanceId": "i-0aaa"}]}  # noqa: E731
+    inv = sequence({"Status": "Failed", "ResponseCode": 1}, {"Status": "Success", "ResponseCode": 0})
+    run = run_job(ssm_mocks(spec(**SSM_SPEC, maxAttempts=2), FindSsmRunner=runners, GetSsmInvocation=inv))
+    assert run.status == "SUCCEEDED" and run.output["attempt"] == 2
+    assert [c["InstanceIds"] for c in run.called("RunSsmJob")] == [["i-0aaa"], ["i-0bbb"]]
+
+
+def test_ssm_wait_gives_up_after_the_job_timeout():
+    run = run_job(ssm_mocks(spec(**SSM_SPEC, timeoutSeconds=60), GetSsmInvocation=lambda _a: {"Status": "InProgress"}))
+    assert run.status == "FAILED" and "did not finish" in json.loads(run.cause)["message"]
+    # timeout + 900 s of delivery and shutdown margin, 30 s per poll
+    assert run.path.count("WaitSsm") == (60 + 900) // 30
+
+
+def test_ssm_lookup_errors_keep_polling_until_the_invocation_is_seen():
+    inv = sequence(
+        TaskError("Ssm.InvocationDoesNotExistException", "not yet"), {"Status": "Success", "ResponseCode": 0}
+    )
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), GetSsmInvocation=inv))
+    assert run.status == "SUCCEEDED" and run.path.count("WaitSsm") == 2
+
+
+def test_ssm_without_result_file_names_the_command():
+    inv = sequence({"Status": "Failed", "ResponseCode": 97})
+    run = run_job(ssm_mocks(spec(**SSM_SPEC), GetSsmInvocation=inv, FetchSsmResult=raises("S3.NoSuchKey")))
+    message = json.loads(run.cause)["message"]
+    assert "no result.json from SSM command cmd-1 on i-0aaa" in message and "exit code 97" in message
 
 
 def test_idempotent_job_is_retried_up_to_max_attempts():
@@ -957,10 +1215,10 @@ def _attribute_values(node: Any):
 def test_dynamodb_sdk_arguments_use_sdk_attribute_type_names(name):
     for state_name, state in render(name)["States"].items():
         if state.get("Resource", "").startswith("arn:aws:states:::aws-sdk:dynamodb:"):
-            args = state["Arguments"]
-            for key in ("Item", "Key", "ExpressionAttributeValues"):
-                types = set(_attribute_values(args.get(key, {})))
-                assert types <= SDK_ATTRIBUTE_TYPES, f"{state_name}.{key}: {types - SDK_ATTRIBUTE_TYPES}"
+            for args in _sdk_calls(state["Arguments"]):
+                for key in ("Item", "Key", "ExpressionAttributeValues"):
+                    types = set(_attribute_values(args.get(key, {})))
+                    assert types <= SDK_ATTRIBUTE_TYPES, f"{state_name}.{key}: {types - SDK_ATTRIBUTE_TYPES}"
 
 
 # --- pre-flight cycle and baseline (ADR 0006) ---------------------------------
@@ -1010,6 +1268,22 @@ def test_reset_verdict_replaces_the_decision_and_feeds_the_reset_jobs():
     assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
     assert run.called("RunResetJob")[0]["Input"]["ctx"]["resetTables"] == ["app.a", "app.b"]
     assert run.called("StartReplicationTask")[0]["StartReplicationTaskType"] == "reload-target"
+
+
+def test_a_reset_list_in_s3_reaches_the_reset_jobs_as_count_and_uri():
+    uri = "s3://b/runs/r/inspect/reset-tables.json"
+    reset = decision(
+        start_type="reload-target",
+        reset=True,
+        resetScope="all",
+        resetTables=[],
+        resetTablesCount=600,
+        resetTablesUri=uri,
+    )
+    run = run_migrate(migrate_mocks(Preflight=payload(verdict("reset", dec=reset))))
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    ctx = run.called("RunResetJob")[0]["Input"]["ctx"]
+    assert (ctx["resetTables"], ctx["resetTablesCount"], ctx["resetTablesUri"]) == ([], 600, uri)
 
 
 def test_prepare_runs_the_pre_jobs_then_checks_again_once():
@@ -1154,6 +1428,103 @@ def test_dump_runs_before_the_reset_and_only_when_something_is_reset():
     assert run.status == "SUCCEEDED" and "DumpJobs" not in run.path
 
 
+def test_reset_reads_the_task_before_the_dump_and_again_before_the_reset():
+    run = run_migrate(reset_mocks())
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    order = [n for n in run.path if n in ("RecheckTask", "DumpJobs", "ResetJobs", "Arm")]
+    assert order == ["RecheckTask", "DumpJobs", "RecheckTask", "ResetJobs", "Arm"]
+    assert run.called("RecheckTask")[0]["Filters"] == [{"Name": "replication-task-arn", "Values": [TASK_ARN]}]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "dumped"),
+    [
+        ({"Status": "running"}, None, False),
+        ({"Status": "stopped", "StopReason": "NORMAL"}, None, False),
+        ({"Status": "ready"}, {"Status": "starting"}, True),
+    ],
+)
+def test_a_task_that_moved_since_inspect_stops_the_run_before_the_target_is_touched(first, second, dumped):
+    reads = [{"ReplicationTasks": [first]}, {"ReplicationTasks": [second or first]}]
+    run = run_migrate(reset_mocks(RecheckTask=sequence(*reads)))
+    assert (run.status, run.error) == ("FAILED", "TaskStateChanged"), (run.error, run.path)
+    assert bool(run.called("RunDumpJob")) is dumped
+    assert run.called("RunResetJob") == [] and run.called("Arm") == [] and run.called("ReleaseLock")
+
+
+def test_a_failed_recheck_is_classified_before_the_target_is_touched():
+    run = run_migrate(reset_mocks(RecheckTask=raises("DatabaseMigration.ResourceNotFoundFault", "gone")))
+    assert run.status == "FAILED" and run.called("RunDumpJob") == [] and run.called("RunResetJob") == []
+
+
+def chained_reset_mocks(chain: dict[str, Any] | None, **over: Any) -> dict[str, Any]:
+    req = request(operation="resume", attempt=2, parentRunId="run-0", parentStartedAt="2026-10-28T10:00:00Z")
+    mocks = reset_mocks(**over)
+    c = ctx(dump=[DUMP_JOB])
+    if chain is not None:
+        c["chain"] = chain
+    mocks["ResolveContext"] = payload({"runId": "run-1-r2", "request": req, "ctx": c, "attempt": 2})
+    return mocks
+
+
+@pytest.mark.parametrize("chain", [{"dumped": False, "dumpUri": None}, None])
+def test_a_chained_reset_dumps_when_the_chain_has_no_dump(chain):
+    """Review finding 5: the first run did not reset (no dump), the resume did, and skipped the
+    dump because it was a resume. A context without the chain (older run) dumps too."""
+    run = run_migrate(chained_reset_mocks(chain))
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    assert [n for n in run.path if n in ("DumpJobs", "RecordChainDump", "ResetJobs")] == [
+        "DumpJobs",
+        "RecordChainDump",
+        "ResetJobs",
+    ]
+
+
+def test_a_chained_reset_after_a_dump_in_the_chain_does_not_dump_again():
+    run = run_migrate(chained_reset_mocks({"dumped": True, "dumpUri": "s3://b/dumps/x/"}))
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    assert run.called("RunDumpJob") == [] and run.called("RunResetJob")
+
+
+def dump_ok(args: Any) -> Any:
+    return {
+        "Output": {
+            "name": "dump-target",
+            "phase": args["Input"]["phase"],
+            "status": "ok",
+            "summary": {"dumpS3Uri": "s3://b/dumps/ledger/core/t-run-1/", "dryRun": args["Input"]["dryRun"]},
+        }
+    }
+
+
+def test_the_dump_is_recorded_on_the_run_for_the_next_resume():
+    mocks = reset_mocks()
+    mocks["RunDumpJob"] = dump_ok
+    run = run_migrate(mocks)
+    assert run.status == "SUCCEEDED", (run.error, run.cause, run.path)
+    rec = run.called("RecordChainDump")[0]
+    assert rec["Key"] == {"pk": {"S": "RUN#run-1"}, "sk": {"S": "META"}}
+    assert rec["ExpressionAttributeValues"] == {
+        ":d": {"Bool": True},
+        ":u": {"S": "s3://b/dumps/ledger/core/t-run-1/"},
+    }
+
+
+def test_a_dry_run_dump_is_not_a_dump_of_the_chain():
+    mocks = reset_mocks()
+    mocks["RunDumpJob"] = dump_ok
+    mocks["ResolveContext"] = payload(
+        {"runId": "run-1", "request": request(dryRun=True), "ctx": ctx(dump=[DUMP_JOB]), "attempt": 1}
+    )
+    run = run_migrate(mocks)
+    assert run.called("RecordChainDump")[0]["ExpressionAttributeValues"] == {":d": {"Bool": False}, ":u": {"S": ""}}
+
+
+def test_a_failed_dump_record_does_not_stop_the_run():
+    run = run_migrate(reset_mocks(RecordChainDump=raises("DynamoDb.InternalServerErrorException")))
+    assert run.status == "SUCCEEDED" and run.called("RunResetJob")
+
+
 def test_failed_dump_stops_before_the_reset():
     reset = decision(start_type="reload-target", reset=True, resetScope="all", resetTables=["app.a"])
     mocks = migrate_mocks(
@@ -1255,3 +1626,62 @@ def test_no_assessment_unless_enabled_and_not_in_a_dry_run():
         {"runId": "run-1", "request": request(dryRun=True), "ctx": {**ctx(), "assessment": ASSESS_CFG}, "attempt": 1}
     )
     assert "StartAssessment" not in run_migrate(m).path
+
+
+# --- the resume chain end to end: retry -> dump -> restore (s19, offline) ----------------
+
+
+def test_a_resume_chain_dumps_before_its_first_reset_and_that_dump_can_be_restored(store, monkeypatch):
+    """Replaces the sandbox scenario s19-chain-dump, which cannot be reproduced live (an external
+    stop never resumes by itself). Attempt 1 started DMS without a reset, so nothing was dumped;
+    it fails with a retryable category, post hands over to attempt 2 (retry); attempt 2 resets
+    and therefore dumps first and records the dump on its RUN# (dump); a further resume of the
+    chain does not dump again, and orch.py restore may restore exactly that dump (restore).
+    Each step feeds the next with what the previous one wrote."""
+    from lambdas.resolve_context.handler import resolve_chain
+    from shared import job_trust
+
+    store.put_run("run-1", {"project": "ledger", "taskKey": "core", "status": "RUNNING"})
+
+    # retry: post classifies the failure as retryable and hands the lock over to run-1-r2.
+    post = run_post(
+        post_mocks(
+            loaded(failure={"Error": "DmsTaskFailed", "Cause": "source connection lost"}),
+            ClassifyFailure=payload({"category": "TRANSIENT_SOURCE_CONN", "retryable": True, "autoResume": True}),
+        )
+    )
+    assert post.output["status"] == "RESUMED", (post.error, post.cause, post.path)
+    _, parent = _sdk_calls(post.called("HandOverLock")[0])
+    assert parent["UpdateExpression"] == "SET resumeChildRunId = :n"
+    store.update_run("run-1", {"resumeChildRunId": parent["ExpressionAttributeValues"][":n"]["S"]})
+    chained = post.called("StartResume")[0]["Input"]
+    chain = resolve_chain(chained, {"name": post.called("StartResume")[0]["Name"]})
+    assert chain == {"dumped": False, "dumpUri": None}
+
+    # dump: attempt 2 resets, so it dumps first and records the dump on its RUN#.
+    mocks = chained_reset_mocks(chain)
+    mocks["RunDumpJob"] = dump_ok
+    second = run_migrate(mocks)
+    assert second.status == "SUCCEEDED", (second.error, second.cause, second.path)
+    order = [n for n in second.path if n in ("DumpJobs", "RecordChainDump", "ResetJobs")]
+    assert order == ["DumpJobs", "RecordChainDump", "ResetJobs"]
+    record = second.called("RecordChainDump")[0]
+    assert record["Key"] == {"pk": {"S": "RUN#run-1-r2"}, "sk": {"S": "META"}}
+    values = record["ExpressionAttributeValues"]
+    dump = values[":u"]["S"]
+    store.update_run(
+        "run-1-r2",
+        {"project": "ledger", "taskKey": "core", "chainDumped": values[":d"]["Bool"], "dumpUri": dump},
+    )
+
+    # A further resume of the same chain takes that dump as the chain's and does not dump again.
+    store.update_run("run-1-r2", {"resumeChildRunId": "run-1-r3"})
+    third_chain = resolve_chain({**chained, "attempt": 3, "parentRunId": "run-1-r2"}, {"name": "run-1-r3"})
+    assert third_chain == {"dumped": True, "dumpUri": dump}
+    third = run_migrate(chained_reset_mocks(third_chain))
+    assert third.status == "SUCCEEDED" and third.called("RunDumpJob") == [] and third.called("RunResetJob")
+
+    # restore: the job-runner accepts pg-restore-s3 of exactly this dump of the task.
+    monkeypatch.setenv("ARTIFACTS_BUCKET", "b")
+    job = {"name": "restore-target", "runtime": "ssm", "command": [*job_trust.RESTORE_COMMAND, dump, "--confirm"]}
+    assert job_trust._restore_job(job, "ledger", "core")["command"] == [*job_trust.RESTORE_COMMAND, dump, "--confirm"]

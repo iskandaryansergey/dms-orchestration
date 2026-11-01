@@ -23,10 +23,13 @@ cutover: the database team's zone, not the orchestrator's.
   30 min). A retry finds the run's snapshot by its `dms-orch:run` tag instead of creating
   another one.
 * Name `<project>-<taskKey>-<YYYYMMDD-HHMMSS>`, tags `dms-orch:project`, `dms-orch:task`,
-  `dms-orch:run`: no host, user or secret. `runs/<runId>/dump.json` records the snapshot.
+  `dms-orch:run`: no host, user or secret. `dump.json` next to the job result
+  (`runs/<project>/<runId>/jobs/dump/<nn>-<name>/`) records the snapshot.
 * IAM: create (and describe) on the registered target clusters; creating a snapshot needs the
-  request tag `dms-orch:project = <project>` on `cluster-snapshot:<project>-*`; describe and
-  delete of snapshots need the resource tag `dms-orch:project = <project>`.
+  request tag `dms-orch:project = <project>` (any snapshot identifier, the tag is the bound);
+  tagging only a snapshot already tagged with the project or not yet tagged; describe and
+  delete of snapshots need the resource tag `dms-orch:project = <project>`
+  ([security.md](../security.md)).
 * Retention: the post job `snapshot-retention` (`cleanup/cluster_snapshots`) deletes this task's
   snapshots older than `dump_retention_days`. Snapshots without both the project and the task tag
   (taken by people) are never touched.

@@ -4,6 +4,190 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions: SemV
 first production run). Commit references name the commit that made or fixed the item; the
 observed AWS behaviour behind the fixes is in [docs/dms-observations.md](docs/dms-observations.md).
 
+## [0.2.0] — 2026-10-30
+
+Hardening of 0.1.0 and new job runtimes. Upgrading needs care: every breaking change is marked
+under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
+
+### Security
+- Run artifacts per project: `runs/<project>/<runId>/` (`context.json`, reports, `jobs/`). A
+  project's job role reads and writes only `runs/<project>/*/jobs/*`; the shared `ecs-job` and
+  `lambda-jobs` roles lose `runs/*`.
+- `post` loads exactly the `context.json` version `migrate` saved: `migrate` records the S3
+  version id on the run item (`CheckContextVersion`, `RecordContextVersion`) and `post` refuses
+  any other version (`ContextNotPinned`).
+- The operator policy no longer publishes job sets; publishing is a separate policy per project
+  that only creates objects, so a published version is never overwritten.
+- Job sets are pinned by hash: `bundle.sha256` (sorted file hashes plus a total) is checked
+  against the registered total by `resolve_context`, the SQL and command runtimes and the
+  built-in jobs; a missing hash fails `JobSetNotPinned`, any difference `JobSetTampered`, before
+  a connection is resolved.
+- A job result holds no command output: a failed job names its exit code and CloudWatch log
+  stream. A dry run opens read-only database sessions (`default_transaction_read_only` for libpq
+  clients and the Lambda SQL runtime; advisory for scripts with other drivers).
+- Chain fields of a run request (`attempt`, `parentRunId`, `parentStartedAt`) are accepted only
+  from the execution `post` handed the lock to (`RUN#<parent>.resumeChildRunId`), else
+  `InvalidRunRequest`.
+- Snapshot rights are bounded by the project tag, not the identifier prefix: create only with the
+  request tag `dms-orch:project = <project>`, tagging only of a snapshot already tagged with the
+  project or not tagged yet; no project name may be a prefix of another.
+- Restore runs under the task lock, checks the manifest's project and task before downloading,
+  restores only the manifest's tables and commits only after `pg_restore` succeeded.
+- The job-runner no longer trusts its input (the operator may start it for `orch.py restore`):
+  `prepare_job` runs a job only if it is in the job set version recorded on the run's `RUN#` with
+  the same code (looked up again by name, bundle hash from the registration, not from the input)
+  or is one of the module's own jobs with its fixed code (snapshot retention at least
+  `dump_retention_days`), for a `RUNNING` run of the project and task named. The job context is
+  built from the registration and `RUN#` only: `inspect_task` records the run's decision (start
+  type, reset scope and list, migration type, selection rules) on `RUN#`, and a reset list in S3
+  is read only under the run's `inspect/` prefix. The restore phase accepts only `pg-restore-s3`
+  of that task's dumps and the restore baseline check, under the task lock held by that restore
+  execution (the job-runner passes its execution id to `PrepareJob`). `dryRun` is the one on
+  `RUN#`: an input that differs is refused before anything is written, and the job-runner runs and
+  records the job with the flag `PrepareJob` returned, so a dry re-run of a real run's job can no
+  longer overwrite its `JOB#` record with `ok` and close a failed post check (run 11, finding 2);
+  migrate and post pass the run's flag to every job, the baseline jobs included. Anything else
+  fails `JobNotInJobSet`. The operator policy denies reading `runs/*/jobs/*`, so a
+  job artifact named `report.json` is not readable either; job results remain visible in the
+  execution history.
+- No reset without a target fingerprint; the reset scope comes from the fingerprint and the
+  task's selection rules, not from the DMS table statistics.
+- The optional `sql-runner` image is built from a digest-pinned base, checksummed downloads and
+  pip wheels by hash, with mirror build arguments; PowerShell is off by default.
+- The Lambda SQL runtime vendors `pg8000` by hash (`make vendor-check`) and connects with TLS
+  `verify-full` against a pinned RDS CA bundle.
+- SSM runtime: runners assume the project's job role through a short-lived profile, the
+  document checks the sha256 of the runtime zip, connection files are `0600` and removed on
+  every exit. Residual risk: projects that share one runner are not isolated from each other
+  (sessions on the runner and other projects' jobs can see job files during a run); use
+  one runner per project ([ADR 0011](docs/adr/0011-job-runtimes.md),
+  [security.md](docs/security.md)).
+
+### Changed
+- **Breaking:** `EXTERNAL_STOP` is refused as an auto-resume category, in the run request
+  (`autoResume.onlyCategories`, a validation error naming it) and in the registration
+  (`defaults.auto_resume_categories`, a plan-time error): someone stopped the task on purpose,
+  and the category is not retryable, so listing it only looked like it would resume. The sandbox
+  scenario `s19-chain-dump`, which relied on it and never reproduced live, is replaced by an
+  offline test of the chain retry → dump → restore ([testing.md](docs/testing.md)).
+- A post retry with `--from-job` skips a post job before it only if its `JOB#` record is `ok`
+  *and* carries the run's own `dryRun` (a record without the flag counts as a real run); without
+  `--from-job` every post job runs again. Upgrade: a `JOB#` written before the fix by a dry
+  re-run of a real run's job (run 11 overwrote a real run's record with a dry `ok`) is no longer
+  trusted, and that job runs again on the next post retry.
+- **Breaking:** runs saved by 0.1.0 are refused by `post` and `orch.py post` (`ContextNotPinned`:
+  the run item has no context version and the artifacts moved under the project). Bucket
+  `versioning` is now required: without a version id `migrate` stops before DMS.
+- **Breaking:** dumps made by 0.1.0 (a manifest without `tables`) are refused by `orch.py restore`
+  and `pg-restore-s3`; `pg_restore` is limited to the manifest's tables (no whole-schema
+  `--clean`) and the stream is wrapped in `BEGIN;` … `COMMIT;`.
+- **Breaking:** a `partitioned` table in the scope of the task makes `pg-dump-s3` fail (`pg_dump -t`
+  would take it without its partitions); use `dump.method = snapshot` for such targets.
+- **Breaking:** a run uses a job set version only when it is pinned in `jobs.bundles` of the task
+  (`scripts/jobset_tool.py hash`, printed by `sync-jobs.sh`), unless `jobs.allow_unpinned = true`
+  (sandbox, development).
+- **Breaking:** `sync-jobs.sh --force` is gone: uploads are create-only (`--if-none-match`),
+  `bundle.sha256` last; publish a new version instead.
+- **Breaking:** the operator policy is split: `operator_policy_json` no longer uploads job sets and
+  reads only run reports; attach `jobset_publisher_policy_json["<project>"]` to whoever publishes
+  that project's job sets. The operator policy gains `PutItem`/`DeleteItem` on `LOCK#` items for
+  a restore under the task lock.
+- **Breaking:** `failOnValidationErrors` defaults to `true`
+  (`defaults.fail_on_validation_errors`): a table DMS did not validate, failed validation records
+  or full-load error rows fail the run `DmsValidationErrors`; off, it succeeds as
+  `COMPLETED_WITH_VALIDATION_ERRORS`. A table DMS cannot validate (`No primary key`) never
+  fails the run: the report lists it in `validationSkippedTables` and its warnings.
+- **Breaking:** Fargate is optional: without `fargate.images` the module creates no ECS cluster,
+  task definitions, ECS roles or ECR endpoints, `ecs_cluster_arn` is `null` and job roles do not
+  trust ECS tasks. SQL jobs run in a Lambda, long jobs on SSM.
+- **Breaking:** registry conventions: every resource is gated on `create`; every input is
+  `nullable = false`; unset optional strings are `""` instead of `null` (`kms_key_arn`,
+  `permissions_boundary_arn`, `artifacts_bucket_name`, `fargate.cluster_arn`,
+  `dms.log_group_name`, connection fields, `lambda.artifact_s3_*`; `assessment.role_arn = ""`
+  turns the step off); `lambda.reserved_concurrency` defaults to `-1`. The `null` sentinels of
+  the HTTPS egress are replaced by the booleans `https_egress_vpc_cidr` and
+  `https_egress_gateway_endpoints` (the lists only add ranges). Tags gain `ManagedBy` and
+  `Module`; the `dms-orch:*` tags stay.
+- **Breaking:** `kms_key_policy_requirements` follows the KMS key policy contract v2 (`sid`,
+  `principals {services, arns, roles}`, `actions`, `conditions`, `purpose`; symbolic roles
+  `deployer` and `module`); the v1 statement list is renamed `kms_key_policy_statements`.
+- **Breaking:** the Python sources moved from `src/` to `modules/dms-orchestration/src`: the module
+  packages only from its own directory. Prebuilt Lambda zips and tooling that point at `src/`
+  need the new path.
+- **Breaking:** the minimum commit of the upstream aurora/dms modules for the sandbox is
+  `08def61`: from it an apply keeps the target's `MaxFileSize` and the sandbox needs no
+  targeted apply or destroy. The start check that refuses `MaxFileSize = 0` stays.
+- `RecheckTask` reads the DMS task again right before the dump and before the reset; a task that
+  runs, is gone or changed stops the run (`TaskStateChanged`) before the target is touched.
+- `post` stops when it cannot take over the lock: `LockLost`, report `MANUAL`, no jobs, the other
+  run's lock left alone.
+- `StartReplicationTask` is not retried on a timeout (the start may have reached DMS); the
+  handoff judges the task.
+- A chained resume dumps before its reset unless a run of the chain already dumped
+  (`RecordChainDump`).
+- Pre-flight without a fingerprint: `allowReset` never resets (`manual` / `NoFingerprint`), and a
+  fresh task is `manual` unless `preflight.allowNoFingerprint`. Above 500 tables the reset list
+  goes to `inspect/reset-tables.json` and is expanded into the job spec only; `psql-run
+  --truncate-scope` truncates it.
+- The pre-flight target check runs in the Lambda through `pg8000` when the target connection has
+  a `host`, so no image is needed for it.
+- `orch.py restore` holds the task lock (`LOCK#`) for its whole duration and takes
+  `--runtime ssm|fargate` (SSM by default when the module has it); `orch.py report` takes
+  `--project` or reads it from the run item.
+- The artifacts bucket (created by the module or by `modules/artifacts-bucket`) aborts incomplete
+  multipart uploads bucket-wide after 7 days (lifecycle rule `abort-incomplete-uploads`; `dumps/`
+  keeps 1 day). `bucket_requirements` lists the rule, so a brought bucket should add it too.
+
+### Added
+- Lambda SQL runtime: `sql` jobs (connection, file or inline SQL, vars, `singleTransaction`,
+  `truncateScope`) in the `sql_jobs` Lambda (`lambda.sql_jobs_enabled`, on by default); the
+  built-in SQL jobs use `pg8000` for connections with a `host` and the Data API otherwise. The
+  example job sets run every job in a Lambda.
+- SSM Run Command runtime for long jobs on instances built from your AMI (`ssm`): the
+  `job-runner` branch `FindSsmRunner` → `RunSsmJob` → `WaitSsm`/`GetSsmInvocation`, the module's
+  Command document and runtime zip, outputs `ssm_runner_policy_json`, `ssm_document_content`,
+  `ssm_document_name`; `pg-dump` dumps run there when it is on. RUNBOOK §16.
+- Output `bucket_requirements` (versioning, SSE-KMS default, TLS only, `DenyDumpsWithoutKms`,
+  lifecycle) and the module `modules/artifacts-bucket`, which creates a bucket with those
+  controls; `network_contract` lists `rds` with snapshot dumps and `ec2messages`/`ssmmessages`
+  with the SSM runtime.
+- Output `jobset_publisher_policy_json` (one policy per project); `scripts/jobset_tool.py hash`.
+- [ADR 0011](docs/adr/0011-job-runtimes.md): Lambda for SQL, SSM for long jobs, Fargate optional,
+  the module never builds an image.
+- Tests: TestState cases `post-lock-lost-stops`, `recheck-task-*`,
+  `dump-runs-on-chained-reset-without-dump`, `start-timeout-is-not-retried`, `job-ssm-*`;
+  `terraform test` for the per-project roles, the SSM runtime, Fargate optional, `create = false`
+  and the KMS contract v2; `test_packaging.py`; e2e scenario `s1ssm`, and `s10` on the SSM
+  runner. Live scenarios still to add are listed in [docs/testing.md](docs/testing.md#planned-scenarios).
+
+### Removed
+- `sync-jobs.sh --force`.
+- Advisory check `no_fargate_images`: SQL jobs no longer need an image.
+- `pg-restore-s3 --schemas`: the manifest's tables are the restore scope.
+- The command output tail in job results.
+- The sandbox `MaxFileSize` workaround (`fix_target_max_file_size` in `sbx test-connections`) and
+  the targeted apply and destroy steps: upstream fixed them in `08def61`.
+
+### Fixed
+- `post` may read the pinned `context.json`: the core Lambdas get `s3:GetObjectVersion`; without
+  it every post stopped `ContextNotPinned` (e635341).
+- The SSM runtime zip carries the pinned RDS CA bundle and `orch-job` points psql and mysql at
+  it; a runner AMI has none at the image's path (4ad8649).
+- Lambda functions and state machines depend on their role policies: a first apply no longer
+  creates a VPC function or a `.sync` state before its policy (b33aa9f).
+- A timed-out `StartReplicationTask` is not retried: an explicit `States.Timeout` retrier with
+  `MaxAttempts 0` comes before the `States.TaskFailed` one (5e0fcc4).
+- `truncateScope` and `psql-run --truncate-scope` (PostgreSQL) skip tables missing on the target
+  and name them (`skippedMissing`, a NOTICE): a reset list from the DMS statistics of an earlier
+  run no longer fails on tables dropped since (941d281, 5a8c2ed).
+- A stopped task whose `StartDate` is after the start request stays pending while
+  `DescribeReplicationTasks` still shows the previous run's `StopDate`; a load longer than the
+  900 s grace no longer ends `DmsTaskNotStarted` on such a lag (3e79b81).
+- Sandbox: the SQL Lambda reaches S3 through the gateway endpoint (25af970); interface endpoint
+  keys come from the sandbox variables, so `terraform validate` has no cycle (aa19e10); the task
+  turned `fail_on_validation_errors` off for its table without a primary key (e53fcec), no longer
+  needed; the README applies and destroys without `-target` (544d1e8).
+
 ## [0.1.0] — 2026-10-29
 
 The first release.

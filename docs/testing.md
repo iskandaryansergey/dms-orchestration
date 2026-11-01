@@ -7,20 +7,21 @@ runs offline, without AWS credentials, and is what `make lint test` and CI run.
 
 | Level | Tool | Proves | Run |
 |---|---|---|---|
-| Unit | pytest (`tests/python/`) | decision logic (`src/shared/dms_outcome.py`, `src/shared/preflight.py`, handoff), schemas, job set rules, the CLI with fake clients | `make py-test` |
+| Unit | pytest (`tests/python/`) | decision logic (`modules/dms-orchestration/src/shared/dms_outcome.py`, `modules/dms-orchestration/src/shared/preflight.py`, handoff), schemas, job set rules, the CLI with fake clients | `make py-test` |
 | Lambdas against fake AWS | pytest + moto | handlers with DynamoDB, S3, SSM, Secrets Manager, RDS snapshots, IAM tokens; the DMS and Step Functions calls through stubs | `make py-test` |
 | State machine paths | local ASL runner (`tests/python/asl_runner.py`) | walks the real `migrate`/`post`/`job-runner` definitions and evaluates their real JSONata, state by state | `make py-test` |
-| Terraform | `terraform test` with a mock provider (`modules/dms-orchestration/tests/*.tftest.hcl`) | IAM least privilege, per-project roles, validations, advisory checks, the upstream module contract | `make tf-test` |
+| Terraform | `terraform test` with a mock provider (`modules/dms-orchestration/tests/*.tftest.hcl`, `modules/artifacts-bucket/tests/*.tftest.hcl`) | IAM least privilege, per-project roles, validations, advisory checks, the upstream module contract, the registry conventions (`create`, empty optional strings, tags, KMS contract v2), the bucket controls | `make tf-test` |
 | State machine cases | AWS TestState (`tests/sfn/cases/`, `tests/sfn/run_teststate.py`) | every case against the real Step Functions service; `--dry` builds the requests offline | `make teststate-dry`; with credentials `uv run python tests/sfn/run_teststate.py` |
-| Image | `docker build` + trivy | the `sql-runner` image builds, starts, and has no fixable HIGH/CRITICAL CVE | `make image`, CI job `image` |
+| Image (optional Fargate runtime) | hadolint, `docker build` + trivy | the `sql-runner` image builds from pinned, checksummed sources, starts, and has no fixable HIGH/CRITICAL CVE | `make image`, CI job `image` when the repository variable `BUILD_SQL_RUNNER_IMAGE` is `true` |
 | Content | denylist gate (`scripts/check_denylist.py`) | no denied term in files, paths, commit messages or authors | `make denylist` |
+| Packaging | pytest (`test_packaging.py`) | the module reads nothing outside its directory: Lambda code and SSM runtime under `modules/dms-orchestration/src/` | `make py-test` |
 | Documentation | pytest (`test_docs_links.py`, `test_docs_matrix.py`, `test_variables_doc.py`) | links resolve, commands in the docs parse, the configuration reference and this matrix match the code | `make py-test`, `make docs-check` |
 | Live | `examples/sandbox/scripts/e2e.py` in the sandbox | the end-to-end behaviour against real DMS, Aurora and Step Functions | only with an approved sandbox run ([sandbox README](../examples/sandbox/README.md)) |
 
 `make lint test` runs ruff, `terraform fmt`, the example job set check, pytest with coverage and
-`terraform test`. CI adds gitleaks, tflint, trivy config, checkov, shellcheck, hadolint, the
-terraform-docs check, both pinned Terraform versions, the image and, when the repository
-variable is set, `make sandbox-validate`.
+`terraform test`. CI adds gitleaks, tflint, trivy config, checkov, shellcheck, the
+terraform-docs check, both pinned Terraform versions and, when the repository variables are set,
+the image (hadolint, build, trivy; `BUILD_SQL_RUNNER_IMAGE`) and `make sandbox-validate`.
 
 ## End-to-end matrix
 
@@ -34,6 +35,7 @@ prints a JSON verdict per check; the exit code is 0 only if every check passed.
 | `s1p` | S1 after both clusters auto-paused (0 ACU): pre-flight and the Data API jobs wake them | **default** | changes to timeouts, retries or the Data API jobs |
 | `s1f` | S1 with the reset and post jobs in the Fargate `sql-runner` image (psql over TLS) | `sql_runner`, image | changes to Fargate jobs or the image |
 | `s1iam` | a Fargate post job logs in with an IAM token, without a secret, over TLS | `iam_auth`, image, `sync-jobs-iam` | changes to IAM database authentication |
+| `s1ssm` | S1 with the reset and post jobs on the SSM runner (document, sha256 of the runtime zip, job role assumed by orch-job, psql over TLS) | `ssm_runner`, `sync-jobs-ssm` | changes to the SSM runtime, orch-job or the runner document |
 | `s7` | dry run: nothing started, nothing written | **default** | changes to the dry-run path |
 | `s2` | a load interrupted from outside resumes without duplicate rows | **default** | changes to resume or reset |
 | `s3` | a revoked grant: the pre-check or DMS fails, classified `PERMISSIONS` | **default** | changes to classification or the grants check |
@@ -47,14 +49,41 @@ prints a JSON verdict per check; the exit code is 0 only if every check passed.
 | `s9` | S2 through two machines: the resume verdict sees the baseline of the interrupted run | **default** | changes to baselines |
 | `s13` | a post job fails; `orch.py post --from-job` with a fixed job set skips the jobs already ok | **default** | changes to repeat post |
 | `s15` | the DMS task replaced by Terraform between runs: `MANUAL`, then `allowReset` recovers | `TF_VAR_*` of the stack | changes to `TABLE#` copies or registration |
-| `s10` | dump before a reload that fails half-way, restore: counts as before, restore baseline | image | changes to dumps, restore or baselines |
+| `s10` | dump before a reload that fails half-way, restore: counts as before, restore baseline; on the SSM runner when the sandbox has one (lock, scoped TOC, manifest check there) | `ssm_runner` and `sync-jobs-ssm`, or image | changes to dumps, restore, baselines or the SSM runtime |
 | `s10snap` | `dump.method = snapshot`: tagged cluster snapshot, `dump.json`, retention job | `snapshot_dumps` | changes to snapshot dumps |
 | `s14` | premigration assessment with `fail_on_warning`: stops before DMS, target untouched | `assessment` | changes to the assessment step or its order |
 | `guard` | an armed `MIGRATION#` of another run refuses before the reset: target untouched | plants a `MIGRATION#` item | changes to the Arm guard |
 | `postdie` | a post that dies in `LoadRun` releases its run's lock in seconds | plants task locks | changes to `release_lock` |
 | `s16` | SQS fan-out: `FAILED` and `MANUAL` reach the filtered queue, `SUCCEEDED` does not | `sqs_fanout` | changes to notifications or message attributes |
+| `dry-ro` | a dry run's `sql:` jobs open read-only sessions: a read works, a write fails with `ReadOnlySqlTransaction`, the target is unchanged | `sync-jobs` (job set `e2e-sql`) | changes to the Lambda SQL runtime or dry runs |
+| `s4big` | a reset above 500 tables (`sbx seed --tables 600`): the list goes to `inspect/reset-tables.json`, `truncateScope` truncates all of them, the report gives the full count; drops the tables and reloads after. The load takes about 90 s, DMS validation of the 604 tables more than 40 minutes | `sync-jobs` (job set `e2e-sql`) | changes to the reset scope or the payload cap |
+| `s17-lock-lost` | post finds its lock taken: `LockLost`, `MANUAL`, no post jobs, the other run's lock untouched | plants another owner on the lock | changes to the post lock takeover |
+| `s18-recheck` | the DMS task started by hand during a pre job: `TaskStateChanged` before the target is reset; reloads after | `sync-jobs` (job set `e2e-recheck`) | changes to `RecheckTask` |
+| `s20-tampered-jobset` | one file of a published job set changed: `JobSetTampered` before any job runs | edits and restores a published job set | changes to job set pinning |
+| `s21-validation` | a row that differs after the load (a trigger on the target): `DmsValidationErrors`; with the flag off `COMPLETED_WITH_VALIDATION_ERRORS`; reloads after | — | changes to the validation outcome |
 
 `tests/python/test_docs_matrix.py` fails when this table and `e2e.py` disagree.
+
+## Planned scenarios
+
+Live checks of 0.2.0 behaviour that the offline levels already cover (pytest, the local ASL
+runner, TestState cases) but `e2e.py` does not run yet. When one is added to `e2e.py`, its row
+moves to the matrix above; `test_docs_matrix.py` fails while a scenario is in both.
+
+| Scenario | Proves | Covered offline by |
+|---|---|---|
+
+None at the moment: the 0.2.0 scenarios are in the matrix above.
+
+## Replaced by offline tests
+
+Scenarios dropped from `e2e.py` because they cannot be reproduced live; the offline test covers
+the same chain step by step, each step fed with what the previous one wrote.
+`test_docs_matrix.py` fails if such a scenario comes back to `e2e.py` or its test disappears.
+
+| Scenario | Why not live | Covered offline by |
+|---|---|---|
+| `s19-chain-dump` | it needed a resume after an external stop, and `EXTERNAL_STOP` never resumes by itself (not retryable; the run request schema and `auto_resume_categories` now refuse it) | `test_asl.py::test_a_resume_chain_dumps_before_its_first_reset_and_that_dump_can_be_restored` (retry: post hands over to attempt 2; dump: attempt 2 resets, dumps first and records the dump, a further resume does not dump again; restore: the job-runner accepts `pg-restore-s3` of that dump), `test_lambdas_core.py::test_an_external_stop_never_resumes_by_itself` |
 
 ## Adding a scenario
 

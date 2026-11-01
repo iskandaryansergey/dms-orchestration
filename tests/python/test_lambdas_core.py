@@ -11,6 +11,7 @@ import pytest
 from conftest import EXEC_ARN, TASK_ARN, FakeDms, FakeSfn, dms_task
 
 from shared import aws as shared_aws
+from shared import bundle as jobs_bundle
 
 BUCKET = "dms-orch-artifacts-test"
 REGISTRATION = {
@@ -54,6 +55,23 @@ JOBSET = {
 }
 
 
+def bundle_files(files: dict[str, bytes]) -> dict[str, str]:
+    return {rel: jobs_bundle.digest(data) for rel, data in files.items()}
+
+
+def put_bundle(s3: Any, version: str, files: dict[str, bytes]) -> str:
+    """Upload a built bundle with its bundle.sha256 (as sync-jobs.sh does); returns the total."""
+    for rel, data in files.items():
+        s3.put_object(Bucket=BUCKET, Key=f"jobs/ledger/{version}/{rel}", Body=data)
+    manifest = jobs_bundle.render(bundle_files(files)).encode()
+    s3.put_object(Bucket=BUCKET, Key=f"jobs/ledger/{version}/bundle.sha256", Body=manifest)
+    return jobs_bundle.total(bundle_files(files))
+
+
+# Terraform pins every job set version a task may run (jobs.bundles, review finding 9).
+REGISTRATION["jobs"]["bundles"] = {"v1": jobs_bundle.total(bundle_files({"jobset.json": json.dumps(JOBSET).encode()}))}
+
+
 @pytest.fixture
 def env(table, monkeypatch):
     monkeypatch.setenv("SSM_PREFIX", "/dms-orch/test")
@@ -61,7 +79,9 @@ def env(table, monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "test")
     s3 = boto3.client("s3", region_name="eu-west-2")
     s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
-    s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/jobset.json", Body=json.dumps(JOBSET).encode())
+    # post reads context.json by the version migrate recorded: the bucket is versioned.
+    s3.put_bucket_versioning(Bucket=BUCKET, VersioningConfiguration={"Status": "Enabled"})
+    put_bundle(s3, "v1", {"jobset.json": json.dumps(JOBSET).encode()})
     ssm = boto3.client("ssm", region_name="eu-west-2")
     ssm.put_parameter(Name="/dms-orch/test/ledger/core", Type="String", Value=json.dumps(REGISTRATION))
     return {"s3": s3, "ssm": ssm, "table": table}
@@ -132,6 +152,7 @@ def test_resolve_context_missing_jobset_version(env):
     from lambdas.resolve_context.handler import handler
     from shared.errors import JobSetNotFound
 
+    register_jobs(env, bundles={**REGISTRATION["jobs"]["bundles"], "v9": "9" * 64})
     with pytest.raises(JobSetNotFound):
         handler({"request": {"project": "ledger", "taskKey": "core", "jobsVersion": "v9"}, "execution": EXECUTION})
 
@@ -198,7 +219,7 @@ def test_inspect_fresh_task(table):
     assert "describe_table_statistics" not in [c[0] for c in dms.calls]
 
 
-def test_inspect_interrupted_task_resets_partial_tables(table):
+def test_inspect_interrupted_task_resets_partial_tables(table, store):
     from lambdas.inspect_task.handler import handler
 
     task = dms_task("stopped", "Stop Reason NORMAL", StartDate="2026-10-26T10:00:00Z")
@@ -211,6 +232,9 @@ def test_inspect_interrupted_task_resets_partial_tables(table):
     assert out["state"] == "interrupted"
     assert out["decision"]["startType"] == "resume-processing"
     assert out["decision"]["resetTables"] == ["public.b"]
+    run = store.get_run("r1")
+    assert run["jobDecision"]["resetTables"] == ["public.b"] and run["jobDecision"]["startType"] == "resume-processing"
+    assert run["jobInspect"]["migrationType"] == "full-load" and run["jobInspect"]["selectionRules"]
 
 
 def test_inspect_rejects_running_task(table):
@@ -312,6 +336,18 @@ def test_classify_auto_resume_limits():
     assert out["autoResume"] is False and "not in autoResume.onlyCategories" in out["notes"][0]
 
 
+def test_an_external_stop_never_resumes_by_itself():
+    """s19 (review item 5) relied on EXTERNAL_STOP in onlyCategories; it is not retryable, so the
+    chain never started live. The schemas now refuse it; classify ignores it anyway."""
+    stopped = dms_task("stopped", "Stop Reason NORMAL")
+    out = _classify(
+        {"Error": "DmsTaskStoppedUnexpectedly"},
+        task=stopped,
+        auto={"maxAttempts": 3, "onlyCategories": ["EXTERNAL_STOP"]},
+    )
+    assert (out["category"], out["retryable"], out["autoResume"]) == ("EXTERNAL_STOP", False, False)
+
+
 # --- write_report ------------------------------------------------------------------
 
 
@@ -334,10 +370,10 @@ def test_write_report_puts_json_and_markdown(env, store):
             "attempt": 1,
         }
     )
-    assert out["reportS3Uri"] == f"s3://{BUCKET}/runs/run-1/report.json" and out["notify"] is True
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-1/report.json")["Body"].read())
+    assert out["reportS3Uri"] == f"s3://{BUCKET}/runs/ledger/run-1/report.json" and out["notify"] is True
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-1/report.json")["Body"].read())
     assert report["outcome"] == "COMPLETED" and report["tables"][0]["fullLoadRows"] == 10
-    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-1/report.md")["Body"].read().decode()
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-1/report.md")["Body"].read().decode()
     assert "| public.a | Table completed | 10 | 0 |" in md
     assert store.get_run("run-1")["status"] == "SUCCEEDED"
     assert json.loads(out["message"])["status"] == "SUCCEEDED"
@@ -360,7 +396,7 @@ def test_write_report_failure_contains_classification_and_respects_notify(env, s
         }
     )
     assert out["notify"] is False and "FAILED" in out["subject"]
-    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-2/report.md")["Body"].read().decode()
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-2/report.md")["Body"].read().decode()
     assert "`PERMISSIONS`" in md
 
 
@@ -482,15 +518,83 @@ SAVED_CONTEXT = {
 }
 
 
+def _pin_context(env, body: bytes, run_id: str = "run-1", project: str = "ledger") -> str:
+    """What migrate does: SaveContext (versioned bucket), then RecordContextVersion on RUN#."""
+    from shared.store import Store
+
+    key = f"runs/{project}/{run_id}/context.json"
+    version = env["s3"].put_object(Bucket=BUCKET, Key=key, Body=body)["VersionId"]
+    Store(env["table"]).update_run(run_id, {"project": project, "contextVersionId": version})
+    return version
+
+
 def _save_context(env) -> None:
-    env["s3"].put_object(Bucket=BUCKET, Key="runs/run-1/context.json", Body=json.dumps(SAVED_CONTEXT).encode())
+    _pin_context(env, json.dumps(SAVED_CONTEXT).encode())
+
+
+def test_context_key_is_per_project():
+    from lambdas.resolve_context.handler import context_key
+
+    assert context_key("ledger", "run-1") == "runs/ledger/run-1/context.json"
+
+
+def _post_event(run_id: str = "run-1") -> dict[str, Any]:
+    outcome = {"kind": "SUCCESS", "outcome": "COMPLETED", "error": None, "cause": "full load finished", "task": {}}
+    return {
+        "mode": "post",
+        "input": {"runId": run_id, "taskArn": TASK_ARN, "outcome": outcome, "startedBy": "event-handler"},
+        "execution": POST_EXECUTION,
+    }
+
+
+def test_post_loads_the_pinned_version_not_a_later_overwrite(env, store):
+    """Review finding 1: whatever writes context.json after migrate, post reads the version migrate recorded."""
+    from lambdas.resolve_context.handler import handler
+
+    _save_context(env)
+    forged = {**SAVED_CONTEXT, "request": {**SAVED_CONTEXT["request"], "operation": "forged"}}
+    env["s3"].put_object(Bucket=BUCKET, Key="runs/ledger/run-1/context.json", Body=json.dumps(forged).encode())
+    assert handler(_post_event())["request"] == SAVED_CONTEXT["request"]
+
+
+def test_post_refuses_a_context_without_a_recorded_version(env, store):
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import ContextNotPinned
+
+    env["s3"].put_object(Bucket=BUCKET, Key="runs/ledger/run-1/context.json", Body=json.dumps(SAVED_CONTEXT).encode())
+    store.put_run("run-1", {"project": "ledger", "status": "STARTED"})
+    with pytest.raises(ContextNotPinned, match="contextVersionId"):
+        handler(_post_event())
+
+
+def test_post_refuses_a_recorded_version_that_does_not_exist(env, store):
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import ContextNotPinned
+
+    _save_context(env)
+    store.update_run("run-1", {"contextVersionId": "not-a-version"})
+    with pytest.raises(ContextNotPinned):
+        handler(_post_event())
+
+
+def test_post_reads_the_context_of_the_project_recorded_on_the_run(env, store):
+    """The project comes from RUN#, not from the post input: another project's prefix is never read."""
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import ContextNotPinned
+
+    _pin_context(env, json.dumps(SAVED_CONTEXT).encode(), project="cards")
+    out = handler(_post_event())
+    assert out["runId"] == "run-1"
+    store.update_run("run-1", {"project": "ledger"})
+    with pytest.raises(ContextNotPinned):
+        handler(_post_event())
 
 
 def test_resolve_context_post_mode_loads_the_saved_run_and_the_success(env, store):
     from lambdas.resolve_context.handler import handler
 
-    _save_context(env)
     store.put_run("run-1", {"project": "ledger", "status": "STARTED", "executionArn": EXEC_ARN})
+    _save_context(env)
     outcome = {"kind": "SUCCESS", "outcome": "COMPLETED", "error": None, "cause": "full load finished", "task": {}}
     event = {
         "mode": "post",
@@ -519,7 +623,7 @@ def test_resolve_context_post_mode_reads_a_context_saved_as_a_json_string(env, s
     from lambdas.resolve_context.handler import handler
 
     body = json.dumps(json.dumps(SAVED_CONTEXT)).encode()
-    env["s3"].put_object(Bucket=BUCKET, Key="runs/run-1/context.json", Body=body)
+    _pin_context(env, body)
     outcome = {"kind": "SUCCESS", "outcome": "COMPLETED", "error": None, "cause": "full load finished", "task": {}}
     event = {
         "mode": "post",
@@ -560,20 +664,62 @@ def test_resolve_context_post_mode_without_saved_context_fails(env):
         )
 
 
-def test_resolve_context_returns_the_attempt_of_a_chained_resume(env):
+CHAINED = {
+    "project": "ledger",
+    "taskKey": "core",
+    "operation": "resume",
+    "attempt": 2,
+    "parentRunId": "run-1",
+    "parentStartedAt": "2026-10-28T10:00:00.000Z",
+}
+
+
+def test_resolve_context_returns_the_attempt_of_a_chained_resume(env, store):
     from lambdas.resolve_context.handler import handler
 
-    req = {
-        "project": "ledger",
-        "taskKey": "core",
-        "operation": "resume",
-        "attempt": 2,
-        "parentRunId": "run-1",
-        "parentStartedAt": "2026-10-28T10:00:00.000Z",
-    }
-    out = handler({"request": req, "execution": {**EXECUTION, "name": "run-1-r2"}})
+    store.put_run("run-1", {"project": "ledger", "resumeChildRunId": "run-1-r2"})
+    out = handler({"request": dict(CHAINED), "execution": {**EXECUTION, "name": "run-1-r2"}})
     assert out["attempt"] == 2 and out["request"]["parentRunId"] == "run-1"
-    assert handler({"request": {"project": "ledger", "taskKey": "core"}, "execution": EXECUTION})["attempt"] == 1
+    assert out["ctx"]["chain"] == {"dumped": False, "dumpUri": None}
+    first = handler({"request": {"project": "ledger", "taskKey": "core"}, "execution": EXECUTION})
+    assert first["attempt"] == 1 and first["ctx"]["chain"] == {"dumped": False, "dumpUri": None}
+
+
+@pytest.mark.parametrize(
+    ("parent", "fields"),
+    [
+        (None, {"attempt": 2, "parentRunId": "run-1"}),
+        ({"project": "ledger"}, {"attempt": 2, "parentRunId": "run-1"}),
+        ({"project": "ledger", "resumeChildRunId": "run-1-r9"}, {"attempt": 2, "parentRunId": "run-1"}),
+        ({"project": "ledger", "resumeChildRunId": "run-1-r2"}, {"attempt": 2}),
+        ({"project": "ledger", "resumeChildRunId": "run-1-r2"}, {"parentRunId": "run-1"}),
+        ({"project": "ledger", "resumeChildRunId": "run-1-r2"}, {"parentStartedAt": "2026-10-28T10:00:00.000Z"}),
+        ({"project": "other", "resumeChildRunId": "run-1-r2"}, {"attempt": 2, "parentRunId": "run-1"}),
+    ],
+)
+def test_resolve_context_rejects_chain_fields_post_did_not_hand_over(env, store, parent, fields):
+    """Review finding 5: attempt / parentRunId from an operator skipped the pre-jobs and the dump.
+    They are accepted only for the execution post named on the parent run (HandOverLock)."""
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import InvalidRunRequest
+
+    if parent:
+        store.put_run("run-1", parent)
+    req = {"project": "ledger", "taskKey": "core", "operation": "resume", **fields}
+    with pytest.raises(InvalidRunRequest):
+        handler({"request": req, "execution": {**EXECUTION, "name": "run-1-r2"}})
+    assert store.get_run("run-1-r2") is None
+
+
+def test_resolve_context_carries_the_dump_of_the_chain(env, store):
+    from lambdas.resolve_context.handler import handler
+
+    dump = "s3://b/dumps/ledger/core/t-run-1/"
+    store.put_run("run-1", {"project": "ledger", "resumeChildRunId": "run-1-r2", "chainDumped": True, "dumpUri": dump})
+    out = handler({"request": dict(CHAINED), "execution": {**EXECUTION, "name": "run-1-r2"}})
+    assert out["ctx"]["chain"] == {"dumped": True, "dumpUri": dump}
+    run = store.get_run("run-1-r2")
+    assert run["chainDumped"] is True and run["dumpUri"] == dump and run["parentRunId"] == "run-1"
 
 
 def _report(handler, status: str, notify: dict | None = None):
@@ -608,7 +754,7 @@ def test_write_report_resumed_is_quiet_and_lists_both_executions(env, store):
     use(dms=FakeDms(FINISHED))
     out = _report(handler, "RESUMED", {"onSuccess": True, "onFailure": True})
     assert out["notify"] is False
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-1/report.json")["Body"].read())
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-1/report.json")["Body"].read())
     assert report["executions"] == {"migrate": EXEC_ARN, "post": post_arn}
     assert store.get_run("run-1")["phase"] == "done"
 
@@ -682,6 +828,10 @@ def test_preflight_fresh_task_with_rows_in_the_target_is_manual_or_reset(env, st
     out = _preflight(handler, state="fresh", decision=start, verify=verify, request=_req(allowReset=True))
     assert out["verdict"] == "reset" and out["decision"]["resetTables"] == ["app.a"]
     assert any(e.get("phase") == "preflight" for e in store.run_items("r2", "EVENT#"))
+    # The decision the reset jobs act on is recorded on RUN#: prepare_job takes it from there,
+    # never from the job-runner input (review item N1).
+    recorded = store.get_run("r2")["jobDecision"]
+    assert recorded["resetTables"] == ["app.a"] and recorded["resetTablesCount"] == 1
 
 
 def test_preflight_interrupted_task_compares_with_the_baseline(env, store):
@@ -754,12 +904,69 @@ def test_preflight_fresh_task_with_table_history_is_manual(env, store):
     assert out["verdict"] == "manual" and "earlier runs" in out["reason"]
 
 
-def test_preflight_without_a_fingerprint_lets_the_dms_state_decide(env):
+def test_preflight_without_a_fingerprint_is_manual_unless_allowed(env):
     from lambdas.inspect_task.handler import handler
 
     start = {"action": "start", "startType": "start-replication", "reset": False, "resetTables": []}
-    out = _preflight(handler, state="fresh", decision=start, verify=None)
-    assert out["verdict"] == "ready" and out["fingerprint"] is None and out["warnings"]
+    out = _preflight(handler, state="fresh", decision=start, verify=None, request=_req(allowReset=True))
+    assert (out["verdict"], out["error"]) == ("manual", "NoFingerprint") and out["fingerprint"] is None
+    req = _req(allowReset=True, preflight={"allowNoFingerprint": True})
+    out = _preflight(handler, state="fresh", decision=start, verify=None, request=req)
+    assert out["verdict"] == "ready" and out["decision"]["reset"] is False and out["warnings"]
+
+
+def test_preflight_reset_scope_follows_the_selection_rules(env):
+    from lambdas.inspect_task.handler import handler
+
+    fp = _fingerprint(5)
+    fp["tables"]["app.tmp_x"] = fp["tables"]["app.a"]
+    uri = _put_fp(env, "runs/r2/d.json", fp)
+    rules = [
+        {"schema": "app", "table": "%", "action": "include"},
+        {"schema": "app", "table": "tmp_%", "action": "exclude"},
+    ]
+    start = {"action": "start", "startType": "start-replication", "reset": False, "resetTables": []}
+    event = {
+        "mode": "preflight",
+        "runId": "r2",
+        "request": _req(allowReset=True),
+        "ctx": _ctx(),
+        "inspect": {"state": "fresh", "decision": start, "tables": [{"table": "app.zz"}], "selectionRules": rules},
+        "verify": {"status": "ok", "summary": {"fingerprintUri": uri}},
+        "iteration": 0,
+    }
+    out = handler(event)
+    assert out["verdict"] == "reset" and out["decision"]["resetTables"] == ["app.a"]
+    assert out["decision"]["resetTablesCount"] == 1 and out["decision"]["resetTablesUri"] is None
+
+
+def test_preflight_puts_a_long_reset_list_in_s3_and_its_count_in_the_payload(env):
+    from lambdas.inspect_task.handler import MAX_TABLES_IN_PAYLOAD, handler
+
+    fp = _fingerprint(5)
+    one = fp["tables"].pop("app.a")
+    fp["tables"] = {f"app.t{i:04d}": one for i in range(600)}
+    fp["expected"] = sorted(fp["tables"])
+    uri = _put_fp(env, "runs/r2/e.json", fp)
+    start = {"action": "start", "startType": "start-replication", "reset": False, "resetTables": []}
+    verify = {"status": "ok", "summary": {"fingerprintUri": uri}}
+    out = _preflight(handler, state="fresh", decision=start, verify=verify, request=_req(allowReset=True))
+    dec = out["decision"]
+    assert out["verdict"] == "reset" and "truncate 600 table(s)" in out["reason"]
+    assert dec["resetTables"] == [] and dec["resetTablesCount"] == 600 > MAX_TABLES_IN_PAYLOAD
+    from shared.store import run_prefix
+
+    key = f"{run_prefix(_ctx().get('project'), 'r2')}/inspect/reset-tables.json"
+    assert dec["resetTablesUri"] == f"s3://{BUCKET}/{key}"
+    stored = json.loads(env["s3"].get_object(Bucket=BUCKET, Key=key)["Body"].read())
+    assert stored == {"resetTables": sorted(fp["tables"]), "count": 600}
+
+
+def test_reset_tables_key_takes_the_run_prefix():
+    from lambdas.inspect_task.handler import reset_tables_key
+
+    assert reset_tables_key("runs/r2") == "runs/r2/inspect/reset-tables.json"
+    assert reset_tables_key("runs/ledger/r2/") == "runs/ledger/r2/inspect/reset-tables.json"
 
 
 def test_resolve_context_adds_the_target_check_when_the_target_has_the_data_api(env):
@@ -805,9 +1012,9 @@ def test_write_report_manual_is_notified_as_high_with_the_diff(env, store):
     assert out["notify"] is True and "MANUAL" in out["subject"]
     msg = json.loads(out["message"])
     assert msg["severity"] == "high" and msg["verdict"] == "manual" and msg["status"] == "MANUAL"
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-m/report.json")["Body"].read())
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-m/report.json")["Body"].read())
     assert report["preflight"]["diff"]["extra"] == ["app.junk"]
-    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-m/report.md")["Body"].read().decode()
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-m/report.md")["Body"].read().decode()
     assert "## Pre-flight" in md and "app.junk" in md and "app.tx" in md
 
 
@@ -846,7 +1053,7 @@ def test_write_report_records_the_baseline_and_the_table_copy_at_the_end_of_post
         "app.a": "Table completed",
         "app.b": "Table error",
     }
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-b/report.json")["Body"].read())
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-b/report.json")["Body"].read())
     assert report["baseline"]["fingerprintHash"] == "sha256:abc" and json.loads(out["message"])["severity"] == "high"
 
 
@@ -889,7 +1096,7 @@ def test_write_report_baseline_mode_records_without_writing_a_report(env, store)
     assert out["recorded"]["fingerprintHash"] == "sha256:r"
     assert store.get_target_baseline("ledger/core")["runId"] == "run-r"
     assert [t["table"] for t in store.get_table_states("ledger/core")] == ["app.a"]
-    keys = env["s3"].list_objects_v2(Bucket=BUCKET, Prefix="runs/run-r/").get("KeyCount", 0)
+    keys = env["s3"].list_objects_v2(Bucket=BUCKET, Prefix="runs/ledger/run-r/").get("KeyCount", 0)
     assert keys == 0
 
 
@@ -982,6 +1189,16 @@ def test_resolve_context_adds_the_dump_job_when_asked_or_by_default(env):
     assert len(out["ctx"]["jobs"]["dump"]) == 1
     req = {"project": "ledger", "taskKey": "core", "dump": {"enabled": False}}
     assert handler({"request": req, "execution": {**EXECUTION, "name": "r-d3"}})["ctx"]["jobs"]["dump"] == []
+
+
+def test_resolve_context_dumps_on_ssm_when_the_runtime_is_on(env, monkeypatch):
+    from lambdas.resolve_context.handler import handler
+
+    monkeypatch.setenv("SSM_JOBS", "1")
+    req = {"project": "ledger", "taskKey": "core", "dump": {"enabled": True}}
+    (dump,) = handler({"request": req, "execution": {**EXECUTION, "name": "r-s1"}})["ctx"]["jobs"]["dump"]
+    assert dump["runtime"] == "ssm" and "image" not in dump
+    assert dump["command"][:3] == ["pg-dump-s3", "--connection", "target"] and dump["timeoutSeconds"] == 21600
 
 
 def test_resolve_context_refuses_the_snapshot_method_unless_the_task_allows_it(env):
@@ -1159,12 +1376,19 @@ def _save_repeat_context(env) -> None:
         "inspect": {"state": "fresh", "completionSpec": {"mode": "task-stopped"}},
         "startedAt": "2026-10-27T10:00:00Z",  # before FINISHED stopped
     }
-    env["s3"].put_object(Bucket=BUCKET, Key="runs/run-1/context.json", Body=json.dumps(saved).encode())
+    _pin_context(env, json.dumps(saved).encode())
 
 
-def _job(table, name: str, index: int, status: str) -> None:
+def _job(table, name: str, index: int, status: str, **extra) -> None:
     table.put_item(
-        Item={"pk": "RUN#run-1", "sk": f"JOB#post#{index:02d}#{name}", "phase": "post", "name": name, "status": status}
+        Item={
+            "pk": "RUN#run-1",
+            "sk": f"JOB#post#{index:02d}#{name}",
+            "phase": "post",
+            "name": name,
+            "status": status,
+            **extra,
+        }
     )
 
 
@@ -1202,6 +1426,39 @@ def test_post_repeat_runs_again_every_earlier_job_that_is_not_ok(env, store, tab
     assert out["skippedJobs"] == []
 
 
+def test_post_repeat_does_not_skip_an_ok_job_recorded_with_another_dry_run_flag(env, store, table):
+    """Run 11 finding 2, defense in depth: a JOB# written before the dryRun fix by a dry re-run of a
+    real run's job says ok, but it is not the run's result, so the post retry runs that job again."""
+    from lambdas.resolve_context.handler import handler
+
+    _save_repeat_context(env)  # a real run (request.dryRun false)
+    _job(table, "indexes", 0, "ok", dryRun=True)
+    _job(table, "row-counts", 1, "ok", dryRun=False)
+    use(dms=FakeDms(FINISHED), sfn=FakeSfn())
+    out = _repeat(handler, from_job="cleanup")
+    assert [j["name"] for j in out["ctx"]["jobs"]["post"]] == ["indexes", "cleanup"]
+    assert out["skippedJobs"] == ["row-counts"]
+
+
+def test_post_repeat_of_a_dry_run_skips_only_its_dry_ok_jobs(env, store, table):
+    from lambdas.resolve_context.handler import handler
+
+    saved = {
+        **SAVED_CONTEXT,
+        "request": {**SAVED_CONTEXT["request"], "dryRun": True},
+        "ctx": {**SAVED_CONTEXT["ctx"], "taskKey": "core", "jobs": {"post": POST_JOBS}},
+        "inspect": {"state": "fresh", "completionSpec": {"mode": "task-stopped"}},
+        "startedAt": "2026-10-27T10:00:00Z",
+    }
+    _pin_context(env, json.dumps(saved).encode())
+    _job(table, "indexes", 0, "ok", dryRun=True)
+    _job(table, "row-counts", 1, "ok")  # no flag: a real result
+    use(dms=FakeDms(FINISHED), sfn=FakeSfn())
+    out = _repeat(handler, from_job="cleanup")
+    assert [j["name"] for j in out["ctx"]["jobs"]["post"]] == ["row-counts", "cleanup"]
+    assert out["skippedJobs"] == ["indexes"]
+
+
 def test_post_repeat_is_refused_while_another_run_or_the_first_post_holds_the_lock(env, store, table):
     from lambdas.resolve_context.handler import handler
     from shared.errors import InvalidRunRequest, RunAlreadyActive
@@ -1237,7 +1494,8 @@ def test_post_repeat_can_take_the_post_jobs_of_a_fixed_job_set_version(env, stor
         **JOBSET,
         "phases": {**JOBSET["phases"], "post": [{"name": "row-counts", "command": ["psql-run", "--sql", "SELECT 1"]}]},
     }
-    env["s3"].put_object(Bucket=BUCKET, Key="jobs/ledger/v2/jobset.json", Body=json.dumps(fixed).encode())
+    v2 = put_bundle(env["s3"], "v2", {"jobset.json": json.dumps(fixed).encode()})
+    register_jobs(env, bundles={**REGISTRATION["jobs"]["bundles"], "v2": v2})
     use(dms=FakeDms(FINISHED), sfn=FakeSfn())
     data = {
         "runId": "run-1",
@@ -1250,6 +1508,8 @@ def test_post_repeat_can_take_the_post_jobs_of_a_fixed_job_set_version(env, stor
     (job,) = out["ctx"]["jobs"]["post"]
     assert job["command"] == ["psql-run", "--sql", "SELECT 1"]
     assert out["ctx"]["jobsVersion"] == "v2" and out["ctx"]["jobsS3Prefix"] == f"s3://{BUCKET}/jobs/ledger/v2/"
+    # prepare_job takes the job set version from RUN#, not from the job-runner input (review item N1).
+    assert store.get_run("run-1")["jobsVersion"] == "v2"
 
 
 # --- the report advises a snapshot dump for a big target -------------------
@@ -1295,8 +1555,8 @@ def test_write_report_advises_the_snapshot_method_above_the_threshold(env, store
             "attempt": 1,
         }
     )
-    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/run-adv/report.json")["Body"].read())
-    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/run-adv/report.md")["Body"].read().decode()
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-adv/report.json")["Body"].read())
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-adv/report.md")["Body"].read().decode()
     found = [a for a in report["advice"] if "dump.method=snapshot" in a]
     assert bool(found) is advised
     assert ("dump.method=snapshot" in md) is advised
@@ -1373,11 +1633,237 @@ def test_verify_runtime_auto_goes_to_fargate_for_a_big_baseline(env, store, monk
     assert _verify_jobs("r-v7", {"verifyRuntime": "auto", "fargateAboveBytes": 2**40})[0]["runtime"] == "lambda"
 
 
-def test_verify_runtime_auto_without_the_data_api_uses_fargate_or_nothing(env, monkeypatch):
+def test_verify_runtime_with_a_host_runs_in_lambda_through_pg8000(env, monkeypatch):
+    """No Data API, but a host: the Lambda reaches the target through pg8000 (no image needed)."""
     target = {k: v for k, v in DATA_API_TARGET.items() if k != "dataApiClusterArn"}
     _register(env, target)
     monkeypatch.setenv("FARGATE_IMAGES", "[]")
-    assert _verify_jobs("r-v8") == []  # as before: the DMS state decides alone
+    (job,) = _verify_jobs("r-v8")
+    assert job["runtime"] == "lambda" and job["handler"] == "builtin:checks/target_verify"
     monkeypatch.setenv("FARGATE_IMAGES", json.dumps(["sql-runner"]))
-    assert _verify_jobs("r-v9")[0]["runtime"] == "fargate"
-    assert _verify_jobs("r-v10", {"verifyRuntime": "lambda"}) == []
+    assert _verify_jobs("r-v9")[0]["runtime"] == "lambda"
+    assert _verify_jobs("r-v10", {"verifyRuntime": "lambda"})[0]["runtime"] == "lambda"
+
+
+def test_verify_runtime_without_host_or_data_api_uses_fargate_or_nothing(env, monkeypatch):
+    target = {k: v for k, v in DATA_API_TARGET.items() if k not in ("dataApiClusterArn", "host")}
+    _register(env, target)
+    monkeypatch.setenv("FARGATE_IMAGES", "[]")
+    assert _verify_jobs("r-v11") == []  # the DMS state decides alone
+    monkeypatch.setenv("FARGATE_IMAGES", json.dumps(["sql-runner"]))
+    assert _verify_jobs("r-v12")[0]["runtime"] == "fargate"
+    assert _verify_jobs("r-v13", {"verifyRuntime": "lambda"}) == []
+
+
+def test_run_request_accepts_allow_no_fingerprint():
+    from shared import validation
+
+    validation.validate(
+        "run_request", {"project": "ledger", "taskKey": "core", "preflight": {"allowNoFingerprint": True}}
+    )
+
+
+def test_write_report_counts_a_reset_list_kept_in_s3(env, store):
+    from lambdas.write_report.handler import handler
+
+    store.put_run("run-1", {"project": "ledger", "status": "RUNNING"})
+    use(dms=FakeDms(FINISHED))
+    decision = {"action": "start", "resetScope": "all", "resetTables": [], "resetTablesCount": 600}
+    handler(
+        {
+            "runId": "run-1",
+            "status": "SUCCEEDED",
+            "request": {"project": "ledger", "taskKey": "core", "notify": {}},
+            "ctx": {"taskArn": TASK_ARN},
+            "inspect": {"state": "completed", "decision": decision},
+            "started": True,
+            "attempt": 1,
+        }
+    )
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-1/report.md")["Body"].read().decode()
+    assert "- Target reset: all (600 tables)" in md
+
+
+# --- review finding 7: failOnValidationErrors (registration default, request override) ---
+
+BAD_VALIDATION = [
+    {
+        "SchemaName": "app",
+        "TableName": "accounts",
+        "TableState": "Table completed",
+        "ValidationState": "Mismatched records",
+        "ValidationFailedRecords": 2,
+    }
+]
+
+
+def test_resolve_context_fail_on_validation_errors_defaults_on_registration_and_request(env, store):
+    from lambdas.resolve_context.handler import handler
+
+    out = handler({"request": {"project": "ledger", "taskKey": "core"}, "execution": EXECUTION})
+    assert out["request"]["failOnValidationErrors"] is True
+    reg = {**REGISTRATION, "defaults": {**REGISTRATION["defaults"], "failOnValidationErrors": False}}
+    env["ssm"].put_parameter(Name="/dms-orch/test/ledger/core", Type="String", Value=json.dumps(reg), Overwrite=True)
+    out = handler({"request": {"project": "ledger", "taskKey": "core"}, "execution": {**EXECUTION, "name": "v1"}})
+    assert out["request"]["failOnValidationErrors"] is False
+    req = {"project": "ledger", "taskKey": "core", "failOnValidationErrors": True}
+    out = handler({"request": req, "execution": {**EXECUTION, "name": "v2"}})
+    assert out["request"]["failOnValidationErrors"] is True
+
+
+@pytest.mark.parametrize("flag,expected", [(None, True), (False, False), (True, True)])
+def test_inspect_puts_fail_on_validation_errors_into_the_completion_spec(table, flag, expected):
+    from lambdas.inspect_task.handler import handler
+
+    use(dms=FakeDms(dms_task("ready")))
+    req = _req() if flag is None else _req(failOnValidationErrors=flag)
+    out = handler({"runId": "r1", "request": req, "ctx": _ctx(), "attempt": 1})
+    assert out["completionSpec"]["failOnValidationErrors"] is expected
+
+
+def test_classify_validation_errors_are_data_and_not_recovered_after_a_wait_timeout():
+    from lambdas.classify_failure.handler import classify
+
+    assert _classify({"Error": "DmsValidationErrors", "Cause": "1 table(s) not validated"})["category"] == "DATA"
+    event = {
+        "failure": {"Error": "WaitTimeout", "Cause": "heartbeat"},
+        "ctx": {"taskArn": TASK_ARN},
+        "request": {},
+        "started": True,
+        "attempt": 1,
+        "completion": {"mode": "task-stopped", "failOnValidationErrors": True},
+        "startedAt": "2026-10-27T10:00:00Z",
+    }
+    out = classify(event, FakeDms(FINISHED, BAD_VALIDATION), FakeLogs())
+    assert out["recovered"] is False
+
+
+# --- review finding 9: job sets pinned by the bundle hash in the registration ---
+
+
+def register_jobs(env, **jobs: Any) -> None:
+    reg = {**REGISTRATION, "jobs": {**REGISTRATION["jobs"], **jobs}}
+    env["ssm"].put_parameter(Name="/dms-orch/test/ledger/core", Type="String", Value=json.dumps(reg), Overwrite=True)
+
+
+def _resolve(version: str = "v1", name: str = "r-pin") -> dict[str, Any]:
+    from lambdas.resolve_context.handler import handler
+
+    req = {"project": "ledger", "taskKey": "core", "jobsVersion": version}
+    return handler({"request": req, "execution": {**EXECUTION, "name": name}})
+
+
+def test_pinned_job_set_puts_its_hashes_into_ctx_and_every_job(env):
+    ctx = _resolve()["ctx"]
+    pinned = REGISTRATION["jobs"]["bundles"]["v1"]
+    assert ctx["jobsBundle"] == {
+        "sha256": pinned,
+        "files": bundle_files({"jobset.json": json.dumps(JOBSET).encode()}),
+        "pinned": True,
+    }
+    assert {j["bundleSha256"] for p in ("pre", "reset") for j in ctx["jobs"][p]} == {pinned}
+    assert "bundle" not in ctx["jobs"]
+
+
+def test_unregistered_job_set_version_is_refused(env):
+    from shared.errors import JobSetNotPinned
+
+    put_bundle(env["s3"], "v3", {"jobset.json": json.dumps(JOBSET).encode()})
+    with pytest.raises(JobSetNotPinned, match="v3"):
+        _resolve("v3")
+
+
+def test_allow_unpinned_takes_the_bundle_hash_it_finds(env):
+    total = put_bundle(env["s3"], "v3", {"jobset.json": json.dumps(JOBSET).encode()})
+    register_jobs(env, allowUnpinned=True)
+    ctx = _resolve("v3")["ctx"]
+    assert ctx["jobsBundle"]["sha256"] == total and ctx["jobsBundle"]["pinned"] is False
+    assert ctx["jobs"]["pre"][0]["bundleSha256"] == total
+
+
+def test_allow_unpinned_without_a_manifest_runs_unverified(env):
+    env["s3"].put_object(Bucket=BUCKET, Key="jobs/ledger/v4/jobset.json", Body=json.dumps(JOBSET).encode())
+    register_jobs(env, allowUnpinned=True)
+    ctx = _resolve("v4")["ctx"]
+    assert ctx["jobsBundle"] is None and ctx["jobs"]["pre"][0]["bundleSha256"] is None
+
+
+def test_tampered_job_set_file_is_refused(env):
+    from shared.errors import JobSetTampered
+
+    evil = {**JOBSET, "phases": {**JOBSET["phases"], "pre": [{"name": "x", "command": ["sh", "-c", "id"]}]}}
+    env["s3"].put_object(Bucket=BUCKET, Key="jobs/ledger/v1/jobset.json", Body=json.dumps(evil).encode())
+    with pytest.raises(JobSetTampered, match="jobset.json"):
+        _resolve()
+
+
+def test_bundle_rewritten_with_a_fresh_manifest_does_not_match_the_pin(env):
+    from shared.errors import JobSetTampered
+
+    evil = {**JOBSET, "phases": {**JOBSET["phases"], "pre": [{"name": "x", "command": ["sh", "-c", "id"]}]}}
+    put_bundle(env["s3"], "v1", {"jobset.json": json.dumps(evil).encode()})
+    with pytest.raises(JobSetTampered, match="pinned"):
+        _resolve()
+    register_jobs(env, allowUnpinned=True)  # allow_unpinned never overrides a registered hash
+    with pytest.raises(JobSetTampered, match="pinned"):
+        _resolve(name="r-pin2")
+
+
+def test_pinned_version_without_a_manifest_is_refused(env):
+    from shared.errors import JobSetTampered
+
+    env["s3"].delete_object(Bucket=BUCKET, Key="jobs/ledger/v1/bundle.sha256")
+    with pytest.raises(JobSetTampered, match="bundle.sha256"):
+        _resolve()
+
+
+def test_post_repeat_with_an_unpinned_job_set_version_is_refused(env, table):
+    from lambdas.resolve_context.handler import handler
+    from shared.errors import JobSetNotPinned
+
+    _save_repeat_context(env)
+    put_bundle(env["s3"], "v5", {"jobset.json": json.dumps(JOBSET).encode()})
+    use(dms=FakeDms(FINISHED), sfn=FakeSfn())
+    data = {"runId": "run-1", "operation": "post", "jobsVersion": "v5", "startedBy": "operator"}
+    with pytest.raises(JobSetNotPinned):
+        handler({"mode": "post", "input": data, "execution": REPEAT_EXEC})
+
+
+def test_job_set_errors_are_configuration_failures():
+    for error in ("JobSetNotPinned", "JobSetTampered"):
+        assert _classify({"Error": error, "Cause": "x"})["category"] == "CONFIG"
+
+
+def test_write_report_lists_tables_dms_cannot_validate_as_a_warning(env, store):
+    from lambdas.write_report.handler import handler
+
+    store.put_run("run-pk", {"project": "ledger"})
+    tables = [
+        {"SchemaName": "app", "TableName": "a", "TableState": "Table completed", "ValidationState": "Validated"},
+    ] + [
+        {
+            "SchemaName": "app",
+            "TableName": f"n{i:02d}",
+            "TableState": "Table completed",
+            "ValidationState": "No primary Key",
+        }
+        for i in range(12)
+    ]
+    use(dms=FakeDms(FINISHED, tables))
+    out = handler(
+        {
+            "runId": "run-pk",
+            "status": "SUCCEEDED",
+            "request": {"project": "ledger", "taskKey": "core", "notify": {}},
+            "ctx": {"taskArn": TASK_ARN},
+            "dmsOutcome": {"outcome": "COMPLETED"},
+            "started": True,
+        }
+    )
+    report = json.loads(env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-pk/report.json")["Body"].read())
+    assert report["validationSkippedTables"] == [f"app.n{i:02d}" for i in range(10)]
+    assert report["validationSkippedCount"] == 12
+    assert any("12 table(s) not validated by DMS (no primary key)" in w for w in report["warnings"])
+    md = env["s3"].get_object(Bucket=BUCKET, Key="runs/ledger/run-pk/report.md")["Body"].read().decode()
+    assert "## Warnings" in md and "app.n00" in md and "and 2 more" in md
+    assert json.loads(out["message"])["validationSkippedCount"] == 12

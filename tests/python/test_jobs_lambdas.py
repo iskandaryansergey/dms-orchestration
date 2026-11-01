@@ -42,6 +42,11 @@ def jobs_env(table, monkeypatch):
     monkeypatch.setenv(
         "JOB_ROLE_ARNS", json.dumps({"ledger": "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"})
     )
+    # These tests are about rendering and routing; which job may run at all (the pinned job set,
+    # the module's own jobs, restore) is test_job_trust.py.
+    from shared import job_trust
+
+    monkeypatch.setattr(job_trust, "authorize", lambda ev, _store: ev)
     s3 = boto3.client("s3", region_name="eu-west-2")
     s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
     return s3
@@ -75,14 +80,64 @@ def test_prepare_fargate_job_renders_command_and_writes_spec(jobs_env):
     spec = handler(event(job()))["spec"]
     assert spec["command"] == ["psql-run", "--connection", "target", "--truncate", "public.a,public.b"]
     assert spec["taskDefinitionArn"] == TD and spec["recordSk"] == "JOB#reset#01#reset-target"
-    assert spec["resultKey"] == "runs/run-1/jobs/reset/01-reset-target/result.json"
+    assert spec["resultKey"] == "runs/ledger/run-1/jobs/reset/01-reset-target/result.json"
     assert spec["maxAttempts"] == 2 and spec["backoffSeconds"] == 30 and spec["skip"] is False
     assert "connections" not in spec  # routing fields only; the full spec is in S3
     stored = json.loads(
-        jobs_env.get_object(Bucket=BUCKET, Key="runs/run-1/jobs/reset/01-reset-target/spec.json")["Body"].read()
+        jobs_env.get_object(Bucket=BUCKET, Key="runs/ledger/run-1/jobs/reset/01-reset-target/spec.json")["Body"].read()
     )
     assert stored["connections"]["target"]["secretArn"].endswith(":secret:t")
     assert stored["jobsS3Prefix"] == CTX["jobsS3Prefix"]
+
+
+LONG = [f"app.t{i:04d}" for i in range(600)]
+LONG_KEY = "runs/ledger/run-1/inspect/reset-tables.json"
+
+
+def _long_ctx(jobs_env, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    jobs_env.put_object(Bucket=BUCKET, Key=LONG_KEY, Body=json.dumps(body or {"resetTables": LONG, "count": 600}))
+    return {**CTX, "resetTables": [], "resetTablesCount": 600, "resetTablesUri": f"s3://{BUCKET}/{LONG_KEY}"}
+
+
+@pytest.mark.parametrize("runtime", ["fargate", "lambda"])
+def test_prepare_expands_a_long_reset_list_into_spec_json_only(jobs_env, runtime):
+    from lambdas.prepare_job.handler import handler
+
+    cmd = ["psql-run", "--connection", "target", "--truncate-scope"]
+    j = (
+        job(runtime="lambda", handler="builtin:checks/connections", command=[])
+        if runtime == "lambda"
+        else job(command=cmd)
+    )
+    spec = handler(event(j, ctx=_long_ctx(jobs_env)))["spec"]
+    stored = json.loads(
+        jobs_env.get_object(Bucket=BUCKET, Key="runs/ledger/run-1/jobs/reset/01-reset-target/spec.json")["Body"].read()
+    )
+    assert stored["ctx"]["resetTables"] == LONG and stored["ctx"]["resetTablesCount"] == 600
+    assert "app.t0599" not in json.dumps(spec)  # the payload stays small
+    if runtime == "lambda":
+        assert spec["ctx"]["resetTables"] == [] and spec["ctx"]["resetTablesCount"] == 600
+
+
+def test_prepare_refuses_a_reset_list_template_when_the_list_is_in_s3(jobs_env):
+    from lambdas.prepare_job.handler import handler
+    from shared.errors import InvalidJobSet
+
+    with pytest.raises(InvalidJobSet, match="--truncate-scope"):
+        handler(event(job(), ctx=_long_ctx(jobs_env)))
+
+
+def test_prepare_refuses_a_reset_list_that_does_not_match_its_count(jobs_env):
+    from lambdas.prepare_job.handler import handler
+    from shared.errors import JobFailed
+
+    with pytest.raises(JobFailed, match="600"):
+        handler(
+            event(job(command=["psql-run", "--truncate-scope"]), ctx=_long_ctx(jobs_env, {"resetTables": LONG[:3]}))
+        )
+    other = {**CTX, "resetTables": [], "resetTablesCount": 600, "resetTablesUri": "s3://elsewhere/x.json"}
+    with pytest.raises(JobFailed, match="inspect prefix"):
+        handler(event(job(command=["psql-run", "--truncate-scope"]), ctx=other))
 
 
 def test_prepare_builtin_lambda_job(jobs_env):
@@ -109,6 +164,32 @@ def test_prepare_project_lambda_must_be_allow_listed(jobs_env):
     assert ok["functionArn"] == PROJECT_FN
     with pytest.raises(InvalidJobSet):
         handler(event(job(runtime="lambda", function="arn:aws:lambda:eu-west-2:1:function:evil", command=[])))
+
+
+def test_prepare_ssm_job_gets_the_job_role_and_only_routing_fields(jobs_env, monkeypatch):
+    from lambdas.prepare_job.handler import handler
+
+    monkeypatch.setenv("SSM_JOBS", "1")
+    j = job(runtime="ssm", image=None, command=["pg-dump-s3", "--connection", "target", "--label", "{{ run.runId }}"])
+    spec = handler(event(j, phase="dump"))["spec"]
+    assert spec["runtime"] == "ssm" and spec["jobRoleArn"] == "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"
+    assert "taskDefinitionArn" not in spec and "functionArn" not in spec
+    assert spec["specS3Uri"] == f"s3://{BUCKET}/runs/ledger/run-1/jobs/dump/01-reset-target/spec.json"
+    assert not {"ctx", "connections", "previous", "with", "failure"} & set(spec)
+    stored = json.loads(
+        jobs_env.get_object(Bucket=BUCKET, Key="runs/ledger/run-1/jobs/dump/01-reset-target/spec.json")["Body"].read()
+    )
+    # orch-job on the runner reads the rendered command from here, never from the document.
+    assert stored["command"] == ["pg-dump-s3", "--connection", "target", "--label", "run-1"]
+
+
+def test_prepare_refuses_an_ssm_job_when_the_runtime_is_off(jobs_env, monkeypatch):
+    from lambdas.prepare_job.handler import handler
+    from shared.errors import InvalidJobSet
+
+    monkeypatch.setenv("SSM_JOBS", "0")
+    with pytest.raises(InvalidJobSet, match=r"ssm\.enabled"):
+        handler(event(job(runtime="ssm", image=None)))
 
 
 def test_prepare_unknown_image(jobs_env):
@@ -397,9 +478,36 @@ def test_dms_dump_writes_artifact(aws):
     assert dump["task"]["lastFailureMessage"] == "boom" and len(dump["events"]) == 1
 
 
+def test_builtin_jobs_write_artifacts_as_the_project_job_role(aws):
+    """Review finding 1: the shared lambda-jobs role has no runs/* access; artifacts go through the job role."""
+    s3 = boto3.client("s3", region_name="eu-west-2")
+    s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
+    sts = FakeSts()
+    shared_aws.set_client("sts", sts)
+
+    class Dms(FakeDms):
+        def describe_events(self, **_kw: Any) -> dict[str, Any]:
+            return {"Events": []}
+
+    shared_aws.set_client("dms", Dms(dms_task("failed", last_failure="boom"), []))
+    assert run_builtin(builtin_spec("builtin:diagnostics/dms_dump"))["status"] == "ok"
+    assert [c["RoleArn"] for c in sts.calls] == [LEDGER_ROLE]
+    out = run_builtin(builtin_spec("builtin:diagnostics/dms_dump", jobRoleArn=None))
+    assert out["status"] == "fail" and "job role" in out["message"]
+
+
 # --- per-project job role (review finding 4) ----------------------------------------
 
 LEDGER_ROLE = "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"
+
+
+def test_prepare_writes_the_spec_under_the_project_of_the_run(jobs_env):
+    """Review finding 1: runs/<project>/<runId>/jobs/..., the only run prefix a project job role can write."""
+    from lambdas.prepare_job.handler import handler
+
+    spec = handler(event(job()))["spec"]
+    assert spec["specS3Uri"] == f"s3://{BUCKET}/runs/ledger/run-1/jobs/reset/01-reset-target/spec.json"
+    assert spec["artifactsS3Prefix"] == f"s3://{BUCKET}/runs/ledger/run-1/jobs/reset/01-reset-target/"
 
 
 def test_prepare_puts_the_project_job_role_into_the_spec(jobs_env, monkeypatch):
@@ -712,7 +820,7 @@ def _snapshot_spec(**kw: Any) -> dict[str, Any]:
         "builtin:dump/cluster_snapshot",
         runId=SNAP_RUN,
         phase="dump",
-        artifactsS3Prefix=f"s3://{BUCKET}/runs/{SNAP_RUN}/jobs/dump/00-snapshot-target/",
+        artifactsS3Prefix=f"s3://{BUCKET}/runs/ledger/{SNAP_RUN}/jobs/dump/00-snapshot-target/",
         **{"with": {"connection": "target", "waitSeconds": 60, **kw}},
     )
 
@@ -742,12 +850,14 @@ def test_cluster_snapshot_is_created_tagged_polled_and_recorded(aws, monkeypatch
     tags = {t["Key"]: t["Value"] for t in create["Tags"]}
     assert tags["dms-orch:project"] == "ledger" and tags["dms-orch:task"] == "core"
     assert tags["dms-orch:run"] == SNAP_RUN
-    assert [c["RoleArn"] for c in sts.calls] == [LEDGER_ROLE]  # acts as the project job role
-    manifest = json.loads(s3.get_object(Bucket=BUCKET, Key=f"runs/{SNAP_RUN}/dump.json")["Body"].read())
+    assert {c["RoleArn"] for c in sts.calls} == {LEDGER_ROLE}  # acts as the project job role (rds and s3)
+    # Under the job's own prefix: the project job role writes only runs/<project>/*/jobs/*.
+    manifest_key = f"runs/ledger/{SNAP_RUN}/jobs/dump/00-snapshot-target/dump.json"
+    manifest = json.loads(s3.get_object(Bucket=BUCKET, Key=manifest_key)["Body"].read())
     assert manifest["method"] == "snapshot" and manifest["snapshotIdentifier"] == name
     assert manifest["clusterIdentifier"] == "target" and manifest["status"] == "available"
     assert out["summary"]["snapshotIdentifier"] == name
-    assert out["summary"]["manifestUri"] == f"s3://{BUCKET}/runs/{SNAP_RUN}/dump.json"
+    assert out["summary"]["manifestUri"] == f"s3://{BUCKET}/{manifest_key}"
     text = json.dumps(manifest).lower()
     assert "rds.amazonaws.com" not in text and "password" not in text and "secret" not in text
 
@@ -1057,3 +1167,49 @@ def test_wake_budget_fits_the_pre_flight_job_and_the_lambda(aws):
     (job,) = preflight_jobs("lambda", {})
     assert job["timeoutSeconds"] >= 2 * budget + 120
     assert job["timeoutSeconds"] + 30 <= 900
+
+
+# --- review finding 9: the pinned bundle hash reaches the runtimes ---------------
+
+
+def test_prepare_passes_the_pinned_bundle_hash_to_the_runtime(jobs_env):
+    from lambdas.prepare_job.handler import handler
+
+    spec = handler(event(job(bundleSha256="b" * 64)))["spec"]
+    assert spec["bundleSha256"] == "b" * 64  # routing fields keep it for the runtime too
+    key = "runs/ledger/run-1/jobs/reset/01-reset-target/spec.json"
+    stored = json.loads(jobs_env.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+    assert stored["bundleSha256"] == "b" * 64
+    assert handler(event(job(), runId="run-2"))["spec"]["bundleSha256"] is None
+
+
+def _bundle_spec(s3: Any, files: dict[str, bytes], pin: bool = True) -> dict[str, Any]:
+    from shared import bundle
+
+    s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-2"})
+    hashes = {rel: bundle.digest(data) for rel, data in files.items()}
+    for rel, data in files.items():
+        s3.put_object(Bucket=BUCKET, Key=f"jobs/ledger/v1/{rel}", Body=data)
+    s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/bundle.sha256", Body=bundle.render(hashes).encode())
+    return builtin_spec(
+        "builtin:x", jobsS3Prefix=CTX["jobsS3Prefix"], bundleSha256=bundle.total(hashes) if pin else None
+    )
+
+
+def test_builtin_jobs_read_bundle_files_only_when_they_match_the_pin(aws):
+    from lambdas.builtin_jobs import handler as builtin
+    from shared.errors import JobSetTampered
+
+    s3 = boto3.client("s3", region_name="eu-west-2")
+    shared_aws.set_client("s3", s3)
+    shared_aws.set_client("sts", FakeSts())
+    spec = _bundle_spec(s3, {"sql/check.sql": b"SELECT 1;", "jobset.json": b"{}"})
+    assert builtin.bundle_file(spec, "sql/check.sql") == b"SELECT 1;"
+    s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/sql/check.sql", Body=b"DROP TABLE t;")
+    with pytest.raises(JobSetTampered, match="hash"):
+        builtin.bundle_file(spec, "sql/check.sql")
+    s3.put_object(Bucket=BUCKET, Key="jobs/ledger/v1/sql/extra.sql", Body=b"SELECT 2;")
+    with pytest.raises(JobSetTampered, match="not in"):
+        builtin.bundle_file(spec, "sql/extra.sql")
+    with pytest.raises(JobSetTampered, match="pinned"):
+        builtin.bundle_file({**spec, "bundleSha256": "c" * 64}, "jobset.json")

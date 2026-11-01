@@ -13,6 +13,8 @@ skip-check:
   - CKV_AWS_26
   - CKV_AWS_27
   - CKV_AWS_338
+  # EventBridge Scheduler: the watchdog schedule takes kms_key_arn when a CMK is given.
+  - CKV_AWS_297
   # S3 access logging and cross-region replication are bucket-policy decisions of the landing zone.
   - CKV_AWS_18
   - CKV_AWS_144

@@ -149,6 +149,39 @@ def test_sandbox_sources_the_upstream_modules_from_the_fetched_directory():
         assert "git::" not in path.read_text(encoding="utf-8"), path
 
 
+def test_endpoint_keys_do_not_read_the_orchestrator_module():
+    # module.dms depends_on the endpoints, and the orchestrator reads module.dms outputs
+    # (var.dms, and var.projects validates against it): keys taken from network_contract
+    # close a cycle that terraform validate refuses. A check block compares them instead.
+    tf = (SANDBOX / "main.tf").read_text(encoding="utf-8")
+    block = re.search(r'resource "aws_vpc_endpoint" "interface" \{(.*?)\n\}', tf, flags=re.DOTALL)
+    assert block, "aws_vpc_endpoint.interface not found"
+    assert "module.dms_orchestration" not in block.group(1)
+    check = re.search(r'check "endpoints_cover_the_network_contract" \{(.*?)\n\}', tf, flags=re.DOTALL)
+    assert check and "network_contract.required_vpc_endpoints" in check.group(1)
+
+
+def test_sandbox_task_does_not_fail_on_the_table_dms_cannot_validate():
+    # app.audit_notes has no primary key (tests/e2e/seed): DMS reports "No primary Key" and, with
+    # the module default fail_on_validation_errors = true, every load ends FAILED
+    # DmsValidationErrors (live sandbox run). The scenarios opt out; the default stays the module's.
+    seed = (ROOT / "tests" / "e2e" / "seed" / "010_source_schema.sql").read_text(encoding="utf-8")
+    notes = re.search(r"CREATE TABLE IF NOT EXISTS app\.audit_notes \((.*?)\);", seed, flags=re.DOTALL)
+    assert notes and "PRIMARY KEY" not in notes.group(1).upper()
+    tf = (SANDBOX / "main.tf").read_text(encoding="utf-8")
+    assert re.search(r"defaults\s*=\s*\{[^}]*fail_on_validation_errors\s*=\s*false", tf)
+
+
+def test_sandbox_sql_lambda_reaches_s3_through_the_gateway_endpoint():
+    # truncate reads spec.json from S3; the gateway endpoint's addresses are the S3 prefix list,
+    # outside the VPC CIDR: without this egress the call hangs until the Lambda timeout (live run).
+    tf = (SANDBOX / "main.tf").read_text(encoding="utf-8")
+    rules = re.findall(r'resource "aws_vpc_security_group_egress_rule" "[^"]+" \{(.*?)\n\}', tf, flags=re.DOTALL)
+    assert any(
+        "aws_security_group.sql_lambda.id" in r and 'aws_vpc_endpoint.gateway["s3"].prefix_list_id' in r for r in rules
+    )
+
+
 def test_local_lint_does_not_reach_into_the_fetched_upstream_checkout():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(r'extend-exclude\s*=\s*\[[^\]]*"examples/sandbox/upstream"', pyproject)
@@ -165,6 +198,38 @@ def test_upstream_checkout_and_local_env_are_ignored_and_the_example_is_a_placeh
     example = (SANDBOX / "upstream.env.example").read_text(encoding="utf-8")
     assert "UPSTREAM_MODULES_GIT=https://example.com/<org>/<modules-repo>.git" in example
     assert "UPSTREAM_MODULES_REF=<commit-sha>" in example
+
+
+MIN_UPSTREAM = "08def61"
+
+
+def test_the_example_states_the_minimum_upstream_commit():
+    example = (SANDBOX / "upstream.env.example").read_text(encoding="utf-8")
+    assert f"at or after {MIN_UPSTREAM}" in example
+
+
+def test_the_contract_marks_2_3_and_2_6_fixed_upstream():
+    text = (ROOT / "docs" / "upstream-modules-contract.md").read_text(encoding="utf-8")
+    for section in ("### 2.3", "### 2.6"):
+        body = re.split(r"\n#{2,3} ", text[text.index(section) :])[0]
+        flat = re.sub(r"\s+", " ", body)
+        assert f"Fixed upstream from {MIN_UPSTREAM}" in flat, section
+        assert "the orchestrator no longer works around it" in flat, section
+    assert "sbx test-connections` sets 32768" not in text
+
+
+def test_troubleshooting_names_no_sandbox_workaround():
+    text = (ROOT / "docs" / "troubleshooting.md").read_text(encoding="utf-8")
+    assert "fix_target_max_file_size" not in text
+    assert MIN_UPSTREAM in text
+
+
+def test_the_sandbox_applies_and_destroys_without_target():
+    # A sandbox run on upstream 08def61 applied without -target and destroyed in one pass.
+    readme = (SANDBOX / "README.md").read_text(encoding="utf-8")
+    assert "MaxFileSize" not in readme
+    assert not re.search(r"terraform (apply|destroy)[^\n]*-target", readme)
+    assert "removed after the next sandbox run" not in readme
 
 
 def test_upstream_patches_stay_local():

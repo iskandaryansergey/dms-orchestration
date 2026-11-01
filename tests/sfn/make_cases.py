@@ -43,6 +43,7 @@ MIGRATE_VARS: dict[str, Any] = {
     "assessmentArn": None,
     "assessmentPolls": 0,
     "migration": None,
+    "recheckFor": None,
     "failure": None,
     "classification": None,
     "report": None,
@@ -83,6 +84,7 @@ def case(
     expect: dict[str, Any],
     mock: Any = None,
     retries: int | None = None,
+    input_: Any = None,
     **var_over: Any,
 ) -> dict[str, Any]:
     base = MIGRATE_VARS if machine == "migrate" else POST_VARS
@@ -94,6 +96,8 @@ def case(
         "variables": variables,
         "context": context(machine, "run-1" if machine == "migrate" else "run-1-post"),
     }
+    if input_ is not None:
+        out["input"] = input_
     if mock is not None:
         out["mock"] = mock
     if retries is not None:
@@ -108,6 +112,33 @@ def err(error: str, cause: str = "x") -> dict[str, Any]:
 
 CONDITIONAL = err("DynamoDb.ConditionalCheckFailedException", "The conditional request failed")
 ARMED = {"status": "armed", "runId": "old"}
+STOPPED_TASK = {
+    "status": "stopped",
+    "stopReason": "FATAL_ERROR",
+    "stats": {"fullLoadProgressPercent": 60, "tablesLoaded": 3, "tablesErrored": 0},
+}
+INTERRUPTED = {"state": "interrupted", "task": STOPPED_TASK, "completionSpec": COMPLETION}
+RESET = {"action": "start", "startType": "resume-processing", "reset": True}
+
+
+def described(status: str, stop_reason: str | None = "FATAL_ERROR") -> dict[str, Any]:
+    task: dict[str, Any] = {
+        "ReplicationTaskArn": TASK,
+        "Status": status,
+        "ReplicationTaskStats": {"FullLoadProgressPercent": 60, "TablesLoaded": 3, "TablesErrored": 0},
+    }
+    if stop_reason:
+        task["StopReason"] = stop_reason
+    return {"ReplicationTasks": [task]}
+
+
+DUMP_JOB = {
+    "name": "dump-target",
+    "index": 0,
+    "runtime": "fargate",
+    "command": ["pg-dump-s3", "--connection", "target"],
+}
+DUMP_CTX = {**CTX, "jobs": {**CTX["jobs"], "dump": [DUMP_JOB]}}
 RESUME_REQ = {
     "project": "ledger",
     "taskKey": "core",
@@ -170,14 +201,77 @@ CASES: dict[str, dict[str, Any]] = {
     "reset-dumps-first": case(
         "migrate",
         "CheckReset",
-        {"status": "SUCCEEDED", "nextState": "DumpJobs"},
+        {"status": "SUCCEEDED", "nextState": "RecheckTask", "variables": {"recheckFor": "dump"}},
         decision={"action": "start", "startType": "reload-target", "reset": True},
+        ctx=DUMP_CTX,
+    ),
+    "recheck-task-unchanged-continues": case(
+        "migrate",
+        "CheckTaskUnchanged",
+        {"status": "SUCCEEDED", "nextState": "DumpJobs"},
+        input_=described("stopped"),
+        inspect=INTERRUPTED,
+        decision=RESET,
+        recheckFor="dump",
+    ),
+    "recheck-task-running-stops": case(
+        "migrate",
+        "CheckTaskUnchanged",
+        {"status": "SUCCEEDED", "nextState": "ClassifyFailure"},
+        input_=described("running", None),
+        inspect=INTERRUPTED,
+        decision=RESET,
+        recheckFor="reset",
+    ),
+    "dump-runs-on-chained-reset-without-dump": case(
+        "migrate",
+        "CheckReset",
+        {"status": "SUCCEEDED", "nextState": "RecheckTask", "variables": {"recheckFor": "dump"}},
+        attempt=2,
+        req=RESUME_REQ,
+        decision=RESET,
+        ctx={**DUMP_CTX, "chain": {"dumped": False, "dumpUri": None}},
+    ),
+    "chained-reset-after-a-dump-does-not-dump-again": case(
+        "migrate",
+        "CheckReset",
+        {"status": "SUCCEEDED", "nextState": "RecheckTask", "variables": {"recheckFor": "reset"}},
+        attempt=2,
+        req=RESUME_REQ,
+        decision=RESET,
+        ctx={**DUMP_CTX, "chain": {"dumped": True, "dumpUri": "s3://b/dumps/ledger/core/t-run-1/"}},
+    ),
+    "resolve-rejects-operator-attempt": case(
+        "migrate",
+        "ResolveContext",
+        {"status": "CAUGHT_ERROR", "nextState": "FailInvalidRequest"},
+        mock=err("InvalidRunRequest", "run run-0 did not hand over to run-1"),
+        input_={**RESUME_REQ, "attempt": 2, "parentRunId": "run-0"},
     ),
     "dry-run-hands-over-to-post": case(
         "migrate",
         "CheckDryRun",
         {"status": "SUCCEEDED", "nextState": "StartPostDryRun"},
         req={"project": "ledger", "taskKey": "core", "operation": "migrate", "dryRun": True},
+    ),
+    "context-version-is-recorded": case(
+        "migrate",
+        "CheckContextVersion",
+        {"status": "SUCCEEDED", "nextState": "RecordContextVersion"},
+        input_={"ETag": '"e"', "VersionId": "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"},
+    ),
+    "context-without-version-stops-before-dms": case(
+        "migrate",
+        "CheckContextVersion",
+        {"status": "SUCCEEDED", "nextState": "ClassifyFailure"},
+        input_={"ETag": '"e"'},
+    ),
+    "record-context-version": case(
+        "migrate",
+        "RecordContextVersion",
+        {"status": "SUCCEEDED", "nextState": "CheckDryRun"},
+        mock={"result": {}},
+        input_={"ETag": '"e"', "VersionId": "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"},
     ),
     "arm-then-start": case(
         "migrate", "Arm", {"status": "SUCCEEDED", "nextState": "CheckWaitOnly"}, mock={"result": {}}
@@ -202,6 +296,14 @@ CASES: dict[str, dict[str, Any]] = {
         "StartReplicationTask",
         {"status": "RETRIABLE"},
         mock=err("DatabaseMigration.ResourceQuotaExceededFault", "slow down"),
+        retries=0,
+    ),
+    # A start that timed out may have reached DMS: never call it again, let the handoff judge the task.
+    "start-timeout-is-not-retried": case(
+        "migrate",
+        "StartReplicationTask",
+        {"status": "CAUGHT_ERROR", "nextState": "RecordStartError"},
+        mock=err("States.Timeout", "Task timed out"),
         retries=0,
     ),
     "migrate-start-rejected-unlocks": case(
@@ -273,11 +375,17 @@ CASES: dict[str, dict[str, Any]] = {
         mock=err("StepFunctions.ExecutionAlreadyExistsException", "Execution already exists"),
         nextRunId="run-1-r2",
     ),
+    "post-lock-lost-stops": case(
+        "post",
+        "TakeOverLock",
+        {"status": "CAUGHT_ERROR", "nextState": "LockLost", "variables": {"finalStatus": "MANUAL"}},
+        mock=CONDITIONAL,
+    ),
     "post-hand-over-lost": case(
         "post",
         "HandOverLock",
         {"status": "CAUGHT_ERROR", "nextState": "OnFailureJobs"},
-        mock=CONDITIONAL,
+        mock=err("DynamoDb.TransactionCanceledException", "Transaction cancelled [ConditionalCheckFailed, None]"),
         nextRunId="run-1-r2",
     ),
 }

@@ -19,7 +19,19 @@
         "pre": [],
         "reset": [],
         "post": [],
-        "on_failure": []
+        "on_failure": [],
+        "dump": [
+          {
+            "name": "dump-target",
+            "index": 0,
+            "runtime": "fargate",
+            "command": [
+              "pg-dump-s3",
+              "--connection",
+              "target"
+            ]
+          }
+        ]
       }
     },
     "attempt": 1,
@@ -54,6 +66,7 @@
     "assessmentArn": null,
     "assessmentPolls": 0,
     "migration": null,
+    "recheckFor": null,
     "failure": null,
     "classification": null,
     "report": null,
@@ -68,6 +81,9 @@
   },
   "expect": {
     "status": "SUCCEEDED",
-    "nextState": "DumpJobs"
+    "nextState": "RecheckTask",
+    "variables": {
+      "recheckFor": "dump"
+    }
   }
 }

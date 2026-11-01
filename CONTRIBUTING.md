@@ -27,6 +27,17 @@ credentials are needed for anything above the live level ([docs/testing.md](docs
    `make denylist` (below).
 5. **Pull request** with the template; CI runs the same gates plus the security scanners.
 
+## Layout and module conventions
+
+- The Python code the module packages (Lambda handlers, the shared library, the SSM runtime and
+  the optional job image) lives under `modules/dms-orchestration/src/`: the module reads nothing
+  outside its own directory (`tests/python/test_packaging.py`), so it can be published alone.
+- Module inputs follow the registry conventions ([configuration](docs/configuration.md#conventions)):
+  every resource behind `create`, `nullable = false` on every variable, `""` rather than `null`
+  for an unset optional string, booleans rather than `null` sentinels, `ManagedBy` and `Module`
+  tags. A new resource gets its `count`/`for_each` on `create` and a line in
+  `conventions.tftest.hcl::create_false_creates_nothing`.
+
 ## Commits
 
 - One commit per logical step, the subject in the imperative with a type prefix

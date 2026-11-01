@@ -13,7 +13,7 @@ operator / CI ──► migrate: lock ─ inspect task ─ pre-flight verdict �
                            ─ [dump] ─ [reset] ─ arm ─ StartReplicationTask ─ end (no waiting)
 AWS DMS ──event──► dms_event_handler ─ claim ─► post: post-jobs | classify ─ [auto-resume]
                            ─ on-failure jobs ─ baseline ─ report ─ SNS ─ unlock
-jobs:   job-runner ─► built-in Lambda checks | Fargate sql-runner (psql, pg_dump, python, bash, pwsh)
+jobs:   job-runner ─► Lambda (built-ins, SQL) | SSM runner from your AMI (pg_dump, scripts) | [Fargate]
 state:  DynamoDB (locks, runs, baselines) · S3 (job sets, reports, dumps) · SSM (registration)
 safety: watchdog every 5 min (lost events, dead executions, orphaned locks) · release_lock
 ```
@@ -35,7 +35,7 @@ Terraform 1.9.8, `hashicorp/aws >= 5.90, < 6`. In the migration workspace, next 
 
 ```hcl
 module "dms_orchestration" {
-  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.1.0"
+  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.2.0"
 
   environment = "dev"
   vpc_id      = var.vpc_id
@@ -60,7 +60,10 @@ module "dms_orchestration" {
             target = { engine = "postgresql", secret_arn = var.target_runner_secret_arn,
                        data_api_cluster_arn = var.target_cluster_arn }
           }
-          jobs     = { default_version = "3f2c1ab" }       # job set version in S3
+          jobs = {                              # job set version in S3, pinned by its hash
+            default_version = "3f2c1ab"
+            bundles         = { "3f2c1ab" = var.jobs_bundle_sha256 } # sync-jobs.sh prints it
+          }
           defaults = { target_reset_policy = "if-interrupted" }
         }
       }
@@ -68,8 +71,7 @@ module "dms_orchestration" {
   }
 
   job_secret_arns             = [var.source_runner_secret_arn, var.target_runner_secret_arn]
-  kms_key_arn                 = var.kms_key_arn  # null only in a sandbox
-  fargate                     = { images = { sql-runner = "${var.ecr}/dms-orch/sql-runner:${var.jobs_image_tag}" } }
+  kms_key_arn                 = var.kms_key_arn  # "" only in a sandbox
   database_security_group_ids = [var.target_db_security_group_id, var.source_db_security_group_id]
 }
 ```
@@ -78,7 +80,20 @@ Every input and output: [docs/configuration.md](docs/configuration.md). Outside 
 pass `sns_topic_arn`, `table_name` and `artifacts_bucket_name` from a long-lived workspace
 (RUNBOOK §9–10). The module creates no VPC endpoints, KMS key policies or operator roles; it
 publishes what they must allow (`network_contract`, `kms_key_policy_requirements`,
-`operator_policy_json`).
+`bucket_requirements`, `operator_policy_json`, `jobset_publisher_policy_json`). A brought
+artifacts bucket must be versioned; `modules/artifacts-bucket` creates one with every control.
+`create = false` creates nothing.
+
+Footprint: Lambda functions from zips the module packages from its own directory (or a prebuilt
+zip, `lambda.artifact_s3_*`), three Step Functions state machines, IAM roles (one job role per
+project), SSM parameters, alarms and, unless you bring them, a DynamoDB table, an S3 bucket and
+an SNS topic; the module's tags include `ManagedBy` and `Module`. No ECS cluster, no ECR
+endpoints and no container image by default: SQL jobs run in a Lambda, long jobs
+(`pg_dump`/`pg_restore`, long DDL, scripts) on SSM-managed instances built from your AMI
+(`ssm`; one runner per project, since projects sharing a runner are not isolated from each
+other), and Fargate is an optional third runtime that appears only with `fargate.images`, a
+pre-pushed image pinned by digest. The module never builds an image
+([ADR 0011](docs/adr/0011-job-runtimes.md)).
 
 ## Run a migration
 
@@ -91,7 +106,7 @@ python scripts/orch.py report <runId>
 python scripts/orch.py gate <runId>                                                   # exit 0: may be promoted
 ```
 
-Run request fields: [`run_request.schema.json`](src/shared/schemas/run_request.schema.json).
+Run request fields: [`run_request.schema.json`](modules/dms-orchestration/src/shared/schemas/run_request.schema.json).
 Job sets (pre, reset, post and on-failure jobs, versioned in S3): [docs/job-contract.md](docs/job-contract.md),
 examples [minimal](examples/jobs/minimal) and [postgres-basic](examples/jobs/postgres-basic).
 
@@ -99,9 +114,10 @@ examples [minimal](examples/jobs/minimal) and [postgres-basic](examples/jobs/pos
 
 ```
 modules/dms-orchestration/   Terraform module (+ asl/ state machines, tests/ terraform test)
-src/shared/                  decision logic, pre-flight, handoff (migrate -> post), DynamoDB store, schemas
-src/lambdas/                 one directory per Lambda handler
-src/jobs/sql-runner/         Fargate image: Dockerfile, orch_job.py entrypoint, psql-run, dumps, verify-target
+  src/shared/                decision logic, pre-flight, handoff (migrate -> post), DynamoDB store, schemas
+  src/lambdas/               one directory per Lambda handler (packaged by the module)
+  src/jobs/sql-runner/       SSM runtime zip and optional Fargate image: orch_job.py, psql-run, dumps, verify-target
+modules/artifacts-bucket/    optional long-lived artifacts bucket with the controls of bucket_requirements
 examples/jobs/               example job sets
 examples/sandbox/            throw-away stack and the e2e scenarios
 scripts/                     orch.py (CLI), sync-jobs.sh, jobset_tool.py, verify_destroyed.py, check_denylist.py
@@ -120,12 +136,14 @@ make teststate-dry    # build the TestState requests (no AWS)
 The cycle, the commit rules and the denylist gate: [CONTRIBUTING.md](CONTRIBUTING.md); for coding
 agents: [AGENTS.md](AGENTS.md). Test levels and the e2e matrix: [docs/testing.md](docs/testing.md).
 
-## Release 0.1.0
+## Release 0.2.0
 
-The first release: two state machines with a pre-flight verdict, target dumps by `pg_dump` or
-cluster snapshot, IAM database authentication for Fargate jobs, the target check in a Lambda or
-on Fargate, SNS fan-out attributes, repeat of post, the sandbox and its e2e matrix. What is in
-it: [CHANGELOG.md](CHANGELOG.md).
+Hardening and new job runtimes: run artifacts per project and a pinned run context, job sets
+pinned by hash, a transactional restore scoped to the dump's tables under the task lock, DMS
+validation failing the run by default, SQL jobs in a Lambda and long jobs on SSM with Fargate
+optional, and the registry conventions (`create`, non-nullable inputs, KMS key policy contract
+v2). 0.2.0 has breaking changes for 0.1 deployments, runs and dumps; each is listed under
+*Changed* in [CHANGELOG.md](CHANGELOG.md).
 
 ## License and security
 

@@ -1,0 +1,28 @@
+{
+  "definition": "job-runner.asl.json",
+  "state": "CheckSsmRunner",
+  "variables": {
+    "input": {},
+    "attempt": 1,
+    "spec": {},
+    "result": null,
+    "exitCode": 0,
+    "ecsError": null,
+    "ssmRunners": [],
+    "ssmInstanceId": null,
+    "ssmCommandId": null,
+    "ssmStatus": null,
+    "ssmPolls": 0
+  },
+  "expect": {
+    "status": "SUCCEEDED",
+    "nextState": "RecordJob",
+    "variables": {
+      "result": {
+        "status": "fail",
+        "message": "no SSM runner instance online (module variable ssm: instance_ids or target_tags)",
+        "summary": {}
+      }
+    }
+  }
+}

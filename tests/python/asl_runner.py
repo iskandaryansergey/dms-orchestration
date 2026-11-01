@@ -47,6 +47,9 @@ TEMPLATE_VALUES: dict[str, Any] = {
     "security_groups_json": ["sg-jobs"],
     "assign_public_ip": "DISABLED",
     "artifacts_bucket": "dms-orch-artifacts-test",
+    "ssm_document_name": "dms-orch-test-orch-job",
+    "ssm_instance_filters_json": [{"Key": "PingStatus", "Values": ["Online"]}],
+    "jobs_log_group_name": "/dms-orch/test/jobs",
 }
 
 
