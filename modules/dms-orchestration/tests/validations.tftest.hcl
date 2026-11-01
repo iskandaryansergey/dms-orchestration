@@ -54,6 +54,14 @@ run "bad_reset_policy" {
   expect_failures = [var.projects]
 }
 
+run "external_stop_never_resumes_by_itself" {
+  command = plan
+  variables {
+    projects = { ledger = { tasks = { core = { defaults = { auto_resume_categories = ["DMS_RESTART", "EXTERNAL_STOP"] } } } } }
+  }
+  expect_failures = [var.projects]
+}
+
 run "bad_project_name" {
   command = plan
   variables {

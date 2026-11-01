@@ -43,7 +43,6 @@ SCENARIOS_0_2 = {
     "s4big",
     "s17-lock-lost",
     "s18-recheck",
-    "s19-chain-dump",
     "s20-tampered-jobset",
     "s21-validation",
 }
@@ -76,3 +75,23 @@ def test_testing_doc_covers_every_level():
     for level in ("pytest", "moto", "asl_runner.py", "terraform test", "TestState", "e2e.py", "denylist", "trivy"):
         assert level in text, level
     assert "## Adding a scenario" in text and "## Adding a state machine case" in text
+
+
+# Scenarios dropped from e2e.py because they cannot be reproduced live, with the offline test
+# that covers the same chain (docs/testing.md, "Replaced by offline tests").
+REPLACED = {
+    "s19-chain-dump": (
+        "test_asl.py",
+        "test_a_resume_chain_dumps_before_its_first_reset_and_that_dump_can_be_restored",
+    ),
+}
+
+
+def test_replaced_scenarios_are_gone_from_e2e_and_their_offline_tests_exist():
+    names = e2e_scenarios() | set(matrix_scenarios()) | set(planned_scenarios())
+    assert set(REPLACED) & names == set(), "a replaced scenario is still run, listed or planned"
+    text = TESTING.read_text(encoding="utf-8")
+    section = text.split("## Replaced by offline tests", 1)[1].split("\n## ", 1)[0]
+    for name, (module, test) in REPLACED.items():
+        assert f"`{name}`" in section and f"`{module}::{test}`" in section
+        assert f"def {test}(" in (ROOT / "tests" / "python" / module).read_text(encoding="utf-8")

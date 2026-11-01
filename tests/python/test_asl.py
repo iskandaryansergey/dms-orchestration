@@ -1626,3 +1626,62 @@ def test_no_assessment_unless_enabled_and_not_in_a_dry_run():
         {"runId": "run-1", "request": request(dryRun=True), "ctx": {**ctx(), "assessment": ASSESS_CFG}, "attempt": 1}
     )
     assert "StartAssessment" not in run_migrate(m).path
+
+
+# --- the resume chain end to end: retry -> dump -> restore (s19, offline) ----------------
+
+
+def test_a_resume_chain_dumps_before_its_first_reset_and_that_dump_can_be_restored(store, monkeypatch):
+    """Replaces the sandbox scenario s19-chain-dump, which cannot be reproduced live (an external
+    stop never resumes by itself). Attempt 1 started DMS without a reset, so nothing was dumped;
+    it fails with a retryable category, post hands over to attempt 2 (retry); attempt 2 resets
+    and therefore dumps first and records the dump on its RUN# (dump); a further resume of the
+    chain does not dump again, and orch.py restore may restore exactly that dump (restore).
+    Each step feeds the next with what the previous one wrote."""
+    from lambdas.resolve_context.handler import resolve_chain
+    from shared import job_trust
+
+    store.put_run("run-1", {"project": "ledger", "taskKey": "core", "status": "RUNNING"})
+
+    # retry: post classifies the failure as retryable and hands the lock over to run-1-r2.
+    post = run_post(
+        post_mocks(
+            loaded(failure={"Error": "DmsTaskFailed", "Cause": "source connection lost"}),
+            ClassifyFailure=payload({"category": "TRANSIENT_SOURCE_CONN", "retryable": True, "autoResume": True}),
+        )
+    )
+    assert post.output["status"] == "RESUMED", (post.error, post.cause, post.path)
+    _, parent = _sdk_calls(post.called("HandOverLock")[0])
+    assert parent["UpdateExpression"] == "SET resumeChildRunId = :n"
+    store.update_run("run-1", {"resumeChildRunId": parent["ExpressionAttributeValues"][":n"]["S"]})
+    chained = post.called("StartResume")[0]["Input"]
+    chain = resolve_chain(chained, {"name": post.called("StartResume")[0]["Name"]})
+    assert chain == {"dumped": False, "dumpUri": None}
+
+    # dump: attempt 2 resets, so it dumps first and records the dump on its RUN#.
+    mocks = chained_reset_mocks(chain)
+    mocks["RunDumpJob"] = dump_ok
+    second = run_migrate(mocks)
+    assert second.status == "SUCCEEDED", (second.error, second.cause, second.path)
+    order = [n for n in second.path if n in ("DumpJobs", "RecordChainDump", "ResetJobs")]
+    assert order == ["DumpJobs", "RecordChainDump", "ResetJobs"]
+    record = second.called("RecordChainDump")[0]
+    assert record["Key"] == {"pk": {"S": "RUN#run-1-r2"}, "sk": {"S": "META"}}
+    values = record["ExpressionAttributeValues"]
+    dump = values[":u"]["S"]
+    store.update_run(
+        "run-1-r2",
+        {"project": "ledger", "taskKey": "core", "chainDumped": values[":d"]["Bool"], "dumpUri": dump},
+    )
+
+    # A further resume of the same chain takes that dump as the chain's and does not dump again.
+    store.update_run("run-1-r2", {"resumeChildRunId": "run-1-r3"})
+    third_chain = resolve_chain({**chained, "attempt": 3, "parentRunId": "run-1-r2"}, {"name": "run-1-r3"})
+    assert third_chain == {"dumped": True, "dumpUri": dump}
+    third = run_migrate(chained_reset_mocks(third_chain))
+    assert third.status == "SUCCEEDED" and third.called("RunDumpJob") == [] and third.called("RunResetJob")
+
+    # restore: the job-runner accepts pg-restore-s3 of exactly this dump of the task.
+    monkeypatch.setenv("ARTIFACTS_BUCKET", "b")
+    job = {"name": "restore-target", "runtime": "ssm", "command": [*job_trust.RESTORE_COMMAND, dump, "--confirm"]}
+    assert job_trust._restore_job(job, "ledger", "core")["command"] == [*job_trust.RESTORE_COMMAND, dump, "--confirm"]

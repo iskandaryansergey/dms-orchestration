@@ -64,6 +64,12 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
   [security.md](docs/security.md)).
 
 ### Changed
+- **Breaking:** `EXTERNAL_STOP` is refused as an auto-resume category, in the run request
+  (`autoResume.onlyCategories`, a validation error naming it) and in the registration
+  (`defaults.auto_resume_categories`, a plan-time error): someone stopped the task on purpose,
+  and the category is not retryable, so listing it only looked like it would resume. The sandbox
+  scenario `s19-chain-dump`, which relied on it and never reproduced live, is replaced by an
+  offline test of the chain retry → dump → restore ([testing.md](docs/testing.md)).
 - **Breaking:** runs saved by 0.1.0 are refused by `post` and `orch.py post` (`ContextNotPinned`:
   the run item has no context version and the artifacts moved under the project). Bucket
   `versioning` is now required: without a version id `migrate` stops before DMS.

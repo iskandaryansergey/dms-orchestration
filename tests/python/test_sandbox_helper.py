@@ -366,7 +366,7 @@ def test_sync_jobs_uploads_the_sql_and_recheck_job_sets():
     assert 'when: "run.dryRun"' in sql and "truncateScope: true" in sql
 
 
-PLANNED = ["dry-ro", "s4big", "s17-lock-lost", "s18-recheck", "s19-chain-dump", "s20-tampered-jobset", "s21-validation"]
+PLANNED = ["dry-ro", "s4big", "s17-lock-lost", "s18-recheck", "s20-tampered-jobset", "s21-validation"]
 
 
 @pytest.mark.parametrize("name", PLANNED)

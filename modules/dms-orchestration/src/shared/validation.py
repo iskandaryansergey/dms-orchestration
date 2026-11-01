@@ -7,7 +7,8 @@ library on every fixture.
 
 Supported: type, enum, const, required, properties, additionalProperties,
 patternProperties, items, minItems, maxItems, uniqueItems, minimum, maximum,
-minLength, maxLength, pattern, $ref (local ``#/$defs/...``), default.
+minLength, maxLength, pattern, not (its ``description`` is the error message), $ref (local
+``#/$defs/...``), default.
 """
 
 from __future__ import annotations
@@ -69,6 +70,12 @@ def _check(root: dict[str, Any], schema: dict[str, Any], value: Any, path: str, 
         errors.append(f"{where}: {value!r} is not one of {schema['enum']}")
     if "const" in schema and value != schema["const"]:
         errors.append(f"{where}: must be {schema['const']!r}")
+    if "not" in schema:
+        inner: list[str] = []
+        _check(root, schema["not"], value, path, inner)
+        if not inner:
+            reason = _resolve(root, schema["not"]).get("description")
+            errors.append(f"{where}: {value!r} is not allowed" + (f": {reason}" if reason else ""))
 
     if isinstance(value, str):
         if "minLength" in schema and len(value) < schema["minLength"]:

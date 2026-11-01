@@ -29,7 +29,6 @@
     e2e.py s4big # 600 more tables: reset list in S3 above 500, truncateScope truncates all, full count in the report
     e2e.py s17-lock-lost # post finds its lock taken: LockLost, MANUAL, no post jobs, the other lock untouched
     e2e.py s18-recheck # the task started by hand during a pre job: TaskStateChanged, the target not reset
-    e2e.py s19-chain-dump # a chained resume that resets after an attempt without a dump dumps first (SSM)
     e2e.py s20-tampered-jobset # a published job set file changed: JobSetTampered, no job runs
     e2e.py s21-validation # a row differs after the load: DmsValidationErrors; flag off COMPLETED_WITH_VALIDATION_ERRORS
 
@@ -1429,42 +1428,6 @@ def s18_recheck() -> bool:
     return restore_baseline("s18-recheck")["countsMatch"] and ok
 
 
-def s19_chain_dump() -> bool:
-    """A chained resume that resets after an attempt that did not dump takes the dump first
-    (review finding 5): attempt 1 has dump enabled but no reset, is stopped from outside
-    (EXTERNAL_STOP, allowed for auto-resume in this request), attempt 2 resets. Needs a completed
-    last run: after an interrupted one attempt 1 already resets and dumps (seen live)."""
-    run = start(
-        operation="migrate",
-        startType="reload-target",
-        targetReset={"policy": "if-interrupted"},
-        jobsVersion="e2e-ssm",
-        dump={"enabled": True},
-        autoResume={"maxAttempts": 1, "onlyCategories": ["EXTERNAL_STOP"]},
-    )
-    interrupt_load(run["arn"])
-    d = wait(run, timeout=3600)
-    first, last = run["runId"], d["runId"]
-    j1, j2 = jobs(first), jobs(last)
-    c = counts()
-    return verdict(
-        "S19-CHAIN-DUMP",
-        {
-            "chained to a second attempt": last != first,
-            "attempt 1 did not dump or reset": "dump-target" not in j1 and "truncate-tables" not in j1,
-            "attempt 2 dumped before the reset": (j2.get("dump-target") or {}).get("status") == "ok"
-            and (j2.get("truncate-tables") or {}).get("status") == "ok",
-            "chain succeeded": d["status"] == "SUCCEEDED",
-            "counts match": all(s == t for s, t in c.values()),
-            "lock released": lock() is None,
-        },
-        attempts=[first, last],
-        jobs={"attempt1": sorted(j1), "attempt2": sorted(j2)},
-        cause=cause(d) if d["status"] != "SUCCEEDED" else None,
-        counts=c,
-    )
-
-
 def s20_tampered_jobset() -> bool:
     """One file of a published job set changed after sync: JobSetTampered before any job runs."""
     key = "jobs/ledger/e2e-dms-only/jobset.json"
@@ -1583,7 +1546,6 @@ def main(argv: list[str]) -> int:
     scenarios["s4big"] = s4big  # only by name: seeds and drops 600 tables, reloads the target
     scenarios["s17-lock-lost"] = s17_lock_lost  # only by name: plants another owner on the lock
     scenarios["s18-recheck"] = s18_recheck  # only by name: starts the DMS task by hand, job set e2e-recheck
-    scenarios["s19-chain-dump"] = s19_chain_dump  # only by name: dump on SSM (ssm_runner), stops DMS
     scenarios["s20-tampered-jobset"] = s20_tampered_jobset  # only by name: edits a published job set
     scenarios["s21-validation"] = s21_validation  # only by name: a trigger on the target, two loads
     ok = True

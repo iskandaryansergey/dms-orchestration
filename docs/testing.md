@@ -59,7 +59,6 @@ prints a JSON verdict per check; the exit code is 0 only if every check passed.
 | `s4big` | a reset above 500 tables (`sbx seed --tables 600`): the list goes to `inspect/reset-tables.json`, `truncateScope` truncates all of them, the report gives the full count; drops the tables and reloads after. The load takes about 90 s, DMS validation of the 604 tables more than 40 minutes | `sync-jobs` (job set `e2e-sql`) | changes to the reset scope or the payload cap |
 | `s17-lock-lost` | post finds its lock taken: `LockLost`, `MANUAL`, no post jobs, the other run's lock untouched | plants another owner on the lock | changes to the post lock takeover |
 | `s18-recheck` | the DMS task started by hand during a pre job: `TaskStateChanged` before the target is reset; reloads after | `sync-jobs` (job set `e2e-recheck`) | changes to `RecheckTask` |
-| `s19-chain-dump` | a chained resume that resets after an attempt without a dump takes the dump first | `ssm_runner`, `sync-jobs-ssm` | changes to dumps in a resume chain |
 | `s20-tampered-jobset` | one file of a published job set changed: `JobSetTampered` before any job runs | edits and restores a published job set | changes to job set pinning |
 | `s21-validation` | a row that differs after the load (a trigger on the target): `DmsValidationErrors`; with the flag off `COMPLETED_WITH_VALIDATION_ERRORS`; reloads after | — | changes to the validation outcome |
 
@@ -75,6 +74,16 @@ moves to the matrix above; `test_docs_matrix.py` fails while a scenario is in bo
 |---|---|---|
 
 None at the moment: the 0.2.0 scenarios are in the matrix above.
+
+## Replaced by offline tests
+
+Scenarios dropped from `e2e.py` because they cannot be reproduced live; the offline test covers
+the same chain step by step, each step fed with what the previous one wrote.
+`test_docs_matrix.py` fails if such a scenario comes back to `e2e.py` or its test disappears.
+
+| Scenario | Why not live | Covered offline by |
+|---|---|---|
+| `s19-chain-dump` | it needed a resume after an external stop, and `EXTERNAL_STOP` never resumes by itself (not retryable; the run request schema and `auto_resume_categories` now refuse it) | `test_asl.py::test_a_resume_chain_dumps_before_its_first_reset_and_that_dump_can_be_restored` (retry: post hands over to attempt 2; dump: attempt 2 resets, dumps first and records the dump, a further resume does not dump again; restore: the job-runner accepts `pg-restore-s3` of that dump), `test_lambdas_core.py::test_an_external_stop_never_resumes_by_itself` |
 
 ## Adding a scenario
 

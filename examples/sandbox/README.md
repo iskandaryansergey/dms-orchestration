@@ -117,7 +117,6 @@ e2e dry-ro               # dry run on the Lambda SQL runtime: a write is refused
 e2e s4big                # 600 more tables: reset list in S3, truncateScope, full count; drops them after
 e2e s17-lock-lost        # post finds its lock taken: LockLost, MANUAL
 e2e s18-recheck          # the task started by hand during a pre job: TaskStateChanged (job set e2e-recheck)
-e2e s19-chain-dump       # a chained resume that resets dumps first (ssm_runner)
 e2e s20-tampered-jobset  # a published job set file changed: JobSetTampered
 e2e s21-validation       # a row differs after the load: DmsValidationErrors, then with the flag off
 e2e s1                   # last: the final code is green

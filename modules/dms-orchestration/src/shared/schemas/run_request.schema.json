@@ -183,7 +183,11 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^[A-Z_]+$"
+            "pattern": "^[A-Z_]+$",
+            "not": {
+              "const": "EXTERNAL_STOP",
+              "description": "EXTERNAL_STOP never resumes by itself (someone stopped the task on purpose)"
+            }
           },
           "uniqueItems": true
         }

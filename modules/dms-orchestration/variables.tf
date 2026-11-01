@@ -147,6 +147,11 @@ variable "projects" {
   }
 
   validation {
+    condition     = alltrue(flatten([for p in values(var.projects) : [for t in values(p.tasks) : !contains(t.defaults.auto_resume_categories, "EXTERNAL_STOP")]]))
+    error_message = "defaults.auto_resume_categories must not contain EXTERNAL_STOP: someone stopped the task on purpose, a run never resumes it by itself (same rule as the run request schema)."
+  }
+
+  validation {
     condition = alltrue(flatten([
       for p in values(var.projects) : [
         for t in values(p.tasks) : [

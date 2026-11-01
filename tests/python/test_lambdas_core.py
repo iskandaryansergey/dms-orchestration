@@ -336,6 +336,18 @@ def test_classify_auto_resume_limits():
     assert out["autoResume"] is False and "not in autoResume.onlyCategories" in out["notes"][0]
 
 
+def test_an_external_stop_never_resumes_by_itself():
+    """s19 (review item 5) relied on EXTERNAL_STOP in onlyCategories; it is not retryable, so the
+    chain never started live. The schemas now refuse it; classify ignores it anyway."""
+    stopped = dms_task("stopped", "Stop Reason NORMAL")
+    out = _classify(
+        {"Error": "DmsTaskStoppedUnexpectedly"},
+        task=stopped,
+        auto={"maxAttempts": 3, "onlyCategories": ["EXTERNAL_STOP"]},
+    )
+    assert (out["category"], out["retryable"], out["autoResume"]) == ("EXTERNAL_STOP", False, False)
+
+
 # --- write_report ------------------------------------------------------------------
 
 

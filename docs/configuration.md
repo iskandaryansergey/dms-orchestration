@@ -80,7 +80,7 @@ Metadata and secret ARNs only, never secret values. Every `secret_arn` must also
 | `target_reset_policy` | `if-interrupted` | reset the target before a load: `never`, `if-interrupted` (after an interrupted load only) or `always` |
 | `run_timeout_seconds` | module `run_timeout_seconds` | hard limit of one run; the watchdog stops runs that exceed it |
 | `auto_resume_max_attempts` | `1` | how many times a run resumes by itself after a retryable failure |
-| `auto_resume_categories` | `TRANSIENT_SOURCE_CONN`, `TRANSIENT_TARGET_CONN`, `DMS_RESTART` | failure categories that may resume by themselves |
+| `auto_resume_categories` | `TRANSIENT_SOURCE_CONN`, `TRANSIENT_TARGET_CONN`, `DMS_RESTART` | failure categories that may resume by themselves (a run request may narrow them with `autoResume.onlyCategories`); only retryable categories ever resume, and `EXTERNAL_STOP` is refused here and in the run request (someone stopped the task on purpose) |
 | `fail_on_table_errors` | `true` | a load that finishes with tables in error fails the run instead of `COMPLETED_WITH_TABLE_ERRORS` |
 | `fail_on_validation_errors` | `true` | DMS validation mismatches (`ValidationState` not `Validated`, failed records or full-load error rows) fail the run instead of `COMPLETED_WITH_VALIDATION_ERRORS`; a table DMS cannot validate (`No primary key`) never fails the run, the report lists it in `validationSkippedTables` |
 | `dump_before_reset` | `false` | take a target dump before every reset (as `dump.enabled` in the request) |
