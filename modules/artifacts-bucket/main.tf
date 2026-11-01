@@ -14,6 +14,11 @@ locals {
 
 # Access logging and cross-region replication are landing-zone decisions (.checkov.yaml).
 resource "aws_s3_bucket" "this" {
+  # checkov 3.2.334 does not link count-indexed resources of a root module to this bucket, so its graph
+  # checks miss the resources below; tests/bucket.tftest.hcl asserts each control.
+  # checkov:skip=CKV2_AWS_6:public access block is aws_s3_bucket_public_access_block.this (all four flags on)
+  # checkov:skip=CKV_AWS_21:versioning is aws_s3_bucket_versioning.this (Enabled)
+  # checkov:skip=CKV2_AWS_61:lifecycle is aws_s3_bucket_lifecycle_configuration.this
   count         = local.create ? 1 : 0
   bucket        = var.name
   force_destroy = var.force_destroy
