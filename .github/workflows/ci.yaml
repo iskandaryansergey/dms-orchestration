@@ -21,9 +21,13 @@ jobs:
     name: static checks
     runs-on: ubuntu-24.04
     steps:
+      # On a pull request, check out the branch head, not the merge commit GitHub synthesizes:
+      # that commit is authored by whoever's account opened the PR, and the denylist would
+      # flag it although it is never part of the history that gets merged.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: gitleaks (secrets)
         run: |
