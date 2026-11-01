@@ -83,6 +83,7 @@ runs the `.tftest.hcl` files with a mock provider; the Python tests run with mot
 | post loads only the `context.json` version migrate recorded on `RUN#`, under the project on `RUN#` | `test_lambdas_core.py::test_post_loads_the_pinned_version_not_a_later_overwrite`, `test_lambdas_core.py::test_post_refuses_a_context_without_a_recorded_version`, `test_asl.py::test_migrate_without_a_context_version_stops_before_dms` |
 | Operator: no job set uploads, reads only reports (never `runs/*/jobs/*`), writes only `LOCK#` items; job set publishing per project | `iam.tftest.hcl::operator_cannot_publish_job_sets` |
 | job-runner input is not trusted: a job runs only if it is in the job set version recorded on the run (hash from the registration) with the same code, or is one of the module's own jobs with its fixed code (snapshot retention at least `dump_retention_days`), for a `RUNNING` run of the project named; the job context is built from the registration and `RUN#` only (reset list as inspect_task decided it); restore runs only `pg-restore-s3` of that task's dumps and the restore baseline check, under the task lock held by that restore execution; anything else is `JobNotInJobSet` | `test_job_trust.py::test_the_context_is_the_run_decision_not_the_input`, `test_job_trust.py::test_the_job_set_version_is_the_one_recorded_on_the_run`, `test_job_trust.py::test_snapshot_retention_keeps_at_least_the_registered_days`, `test_job_trust.py::test_restore_needs_the_task_lock_held_by_this_restore_execution`, `test_job_trust.py::test_an_inline_job_is_refused`, `test_job_trust.py::test_a_job_set_name_with_another_body_is_refused`, `test_job_trust.py::test_the_project_of_the_input_must_be_the_project_of_the_run`, `test_job_trust.py::test_connections_come_from_the_registration_not_the_input`, `test_job_trust.py::test_restore_accepts_nothing_else`, `test_job_trust.py::test_the_jobs_resolve_context_builds_are_accepted_as_they_are`, TestState `job-not-in-job-set-is-refused` |
+| a job runs and is recorded with the run's own `dryRun` (`RUN#`): an input with another flag is refused before anything is written, and the job-runner never takes the flag from its input; migrate and post pass the run's flag to every job | `test_job_trust.py::test_a_job_is_not_rerun_with_another_dry_run_flag_than_its_run`, `test_job_trust.py::test_the_dry_run_flag_is_the_one_recorded_on_the_run`, `test_asl.py::test_the_job_runs_and_is_recorded_with_the_dry_run_flag_prepare_job_decided`, `test_asl.py::test_a_refused_job_records_nothing`, `test_asl.py::test_migrate_and_post_pass_the_dry_run_flag_of_the_run_to_every_job` |
 | Restore baseline: written only in the `restore` phase, through `dynamodb:LeadingKeys` on `TARGET#` | `iam.tftest.hcl::least_privilege`, `test_jobs_lambdas.py::test_only_the_restore_phase_may_record_a_baseline` |
 | Job container: uid 10001, read-only root, the init container gets no input or secrets | `defaults.tftest.hcl::lambda_and_events` |
 | SSM runtime: `SendCommand` only of the module document to the configured runners; the runner role trusted by the job roles, never passed; instance profile reads `runtime/*` only; document parameters pattern-checked; runtime zip checked by SHA-256; jobs as `runner_user`, never root; off by default | `iam.tftest.hcl::ssm_runtime_least_privilege`, `iam.tftest.hcl::ssm_runtime_with_target_tags`, `options.tftest.hcl::ssm_runtime_with_a_platform_document`, `options.tftest.hcl::ssm_runtime_never_runs_jobs_as_root`, `defaults.tftest.hcl::no_ssm_runtime_by_default` |
@@ -142,7 +143,11 @@ rendered or written, `prepare_job` (`shared/job_trust.py`):
   `restore-…` id, and `LOCK#<taskArn>` must be held by that restore id and by this very
   job-runner execution (as `orch.py restore` holds it), so a restore never runs under a run's
   lock;
-* a run recorded as a dry run stays dry.
+* `dryRun` is the one recorded on `RUN#`: an input that says otherwise is refused, and the
+  job-runner executes and records (`JOB#…`) with the flag `PrepareJob` returned, never the
+  input's. A dry re-run of a job of a real run therefore cannot overwrite the run's `JOB#` record
+  with `ok` (a post retry skips post jobs that are `ok`, so it could close a failed post check —
+  run 11, finding 2), and a real re-run of a dry run's job cannot write.
 
 Anything else fails the job-runner with `JobNotInJobSet` (the execution's `JobFailed` cause).
 
@@ -167,7 +172,11 @@ Residual risk, stated plainly:
 * The operator role still starts runs and restores for every project of the environment, and
   can restore a target from that task's dumps. While a run is `RUNNING` it can also start a
   job-runner execution that repeats one of that run's jobs (the same pinned job, the same
-  recorded context) at a time it chooses; only the `failure` of an `on_failure` job is still
+  recorded context and the run's own `dryRun`) at a time it chooses. Such a repeat writes the
+  same slots as the run's job (`runs/<project>/<runId>/jobs/<phase>/<nn>-<name>/` and
+  `RUN#…/JOB#<phase>#<nn>#<name>`): its result replaces the run's, but it is a real execution of
+  the reviewed job under the run's flag (its `executionArn` on the record names the job-runner
+  execution that wrote it). Only the `failure` of an `on_failure` job is still
   taken from the input, and a job set that renders it into commands or SQL relies on the
   runtimes' quoting. A project that needs its own run boundary needs its own operator role per
   module instance.

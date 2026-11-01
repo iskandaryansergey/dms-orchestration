@@ -127,7 +127,7 @@
           "specS3Uri": ["{% $spec.specS3Uri %}"],
           "jobRoleArn": ["{% $spec.jobRoleArn %}"],
           "attempt": ["{% $string($attempt) %}"],
-          "dryRun": ["{% $input.dryRun = true ? '1' : '0' %}"],
+          "dryRun": ["{% $spec.dryRun = true ? '1' : '0' %}"],
           "executionTimeout": ["{% $string($spec.timeoutSeconds) %}"]
         },
         "CloudWatchOutputConfig": { "CloudWatchOutputEnabled": true, "CloudWatchLogGroupName": "${jobs_log_group_name}" }
@@ -286,7 +286,7 @@
               "Environment": [
                 { "Name": "ORCH_JOB_SPEC_S3", "Value": "{% $spec.specS3Uri %}" },
                 { "Name": "ORCH_RUN_ID", "Value": "{% $input.runId %}" },
-                { "Name": "ORCH_DRY_RUN", "Value": "{% $input.dryRun ? '1' : '0' %}" },
+                { "Name": "ORCH_DRY_RUN", "Value": "{% $spec.dryRun = true ? '1' : '0' %}" },
                 { "Name": "ORCH_ATTEMPT", "Value": "{% $string($attempt) %}" }
               ]
             }
@@ -357,7 +357,7 @@
           "status": { "S": "{% $result.status %}" },
           "attempt": { "N": "{% $string($attempt) %}" },
           "runtime": { "S": "{% $spec.runtime %}" },
-          "dryRun": { "Bool": "{% $input.dryRun = true %}" },
+          "dryRun": { "Bool": "{% $spec.dryRun = true %}" },
           "summary": { "S": "{% $string($exists($result.summary) ? $result.summary : {}) %}" },
           "message": { "S": "{% $exists($result.message) ? $substring($string($result.message), 0, 4000) : '' %}" },
           "executionArn": { "S": "{% $states.context.Execution.Id %}" },

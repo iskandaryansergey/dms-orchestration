@@ -42,8 +42,12 @@ under *Changed*; finish or abandon runs started by 0.1.0 before the upgrade.
   type, reset scope and list, migration type, selection rules) on `RUN#`, and a reset list in S3
   is read only under the run's `inspect/` prefix. The restore phase accepts only `pg-restore-s3`
   of that task's dumps and the restore baseline check, under the task lock held by that restore
-  execution (the job-runner passes its execution id to `PrepareJob`). A dry run stays dry;
-  anything else fails `JobNotInJobSet`. The operator policy denies reading `runs/*/jobs/*`, so a
+  execution (the job-runner passes its execution id to `PrepareJob`). `dryRun` is the one on
+  `RUN#`: an input that differs is refused before anything is written, and the job-runner runs and
+  records the job with the flag `PrepareJob` returned, so a dry re-run of a real run's job can no
+  longer overwrite its `JOB#` record with `ok` and close a failed post check (run 11, finding 2);
+  migrate and post pass the run's flag to every job, the baseline jobs included. Anything else
+  fails `JobNotInJobSet`. The operator policy denies reading `runs/*/jobs/*`, so a
   job artifact named `report.json` is not readable either; job results remain visible in the
   execution history.
 - No reset without a target fingerprint; the reset scope comes from the fingerprint and the

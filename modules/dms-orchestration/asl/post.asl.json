@@ -231,7 +231,7 @@
         "job": "{% $states.context.Map.Item.Value %}",
         "phase": "baseline",
         "runId": "{% $runId %}",
-        "dryRun": false,
+        "dryRun": "{% $req.dryRun = true %}",
         "ctx": "{% $jobCtx %}",
         "failure": null
       },
@@ -422,7 +422,7 @@
         "job": "{% $states.context.Map.Item.Value %}",
         "phase": "baseline",
         "runId": "{% $runId %}",
-        "dryRun": false,
+        "dryRun": "{% $req.dryRun = true %}",
         "ctx": "{% $jobCtx %}",
         "failure": null
       },

@@ -299,10 +299,27 @@ def test_a_reset_list_in_s3_is_read_only_from_the_inspect_prefix_of_the_run(env)
         prepare(event(pinned("reset", "reset-target"), phase="reset"))
 
 
-def test_a_dry_run_cannot_be_turned_into_a_real_one(env):
+def test_the_dry_run_flag_is_the_one_recorded_on_the_run(env):
     env["store"].update_run("run-1", {"dryRun": True})
-    spec = prepare(event(pinned("pre", "create-tables"), dryRun=False))
-    assert spec["dryRun"] is True
+    ev = event(pinned("pre", "create-tables"))
+    del ev["dryRun"]
+    assert prepare(ev)["dryRun"] is True
+    env["store"].update_run("run-1", {"dryRun": False})
+    assert prepare(ev)["dryRun"] is False
+
+
+@pytest.mark.parametrize("recorded, given", [(True, False), (False, True), (False, "true"), (None, True)])
+def test_a_job_is_not_rerun_with_another_dry_run_flag_than_its_run(env, recorded, given):
+    """Run 11 finding 2: a dry re-run of a pinned job of a real run overwrote the run's JOB# record
+    with ok, and a post retry skips ok jobs. The flag of the input must match RUN#, or nothing runs."""
+    from shared.errors import JobNotInJobSet
+
+    env["store"].update_run("run-1", {"dryRun": recorded})
+    with pytest.raises(JobNotInJobSet, match="dry"):
+        prepare(event(pinned("pre", "create-tables"), dryRun=given))
+    listed = env["s3"].list_objects_v2(Bucket=BUCKET, Prefix="runs/").get("Contents") or []
+    assert listed == []  # no spec.json
+    assert env["store"].job_results("run-1") == []
 
 
 # --- the module's own jobs ---------------------------------------------------------------

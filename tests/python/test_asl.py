@@ -969,7 +969,7 @@ def test_skipped_job_does_not_run():
 
 
 def test_fargate_job_passes_command_and_env_and_reads_result():
-    run = run_job(job_mocks(spec(runtime="fargate")), {**JOB_INPUT, "dryRun": True})
+    run = run_job(job_mocks(spec(runtime="fargate", dryRun=True)), {**JOB_INPUT, "dryRun": True})
     assert run.status == "SUCCEEDED" and run.output["summary"] == {"rows": 10}
     args = run.called("RunFargateJob")[0]
     override = args["Overrides"]["ContainerOverrides"][0]
@@ -1021,6 +1021,53 @@ def test_fargate_without_result_file_fails():
     assert run.status == "FAILED" and "no result.json" in json.loads(run.cause)["message"]
 
 
+def _dry_flags(run: Any) -> dict[str, Any]:
+    flags: dict[str, Any] = {"record": run.called("RecordJob")[0]["Item"]["dryRun"]}
+    for c in run.called("RunFargateJob"):
+        env = {e["Name"]: e["Value"] for e in c["Overrides"]["ContainerOverrides"][0]["Environment"]}
+        flags["fargate"] = env["ORCH_DRY_RUN"]
+    for c in run.called("RunSsmJob"):
+        flags["ssm"] = c["Parameters"]["dryRun"]
+    return flags
+
+
+@pytest.mark.parametrize("runtime", ["lambda", "fargate", "ssm"])
+def test_the_job_runs_and_is_recorded_with_the_dry_run_flag_prepare_job_decided(runtime):
+    """Run 11 finding 2: the input's dryRun is the caller's; prepare_job takes it from RUN#."""
+    job_spec = spec(**(SSM_SPEC if runtime == "ssm" else {"runtime": runtime}), dryRun=False)
+    mocks = ssm_mocks(job_spec) if runtime == "ssm" else job_mocks(job_spec)
+    run = run_job(mocks, {**JOB_INPUT, "dryRun": True})
+    expected: dict[str, Any] = {"record": {"Bool": False}}
+    if runtime == "fargate":
+        expected["fargate"] = "0"
+    if runtime == "ssm":
+        expected["ssm"] = ["0"]
+    assert _dry_flags(run) == expected
+
+
+def test_a_refused_job_records_nothing():
+    run = run_job(job_mocks(spec(), PrepareJob=raises("JobNotInJobSet", "dryRun differs")))
+    assert (run.status, run.error) == ("FAILED", "JobFailed")
+    assert run.called("RecordJob") == [] and run.called("InvokeLambdaJob") == []
+
+
+def _job_dry_flags(node: Any) -> list[Any]:
+    """The dryRun of every job-runner input (an object with phase and dryRun) in a definition."""
+    if isinstance(node, list):
+        return [f for v in node for f in _job_dry_flags(v)]
+    if not isinstance(node, dict):
+        return []
+    own = [node["dryRun"]] if "dryRun" in node and "phase" in node else []
+    return own + [f for v in node.values() for f in _job_dry_flags(v)]
+
+
+def test_migrate_and_post_pass_the_dry_run_flag_of_the_run_to_every_job():
+    """No literal dryRun: prepare_job refuses a flag that is not the one on RUN#."""
+    for name in (MIGRATE, POST):
+        found = _job_dry_flags(render(name))
+        assert found and all(isinstance(v, str) and "$req.dryRun" in v for v in found), (name, found)
+
+
 # --- SSM Run Command runtime (runner instance from the team AMI) ---------------------
 
 SSM_SPEC = {"runtime": "ssm", "jobRoleArn": "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"}
@@ -1039,7 +1086,7 @@ def ssm_mocks(job_spec: dict[str, Any], **over: Any) -> dict[str, Any]:
 
 
 def test_ssm_job_sends_the_module_document_and_polls_until_terminal():
-    run = run_job(ssm_mocks(spec(**SSM_SPEC, timeoutSeconds=7200)), {**JOB_INPUT, "dryRun": True})
+    run = run_job(ssm_mocks(spec(**SSM_SPEC, timeoutSeconds=7200, dryRun=True)), {**JOB_INPUT, "dryRun": True})
     assert run.status == "SUCCEEDED" and run.output["summary"] == {"restored": 4}
     assert run.called("RunFargateJob") == [] and run.called("InvokeLambdaJob") == []
     assert run.called("FindSsmRunner")[0]["Filters"] == [{"Key": "PingStatus", "Values": ["Online"]}]

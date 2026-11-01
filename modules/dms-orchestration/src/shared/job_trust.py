@@ -11,7 +11,9 @@ job-runner too (``orch.py restore``). So prepare_job trusts none of it:
   (:mod:`shared.module_jobs`) with exactly its code;
 * the restore phase accepts only the two jobs ``orch.py restore`` builds, ``pg-restore-s3`` of a
   dump of that very task and the target check that records the restore baseline;
-* project, task, task ARN and connections come from the registration; a dry run stays dry.
+* project, task, task ARN and connections come from the registration; ``dryRun`` is the one on
+  ``RUN#``, an input that says otherwise is refused (a dry re-run cannot overwrite a real run's
+  ``JOB#`` record, a real re-run cannot write in a dry run).
 
 Anything else is ``JobNotInJobSet``; nothing has been written by then.
 """
@@ -163,6 +165,12 @@ def _run_phase(event: dict[str, Any], store: Store) -> dict[str, Any]:
         raise _refuse(
             f"run {run_id} is a run of {project}/{task}, not of {given.get('project')}/{given.get('taskKey')}"
         )
+    # The run's own flag: a dry re-run of a job of a real run would overwrite the run's JOB#
+    # record (a post retry skips ok jobs), a real re-run of a dry run's job would write.
+    dry_run = run.get("dryRun") is True
+    given_dry = event.get("dryRun")
+    if given_dry is not None and given_dry is not dry_run:
+        raise _refuse(f"dryRun {given_dry!r} is not the dryRun of run {run_id} ({dry_run})")
     reg = load_registration(str(project), str(task))
     job = event.get("job") or {}
     version = run.get("jobsVersion")
@@ -189,7 +197,6 @@ def _run_phase(event: dict[str, Any], store: Store) -> dict[str, Any]:
     }
     if not ctx["resetTables"]:
         ctx["resetTables"] = []
-    dry_run = bool(event.get("dryRun")) or bool(run.get("dryRun"))
     return {**event, "job": trusted, "ctx": ctx, "dryRun": dry_run}
 
 
