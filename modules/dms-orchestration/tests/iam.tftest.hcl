@@ -968,3 +968,43 @@ run "ssm_single_runner_form_is_refused" {
 
   expect_failures = [var.ssm]
 }
+
+# target_tags of one project that are a subset of another's select that project's instances too
+# (DescribeInstanceInformation ANDs the tag filters): refused, as equal tags are.
+run "ssm_runner_tags_that_are_a_subset_of_another_projects_are_refused" {
+  command = plan
+
+  variables {
+    projects = {
+      ledger = { tasks = { core = {} } }
+      cards  = { tasks = { extra = {} } }
+    }
+    ssm = {
+      enabled = true
+      runners = {
+        ledger = { target_tags = { Role = "dms-runner" }, instance_role_arn = "arn:aws:iam::111122223333:role/ledger-sql-bastion" }
+        cards  = { target_tags = { Role = "dms-runner", Project = "cards" }, instance_role_arn = "arn:aws:iam::111122223333:role/cards-sql-bastion" }
+      }
+    }
+  }
+
+  expect_failures = [var.ssm]
+}
+
+run "ssm_runner_tags_that_differ_in_a_value_plan" {
+  command = plan
+
+  variables {
+    projects = {
+      ledger = { tasks = { core = {} } }
+      cards  = { tasks = { extra = {} } }
+    }
+    ssm = {
+      enabled = true
+      runners = {
+        ledger = { target_tags = { Role = "dms-runner", Project = "ledger" }, instance_role_arn = "arn:aws:iam::111122223333:role/ledger-sql-bastion" }
+        cards  = { target_tags = { Role = "dms-runner", Project = "cards" }, instance_role_arn = "arn:aws:iam::111122223333:role/cards-sql-bastion" }
+      }
+    }
+  }
+}

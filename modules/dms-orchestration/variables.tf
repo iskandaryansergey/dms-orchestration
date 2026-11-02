@@ -491,6 +491,19 @@ variable "ssm" {
     error_message = "ssm.runners: no two projects may select the same instance (instance_ids) or the same target_tags."
   }
 
+  # Tag filters are ANDed: a project whose target_tags are a subset of another's would also
+  # select that project's instances. instance_ids against another project's tags cannot be
+  # checked here (docs/security.md).
+  validation {
+    condition = alltrue(flatten([
+      for a, ra in var.ssm.runners : [
+        for b, rb in var.ssm.runners : a == b || length(ra.target_tags) == 0 || length(rb.target_tags) == 0
+        || !alltrue([for k, v in ra.target_tags : try(rb.target_tags[k], null) == v])
+      ]
+    ]))
+    error_message = "ssm.runners: one project's target_tags must not be a subset of another project's (its tag filters would also match that project's runners)."
+  }
+
   validation {
     condition     = var.ssm.document_name_override == "" || can(regex("^[A-Za-z0-9_.-]{3,128}$", var.ssm.document_name_override))
     error_message = "ssm.document_name_override must be an SSM document name in this account (A-Z a-z 0-9 _ . -)."
