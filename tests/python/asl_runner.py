@@ -48,7 +48,11 @@ TEMPLATE_VALUES: dict[str, Any] = {
     "assign_public_ip": "DISABLED",
     "artifacts_bucket": "dms-orch-artifacts-test",
     "ssm_document_name": "dms-orch-test-orch-job",
-    "ssm_instance_filters_json": [{"Key": "PingStatus", "Values": ["Online"]}],
+    # One runner per project (ssm.runners): FindSsmRunner looks up the job's project.
+    "ssm_runner_filters_json": {
+        "ledger": [{"Key": "InstanceIds", "Values": ["i-0aaa"]}, {"Key": "PingStatus", "Values": ["Online"]}],
+        "cards": [{"Key": "tag:Migration", "Values": ["cards"]}, {"Key": "PingStatus", "Values": ["Online"]}],
+    },
     "jobs_log_group_name": "/dms-orch/test/jobs",
 }
 
@@ -63,7 +67,7 @@ def render(name: str, values: dict[str, Any] | None = None) -> dict[str, Any]:
         if key not in vals:
             raise KeyError(f"template variable {key} has no test value")
         value = vals[key]
-        return json.dumps(value) if isinstance(value, list) else str(value)
+        return json.dumps(value) if isinstance(value, (list, dict)) else str(value)
 
     return json.loads(re.sub(r"\$\{([a-z_]+)\}", sub, text))
 
@@ -252,7 +256,11 @@ class Interpreter:
         if state["Resource"].endswith(".waitForTaskToken"):
             self._token += 1
             sv = {**sv, "context": {**sv["context"], "Task": {"Token": f"token-{self._token}"}}}
-        args = self.evaluate(state.get("Arguments", {}), variables, sv)
+        try:
+            args = self.evaluate(state.get("Arguments", {}), variables, sv)
+        except jsonata.JException as err:
+            # Like Step Functions: a failing expression in Arguments is a catchable state error.
+            raise TaskError("States.QueryEvaluationError", str(err)) from err
         for key in ("TimeoutSeconds", "HeartbeatSeconds"):
             if key in state:
                 value = self.evaluate(state[key], variables, sv)

@@ -564,11 +564,16 @@ module "dms_orchestration" {
     folder   = module.dms.premigration_assessment.folder
   } : null
 
-  # ssm_runner.tf: long jobs (pg-dump, restore, e2e-ssm) on the runner instance.
+  # ssm_runner.tf: long jobs (pg-dump, restore, e2e-ssm) on the runner instance of the one
+  # sandbox project (ssm.runners: one runner per project, never shared).
   ssm = {
-    enabled           = var.ssm_runner
-    instance_ids      = aws_instance.ssm_runner[*].id
-    instance_role_arn = one(aws_iam_role.ssm_runner[*].arn)
+    enabled = var.ssm_runner
+    runners = var.ssm_runner ? {
+      ledger = {
+        instance_ids      = aws_instance.ssm_runner[*].id
+        instance_role_arn = aws_iam_role.ssm_runner[0].arn
+      }
+    } : {}
   }
 
   # sql_runner.tf: the image built by CodeBuild, when its tag is given.

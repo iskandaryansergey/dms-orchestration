@@ -65,11 +65,11 @@ locals {
           Action    = "sts:AssumeRole"
           },
           ], local.ssm_enabled ? [{
-            # SSM runtime: orch-job on a runner instance assumes the job role of the run's project
-            # (docs/security.md: every project trusts the same runner role).
+            # SSM runtime: orch-job on this project's runner instance assumes this job role; no
+            # other project's runner is trusted (ssm.runners: one per project, never shared).
             Sid       = "SsmRunnerInstances"
             Effect    = "Allow"
-            Principal = { AWS = var.ssm.instance_role_arn }
+            Principal = { AWS = var.ssm.runners[p].instance_role_arn }
             Action    = "sts:AssumeRole"
       }] : [])
     })

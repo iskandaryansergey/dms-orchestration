@@ -63,8 +63,8 @@ output "jobset_publisher_policy_json" {
 }
 
 output "ssm_runner_policy_json" {
-  description = "IAM policy for the instance profile role of the SSM runners (ssm.instance_role_arn), besides SSM management: read the runtime zip, assume the project job roles, write command output to the jobs log group. Not attached by the module. null when ssm.enabled is false."
-  value       = local.ssm_enabled ? jsonencode(local.ssm_runner_policy) : null
+  description = "IAM policy per project for the instance profile role of that project's SSM runner (ssm.runners[<project>].instance_role_arn; e.g. a dms-sql-bastion's additional_iam_policy_json), besides SSM management: read the runtime zip, assume that project's job role only, write command output to the jobs log group. Not attached by the module. Empty when ssm.enabled is false."
+  value       = local.ssm_enabled ? { for p, pol in local.ssm_runner_policies : p => jsonencode(pol) } : {}
 }
 
 output "ssm_document_content" {

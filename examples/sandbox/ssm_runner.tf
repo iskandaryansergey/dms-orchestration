@@ -43,12 +43,13 @@ resource "aws_iam_role_policy_attachment" "ssm_runner_core" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Runtime zip, the project job roles, command output: the module's contract for the profile.
+# Runtime zip, the ledger job role only, command output: the module's contract for the profile
+# of the ledger project's runner.
 resource "aws_iam_role_policy" "ssm_runner" {
   count  = var.ssm_runner ? 1 : 0
   name   = "dms-orchestration-runner"
   role   = aws_iam_role.ssm_runner[0].id
-  policy = module.dms_orchestration.ssm_runner_policy_json
+  policy = module.dms_orchestration.ssm_runner_policy_json["ledger"]
 }
 
 resource "aws_iam_instance_profile" "ssm_runner" {

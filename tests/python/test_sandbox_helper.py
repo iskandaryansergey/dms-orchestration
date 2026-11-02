@@ -262,7 +262,7 @@ def test_the_sandbox_runner_instance_is_a_stand_in_for_the_team_ami():
     assert 'var.runner_ami_id != "" ? var.runner_ami_id' in tf
     assert 'http_tokens = "required"' in tf and "associate_public_ip_address = false" in tf
     assert "encrypted = true" in tf
-    assert "module.dms_orchestration.ssm_runner_policy_json" in tf
+    assert 'module.dms_orchestration.ssm_runner_policy_json["ledger"]' in tf  # its project's policy only
     assert "AmazonSSMManagedInstanceCore" in tf
     variables = (SANDBOX / "variables.tf").read_text(encoding="utf-8")
     for name in ("ssm_runner", "runner_ami_id"):
@@ -272,6 +272,7 @@ def test_the_sandbox_runner_instance_is_a_stand_in_for_the_team_ami():
     )
     main = re.sub(r"\s+", " ", (SANDBOX / "main.tf").read_text(encoding="utf-8"))
     assert "enabled = var.ssm_runner" in main and "instance_ids = aws_instance.ssm_runner[*].id" in main
+    assert "runners = var.ssm_runner ? { ledger = {" in main  # one runner per project
     assert '"ec2messages", "ssmmessages"' in main  # agent endpoints from the network contract
 
 

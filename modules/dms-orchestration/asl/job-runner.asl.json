@@ -14,6 +14,7 @@
         "exitCode": 0,
         "ecsError": null,
         "ssmRunners": [],
+        "ssmRunnerFilters": ${ssm_runner_filters_json},
         "ssmInstanceId": null,
         "ssmCommandId": null,
         "ssmStatus": null,
@@ -78,9 +79,9 @@
     },
     "FindSsmRunner": {
       "Type": "Task",
-      "Comment": "Online runner instances among the configured ones (ssm.instance_ids or ssm.target_tags).",
+      "Comment": "Online runner instances of the job's project (ssm.runners[project]: instance_ids or target_tags), never another project's runner.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
-      "Arguments": { "Filters": ${ssm_instance_filters_json}, "MaxResults": 50 },
+      "Arguments": { "Filters": "{% $exists($lookup($ssmRunnerFilters, $spec.project)) ? $lookup($ssmRunnerFilters, $spec.project) : $error('no SSM runner for project ' & $string($spec.project) & ' (ssm.runners)') %}", "MaxResults": 50 },
       "TimeoutSeconds": 30,
       "Retry": [
         { "ErrorEquals": ["Ssm.SsmException", "Ssm.InternalServerErrorException"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2, "JitterStrategy": "FULL" }
@@ -108,7 +109,7 @@
           "Condition": "{% $count($ssmRunners) = 0 %}",
           "Next": "RecordJob",
           "Assign": {
-            "result": { "status": "fail", "message": "no SSM runner instance online (module variable ssm: instance_ids or target_tags)", "summary": {} }
+            "result": { "status": "fail", "message": "no SSM runner instance of the project online (module variable ssm.runners)", "summary": {} }
           }
         }
       ],

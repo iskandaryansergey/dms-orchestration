@@ -1,6 +1,7 @@
 ############################################
 # SSM Run Command runtime (runtime ssm, ADR 0011): long jobs on runner instances built from
-# the team AMI. The job-runner sends the module document to one online runner; the document
+# the team AMI, one runner per project (ssm.runners), never shared. The job-runner sends the
+# module document to one online runner of the job's project; the document
 # fetches the runtime zip from the artifacts bucket, checks its sha256 and runs orch-job as
 # ssm.runner_user with the project's job role (--assume-role). Nothing comes from the internet.
 ############################################
@@ -10,13 +11,15 @@ locals {
   ssm_document_name = coalesce(var.ssm.document_name_override, "${local.prefix}-orch-job")
   ssm_document_arn  = "arn:${local.partition}:ssm:${local.region}:${local.account_id}:document/${local.ssm_document_name}"
 
-  # DescribeInstanceInformation filters of the job-runner (FindSsmRunner): the configured runners
-  # that are online. All filters apply together.
-  ssm_instance_filters = concat(
-    length(var.ssm.instance_ids) > 0 ? [{ Key = "InstanceIds", Values = var.ssm.instance_ids }] : [],
-    [for k in sort(keys(var.ssm.target_tags)) : { Key = "tag:${k}", Values = [var.ssm.target_tags[k]] }],
-    [{ Key = "PingStatus", Values = ["Online"] }],
-  )
+  # DescribeInstanceInformation filters of the job-runner (FindSsmRunner), per project: that
+  # project's runner instances that are online. All filters of a project apply together.
+  ssm_instance_filters = {
+    for p, r in var.ssm.runners : p => concat(
+      length(r.instance_ids) > 0 ? [{ Key = "InstanceIds", Values = r.instance_ids }] : [],
+      [for k in sort(keys(r.target_tags)) : { Key = "tag:${k}", Values = [r.target_tags[k]] }],
+      [{ Key = "PingStatus", Values = ["Online"] }],
+    ) if local.ssm_enabled
+  }
 
   # Runtime zip: src/jobs/sql-runner without the Dockerfile, plus the shared modules the image
   # copies (tests/python/test_sql_runner.py keeps both lists equal). Code for the AMI's python3.
@@ -76,39 +79,43 @@ locals {
     }]
   }
 
-  # Not attached: what the runner instance profile needs besides SSM management
-  # (AmazonSSMManagedInstanceCore or the platform's equivalent).
-  ssm_runner_policy = {
-    Version = "2012-10-17"
-    Statement = concat([
-      {
-        Sid      = "ReadRuntime"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject"]
-        Resource = ["${local.bucket_arn}/runtime/*"]
-      },
-      {
-        # orch-job assumes the job role of the run's project; secrets, specs and results are
-        # reachable only through it.
-        Sid      = "AssumeProjectJobRoles"
-        Effect   = "Allow"
-        Action   = ["sts:AssumeRole"]
-        Resource = values(local.job_role_arns)
-      },
-      {
-        # Command output (SendCommand CloudWatchOutputConfig) into the jobs log group.
-        Sid      = "CommandOutput"
-        Effect   = "Allow"
-        Action   = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
-        Resource = ["${local.jobs_log_group_arn}:*"]
-      },
-      {
-        Sid      = "FindLogGroup"
-        Effect   = "Allow"
-        Action   = ["logs:DescribeLogGroups"]
-        Resource = "*"
-      },
-    ], local.kms_statements)
+  # Not attached: what each project's runner instance profile needs besides SSM management
+  # (AmazonSSMManagedInstanceCore or the platform's equivalent). Keyed by project like the job
+  # roles and built from names only, not from ssm.runners: a runner module can take its
+  # project's policy as an input (additional_iam_policy_json) without a dependency cycle.
+  ssm_runner_policies = {
+    for p in keys(local.projects) : p => {
+      Version = "2012-10-17"
+      Statement = concat([
+        {
+          Sid      = "ReadRuntime"
+          Effect   = "Allow"
+          Action   = ["s3:GetObject"]
+          Resource = ["${local.bucket_arn}/runtime/*"]
+        },
+        {
+          # orch-job assumes this project's job role and no other: secrets, specs and results
+          # are reachable only through it.
+          Sid      = "AssumeProjectJobRole"
+          Effect   = "Allow"
+          Action   = ["sts:AssumeRole"]
+          Resource = [local.job_role_arns[p]]
+        },
+        {
+          # Command output (SendCommand CloudWatchOutputConfig) into the jobs log group.
+          Sid      = "CommandOutput"
+          Effect   = "Allow"
+          Action   = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
+          Resource = ["${local.jobs_log_group_arn}:*"]
+        },
+        {
+          Sid      = "FindLogGroup"
+          Effect   = "Allow"
+          Action   = ["logs:DescribeLogGroups"]
+          Resource = "*"
+        },
+      ], local.kms_statements)
+    }
   }
 }
 
