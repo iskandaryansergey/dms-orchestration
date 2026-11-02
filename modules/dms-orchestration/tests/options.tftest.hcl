@@ -255,6 +255,13 @@ run "ssm_runtime_with_a_platform_document" {
     error_message = "the content to register names the uploaded runtime zip and the runner user"
   }
 
+  # An SSM Command document holds at most 64 KB; the content embeds orch_aws.py, so keep a margin
+  # (bytes of the UTF-8 content: base64 length * 3 / 4).
+  assert {
+    condition     = length(base64encode(output.ssm_document_content)) * 3 / 4 <= 56 * 1024
+    error_message = "the SSM document content must stay under 56 KiB (limit 64 KB): trim orch_aws.py or the script"
+  }
+
   assert {
     condition     = aws_s3_object.ssm_runtime[0].server_side_encryption == "aws:kms" && aws_s3_object.ssm_runtime[0].kms_key_id == var.kms_key_arn
     error_message = "the runtime zip is encrypted with the CMK"
