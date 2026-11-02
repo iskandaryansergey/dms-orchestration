@@ -374,3 +374,56 @@ def test_e2e_has_the_planned_scenarios_by_name_only(name):
     text = E2E.read_text(encoding="utf-8")
     assert f"e2e.py {name} " in text and f'scenarios["{name}"] = ' in text
     assert f'"{name}": ' not in text.split("names = argv or list(scenarios)")[0].split("def main")[-1]
+
+
+def crlf_platform(monkeypatch):
+    """Text-mode writes without an explicit newline get CRLF, as on Windows, on any host."""
+    real_open = Path.open
+
+    def open_like_windows(self, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
+        if "b" not in mode and any(m in mode for m in "wax+") and newline is None:
+            newline = "\r\n"
+        return real_open(self, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", open_like_windows)
+
+
+SYNCED_TEMPLATES = sorted(p.name for p in (SANDBOX / "jobs").glob("jobset*.yaml.tmpl"))
+
+
+@pytest.mark.parametrize("template", SYNCED_TEMPLATES)
+def test_sync_jobs_uploads_the_same_bytes_on_every_platform(template, monkeypatch):
+    # The bundle total covers every byte of jobset.yaml; CRLF on one host would make the pinned
+    # totals (main.tf jobs.bundles) host specific and every other host's runs JobSetTampered.
+    crlf_platform(monkeypatch)
+    uploaded: dict[str, bytes] = {}
+
+    class S3:
+        def upload_file(self, path, bucket, key):
+            assert bucket == "bkt"
+            uploaded[key.split("/", 3)[3]] = Path(path).read_bytes()
+
+    class Session:
+        def client(self, name):
+            assert name == "s3"
+            return S3()
+
+    monkeypatch.setattr(sandbox, "session", lambda out: Session())
+    arn = "arn:aws:lambda:us-east-1:000000000000:function:dms-orch-sbx-sql"
+    sandbox.cmd_sync_jobs({"sql_lambda_arn": arn, "artifacts_bucket": "bkt"}, template, "v")
+    source = (SANDBOX / "jobs" / template).read_bytes().replace(b"__SQL_LAMBDA_ARN__", arn.encode())
+    assert uploaded["jobset.yaml"] == source
+    assert {"jobset.yaml", "jobset.json", "bundle.sha256"} <= set(uploaded)
+    assert not [k for k, v in uploaded.items() if b"\r" in v]
+
+
+def test_jobset_tool_build_adds_no_platform_newlines(tmp_path, monkeypatch):
+    import jobset_tool
+
+    crlf_platform(monkeypatch)
+    bundle, out = SANDBOX.parent / "jobs" / "minimal", tmp_path / "built"
+    assert not [p for p in bundle.rglob("*") if p.is_file() and b"\r" in p.read_bytes()]
+    assert jobset_tool.build(bundle, out) == 0
+    built = {p.relative_to(out).as_posix(): p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    assert {"jobset.yaml", "jobset.json", "bundle.sha256"} <= set(built)
+    assert not [k for k, v in built.items() if b"\r" in v]
