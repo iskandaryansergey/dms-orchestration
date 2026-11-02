@@ -13,6 +13,9 @@ observed AWS behaviour behind the fixes is in [docs/dms-observations.md](docs/dm
   `summary.tables` (new, absent before): the number of tables the server truncated. Without the server's record (only possible with
   `--on-error continue`) the job ends `warn`.
 - `truncateScope` (Lambda) also carries `skippedTables` in the summary next to `skippedMissing`.
+- Sandbox: `sandbox.py sync-jobs` writes the rendered `jobset.yaml` as bytes (LF on every
+  host); on Windows it got CRLF, so the bundle totals pinned in `examples/sandbox/main.tf` held
+  only for the host that pinned them. The seven e2e totals are re-pinned over LF output.
 - Documentation: the 0.1.0 entry and `docs/security.md` no longer say that every post retry skips
   the post jobs already `ok`; only the ones before `--from-job` are skipped.
 
