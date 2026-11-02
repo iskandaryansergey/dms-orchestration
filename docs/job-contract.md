@@ -298,7 +298,8 @@ Entry point `orch_job.py` runs your `command` in the bundle directory.
 | `ORCH_DRY_RUN` | `1` in dry runs: **change nothing**, print what you would do |
 | `ORCH_RUN_ID`, `ORCH_PHASE`, `ORCH_JOB_NAME`, `ORCH_ATTEMPT` | run info |
 
-Tools: `psql` 17, `mysql`, `python3` (+ boto3), `bash`, `pwsh`, and
+Tools: `psql` 17, `mysql`, `python3` (+ boto3 in the Fargate image only; on an SSM runner the
+standard library), `bash`, `pwsh`, and
 `psql-run` / `mysql-run`:
 
 ```
