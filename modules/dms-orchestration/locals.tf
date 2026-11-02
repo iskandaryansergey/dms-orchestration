@@ -14,7 +14,7 @@ locals {
   projects = local.create ? var.projects : {}
 
   tags = merge(var.tags, {
-    ManagedBy              = "terraform"
+    ManagedBy              = "Terraform"
     Module                 = "dms-orchestration"
     "dms-orch:module"      = "dms-orchestration"
     "dms-orch:environment" = var.environment

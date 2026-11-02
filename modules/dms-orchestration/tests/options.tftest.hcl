@@ -119,7 +119,7 @@ run "customer_managed_key" {
   }
 
   assert {
-    condition     = length(jsondecode(output.kms_key_policy_statements)) == 3 && length(jsondecode(output.kms_key_policy_requirements)) == 4
+    condition     = length(jsondecode(output.kms_key_policy_statements)) == 3 && length(output.kms_key_policy_requirements) == 4
     error_message = "key policy requirements are published"
   }
 
