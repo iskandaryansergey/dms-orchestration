@@ -4,6 +4,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions: SemV
 first production run). Commit references name the commit that made or fixed the item; the
 observed AWS behaviour behind the fixes is in [docs/dms-observations.md](docs/dms-observations.md).
 
+## [Unreleased]
+
+### Fixed
+- `psql-run --truncate-scope` (PostgreSQL, SSM and Fargate runtimes) puts the skipped tables in
+  the job result, not only in the NOTICE of the job log: the message names them and the summary
+  carries `skippedMissing` and `skippedTables` (up to 10 names); `summary.tables` counts the tables
+  the server truncated, not the reset list. Without the server's record (only possible with
+  `--on-error continue`) the job ends `warn`.
+- `truncateScope` (Lambda) also carries `skippedTables` in the summary next to `skippedMissing`.
+- Documentation: the 0.1.0 entry and `docs/security.md` no longer say that every post retry skips
+  the post jobs already `ok`; only the ones before `--from-job` are skipped.
+
 ## [0.2.0] — 2026-10-30
 
 Hardening of 0.1.0 and new job runtimes. Upgrading needs care: every breaking change is marked
