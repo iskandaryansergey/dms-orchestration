@@ -237,7 +237,8 @@ The first release.
   attached to the project's job role; a token per psql start, only in `PGPASSWORD`, TLS required.
   DMS and the Data API keep their secrets.
 - Repeat of post: `orch.py post <runId> [--from-job] [--jobs-version]` asks DMS for the outcome
-  again, takes the lock and skips the post jobs already `ok`.
+  again, takes the lock and skips the post jobs before `--from-job` that are already `ok`;
+  without `--from-job` every post job runs again.
 - SNS message attributes `environment, project, taskKey, status, phase, severity` on every
   notification, so subscriptions of the platform topic filter without parsing; `table_name` and
   `artifacts_bucket_name` bring state from a long-lived workspace; checks
