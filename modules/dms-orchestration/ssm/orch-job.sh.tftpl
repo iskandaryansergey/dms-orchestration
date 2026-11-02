@@ -2,6 +2,8 @@
 # orch-job on an SSM runner instance (document ${document_name}); SSM runs this as root.
 # Fetch the runtime zip from the artifacts bucket, check its sha256, run orch_job.py as
 # ${runner_user} with the project's job role. Nothing is downloaded from the internet.
+# The AMI's python3 has the standard library only (no boto3, no AWS CLI): orch_aws.py, written
+# from this document, signs the download with the instance profile's credentials (IMDSv2).
 set -euo pipefail
 umask 077
 runner_user='${runner_user}'
@@ -12,12 +14,14 @@ export AWS_REGION='${region}' AWS_DEFAULT_REGION='${region}' AWS_STS_REGIONAL_EN
 for tool in python3 sha256sum runuser; do
   command -v "$tool" >/dev/null || { echo "orch: $tool is missing on the runner instance (team AMI)"; exit 96; }
 done
-python3 -c 'import boto3' 2>/dev/null || { echo "orch: python3 on the runner instance has no boto3 (team AMI)"; exit 96; }
 id -u "$runner_user" >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin "$runner_user"
 base=$(mktemp -d /var/tmp/orch-job.XXXXXXXX)
 trap 'rm -rf "$base"' EXIT
 chmod 0711 "$base"
-python3 -c 'import sys, boto3; boto3.client("s3").download_file(sys.argv[1], sys.argv[2], sys.argv[3])' "$bucket" "$runtime_key" "$base/runtime.zip"
+cat > "$base/orch_aws.py" <<'ORCH_AWS_PY'
+${orch_aws_py}
+ORCH_AWS_PY
+python3 -I "$base/orch_aws.py" s3-download "$bucket" "$runtime_key" "$base/runtime.zip" || { echo "orch: cannot read s3://$bucket/$runtime_key with the instance profile"; exit 98; }
 echo "$runtime_sha256  $base/runtime.zip" | sha256sum --check --status || { echo "orch: s3://$bucket/$runtime_key does not match its sha256"; exit 97; }
 mkdir -m 0755 "$base/rt"
 python3 -m zipfile -e "$base/runtime.zip" "$base/rt"

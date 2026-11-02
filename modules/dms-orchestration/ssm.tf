@@ -74,6 +74,8 @@ locals {
           environment    = var.environment
           dump_kms_key   = var.kms_key_arn
           log_group      = local.jobs_log_group_name
+          # Fetches the runtime zip before the zip is there (the same file is in the zip).
+          orch_aws_py = trimspace(file("${local.ssm_runtime_dir}/orch_aws.py"))
         })))
       }
     }]

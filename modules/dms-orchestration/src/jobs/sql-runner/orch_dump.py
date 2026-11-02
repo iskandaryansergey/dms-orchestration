@@ -106,9 +106,9 @@ def _pg_env(conn: dict[str, Any]) -> dict[str, str]:
 
 
 def _s3() -> Any:
-    import boto3
+    import orch_aws  # standard library only: the runner AMI has no boto3
 
-    return boto3.client("s3")
+    return orch_aws.client("s3")
 
 
 def _result(status: str, message: str, **summary: Any) -> None:

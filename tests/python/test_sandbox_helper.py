@@ -264,6 +264,7 @@ def test_the_sandbox_runner_instance_is_a_stand_in_for_the_team_ami():
     assert "encrypted = true" in tf
     assert 'module.dms_orchestration.ssm_runner_policy_json["ledger"]' in tf  # its project's policy only
     assert "AmazonSSMManagedInstanceCore" in tf
+    assert "python3-boto3" not in tf  # the runtime needs python3 with the standard library only
     variables = (SANDBOX / "variables.tf").read_text(encoding="utf-8")
     for name in ("ssm_runner", "runner_ami_id"):
         assert f'variable "{name}"' in variables

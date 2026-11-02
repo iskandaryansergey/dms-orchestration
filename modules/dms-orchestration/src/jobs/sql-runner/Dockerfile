@@ -67,7 +67,7 @@ RUN pip install --no-cache-dir --require-hashes --only-binary=:all: --index-url 
 
 COPY modules/dms-orchestration/src/shared/__init__.py modules/dms-orchestration/src/shared/expr.py modules/dms-orchestration/src/shared/preflight.py modules/dms-orchestration/src/shared/fingerprint.py modules/dms-orchestration/src/shared/bundle.py modules/dms-orchestration/src/shared/errors.py /opt/orch/shared/
 COPY modules/dms-orchestration/src/jobs/sql-runner/orch_job.py modules/dms-orchestration/src/jobs/sql-runner/orch_sql.py modules/dms-orchestration/src/jobs/sql-runner/orch_dump.py \
-     modules/dms-orchestration/src/jobs/sql-runner/orch_verify.py /opt/orch/
+     modules/dms-orchestration/src/jobs/sql-runner/orch_verify.py modules/dms-orchestration/src/jobs/sql-runner/orch_aws.py /opt/orch/
 COPY modules/dms-orchestration/src/jobs/sql-runner/bin/ /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/psql-run /usr/local/bin/mysql-run /usr/local/bin/orch-job \
       /usr/local/bin/pg-dump-s3 /usr/local/bin/pg-restore-s3 /usr/local/bin/verify-target \

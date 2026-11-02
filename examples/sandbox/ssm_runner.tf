@@ -4,7 +4,8 @@
 #
 # The target platform builds it from the team AMI (var.runner_ami_id). Without one the
 # sandbox takes the latest Amazon Linux 2023 as a stand-in and installs the PostgreSQL client
-# and boto3 at boot from the AL2023 repository (served from S3: the S3 gateway endpoint).
+# at boot from the AL2023 repository (served from S3: the S3 gateway endpoint). No boto3: the
+# runtime needs python3 with the standard library only, like the team AMI.
 # No public IP, IMDSv2 only, the jobs security group (443 to the endpoints, 5432 to Aurora).
 # Everything here goes with `terraform destroy`.
 ############################################
@@ -20,7 +21,7 @@ locals {
   ssm_runner_user_data = var.runner_ami_id != "" ? null : <<-EOT
     #!/bin/bash
     set -euo pipefail
-    dnf install -y "postgresql${split(".", var.aurora_engine_version)[0]}" python3-boto3
+    dnf install -y "postgresql${split(".", var.aurora_engine_version)[0]}"
   EOT
 }
 

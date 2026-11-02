@@ -800,6 +800,20 @@ run "ssm_runtime_least_privilege" {
   }
 
   assert {
+    condition = alltrue([
+      !strcontains(aws_ssm_document.orch_job[0].content, "import boto3"),
+      strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "python3 -I \"$base/orch_aws.py\" s3-download"),
+      strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "def generate_db_auth_token"),
+    ])
+    error_message = "the runner needs python3 with the standard library only: the document carries orch_aws.py and fetches the runtime zip with it"
+  }
+
+  assert {
+    condition     = length(aws_ssm_document.orch_job[0].content) < 64000
+    error_message = "an SSM Command document holds at most 64 KB"
+  }
+
+  assert {
     condition     = strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "runuser -u \"$runner_user\"") && strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "runner_user='orch'")
     error_message = "the job runs as ssm.runner_user, not as root"
   }
