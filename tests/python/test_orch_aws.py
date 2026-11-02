@@ -287,11 +287,13 @@ def s3_client(t: FakeTransport) -> orch_aws.S3:
 def test_s3_urls_virtual_hosted_path_style_for_dotted_buckets_and_the_endpoint_override(monkeypatch):
     monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
     s3 = s3_client(FakeTransport([]))
-    assert s3._url("b-1", "a b/x.sql") == "https://b-1.s3.eu-west-2.amazonaws.com/a%20b/x.sql"
-    assert s3._url("b.1", "k") == "https://s3.eu-west-2.amazonaws.com/b.1/k"
-    assert orch_aws.S3("cn-north-1", lambda: CREDS)._url("b", "k") == "https://b.s3.cn-north-1.amazonaws.com.cn/k"
+    assert s3._url("bkt-1", "a b/x.sql") == "https://bkt-1.s3.eu-west-2.amazonaws.com/a%20b/x.sql"
+    assert s3._url("bkt.1", "k") == "https://s3.eu-west-2.amazonaws.com/bkt.1/k"
+    assert orch_aws.S3("cn-north-1", lambda: CREDS)._url("bkt", "k") == "https://bkt.s3.cn-north-1.amazonaws.com.cn/k"
     monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "https://bucket.vpce-1.s3.eu-west-2.vpce.amazonaws.com/")
-    assert s3_client(FakeTransport([]))._url("b", "k") == "https://bucket.vpce-1.s3.eu-west-2.vpce.amazonaws.com/b/k"
+    assert (
+        s3_client(FakeTransport([]))._url("bkt", "k") == "https://bucket.vpce-1.s3.eu-west-2.vpce.amazonaws.com/bkt/k"
+    )
 
 
 def test_s3_list_pages_until_the_listing_is_complete():
@@ -313,16 +315,16 @@ def test_s3_list_pages_until_the_listing_is_complete():
             {},
         )
 
-    s3 = s3_client(FakeTransport([("GET", "https://b.s3.eu-west-2.amazonaws.com/?", page)]))
-    pages = list(s3.get_paginator("list_objects_v2").paginate(Bucket="b", Prefix="jobs/"))
+    s3 = s3_client(FakeTransport([("GET", "https://bkt.s3.eu-west-2.amazonaws.com/?", page)]))
+    pages = list(s3.get_paginator("list_objects_v2").paginate(Bucket="bkt", Prefix="jobs/"))
     assert [o["Key"] for p in pages for o in p["Contents"]] == ["jobs/a.sql", "jobs/b.sql"]
 
 
 def test_s3_errors_carry_the_botocore_shape(pauses):
     missing = (404, "<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>", {})
-    s3 = s3_client(FakeTransport([("GET", "https://b.s3", missing)]))
+    s3 = s3_client(FakeTransport([("GET", "https://bkt.s3", missing)]))
     with pytest.raises(orch_aws.ClientError) as err:
-        s3.get_object(Bucket="b", Key="k")
+        s3.get_object(Bucket="bkt", Key="k")
     assert err.value.response["Error"]["Code"] == "NoSuchKey"
     assert err.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
@@ -338,22 +340,22 @@ def test_s3_multipart_upload_with_kms():
         [
             (
                 "POST",
-                "https://b.s3.eu-west-2.amazonaws.com/d/t.dump?uploads",
+                "https://bkt.s3.eu-west-2.amazonaws.com/d/t.dump?uploads",
                 (200, "<R><UploadId>u1</UploadId></R>", {}),
             ),
             (
                 "PUT",
-                "https://b.s3.eu-west-2.amazonaws.com/d/t.dump?partNumber=1&uploadId=u1",
+                "https://bkt.s3.eu-west-2.amazonaws.com/d/t.dump?partNumber=1&uploadId=u1",
                 (200, "", {"etag": '"e1"'}),
             ),
-            ("POST", "https://b.s3.eu-west-2.amazonaws.com/d/t.dump?uploadId=u1", finish),
+            ("POST", "https://bkt.s3.eu-west-2.amazonaws.com/d/t.dump?uploadId=u1", finish),
         ]
     )
     s3 = s3_client(t)
-    up = s3.create_multipart_upload(Bucket="b", Key="d/t.dump", ServerSideEncryption="aws:kms", SSEKMSKeyId="k-1")
-    etag = s3.upload_part(Bucket="b", Key="d/t.dump", UploadId=up["UploadId"], PartNumber=1, Body=b"data")["ETag"]
+    up = s3.create_multipart_upload(Bucket="bkt", Key="d/t.dump", ServerSideEncryption="aws:kms", SSEKMSKeyId="k-1")
+    etag = s3.upload_part(Bucket="bkt", Key="d/t.dump", UploadId=up["UploadId"], PartNumber=1, Body=b"data")["ETag"]
     s3.complete_multipart_upload(
-        Bucket="b", Key="d/t.dump", UploadId="u1", MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": etag}]}
+        Bucket="bkt", Key="d/t.dump", UploadId="u1", MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": etag}]}
     )
     assert t.calls[0]["headers"]["x-amz-server-side-encryption"] == "aws:kms"
     assert t.calls[0]["headers"]["x-amz-server-side-encryption-aws-kms-key-id"] == "k-1"
@@ -365,9 +367,9 @@ def test_s3_multipart_upload_with_kms():
 
 def test_s3_complete_multipart_upload_error_inside_a_200_is_an_error(pauses):
     err_doc = (200, "<Error><Code>InternalError</Code><Message>retry</Message></Error>", {})
-    s3 = s3_client(FakeTransport([("POST", "https://b.s3", err_doc)]))
+    s3 = s3_client(FakeTransport([("POST", "https://bkt.s3", err_doc)]))
     with pytest.raises(orch_aws.ClientError, match="InternalError"):
-        s3.complete_multipart_upload(Bucket="b", Key="k", UploadId="u", MultipartUpload={"Parts": []})
+        s3.complete_multipart_upload(Bucket="bkt", Key="k", UploadId="u", MultipartUpload={"Parts": []})
 
 
 def test_plain_http_is_refused_except_for_metadata_and_this_host():
@@ -497,7 +499,7 @@ def xml_error(status: int, code: str) -> tuple[int, str, dict[str, str]]:
 def test_transient_failures_are_retried(failure, pauses):
     t = Flaky([failure, failure])
     s3 = s3_client(t)
-    assert s3.put_object(Bucket="b", Key="k", Body=b"payload") == {"ETag": ""}
+    assert s3.put_object(Bucket="bkt", Key="k", Body=b"payload") == {"ETag": ""}
     assert len(t.calls) == 3 and len(pauses) == 2
     assert all(c["body"] == b"payload" for c in t.calls)  # the same bytes every attempt
 
@@ -505,7 +507,7 @@ def test_transient_failures_are_retried(failure, pauses):
 def test_retries_stop_after_five_attempts_with_growing_jittered_backoff(pauses):
     t = Flaky([xml_error(503, "SlowDown")] * 10)
     with pytest.raises(orch_aws.ClientError, match="SlowDown"):
-        s3_client(t).get_object(Bucket="b", Key="k")
+        s3_client(t).get_object(Bucket="bkt", Key="k")
     assert len(t.calls) == 5 and len(pauses) == 4
     for i, p in enumerate(pauses):
         assert 0 <= p <= orch_aws.RETRY_BASE_SECONDS * 2**i
@@ -514,7 +516,7 @@ def test_retries_stop_after_five_attempts_with_growing_jittered_backoff(pauses):
 def test_a_network_error_on_the_last_attempt_is_raised(pauses):
     t = Flaky([ConnectionResetError(104, "reset")] * 5)
     with pytest.raises(ConnectionResetError):
-        s3_client(t).get_object(Bucket="b", Key="k")
+        s3_client(t).get_object(Bucket="bkt", Key="k")
     assert len(t.calls) == 5
 
 
@@ -531,7 +533,7 @@ def test_a_network_error_on_the_last_attempt_is_raised(pauses):
 def test_other_client_errors_are_not_retried(failure, pauses):
     t = Flaky([failure])
     with pytest.raises(orch_aws.ClientError):
-        s3_client(t).get_object(Bucket="b", Key="k")
+        s3_client(t).get_object(Bucket="bkt", Key="k")
     assert len(t.calls) == 1 and pauses == []
 
 
@@ -540,7 +542,7 @@ def test_a_certificate_failure_is_not_retried(pauses):
 
     t = Flaky([orch_aws.urllib.error.URLError(ssl.SSLCertVerificationError("bad cert"))] * 5)
     with pytest.raises(orch_aws.urllib.error.URLError):
-        s3_client(t).get_object(Bucket="b", Key="k")
+        s3_client(t).get_object(Bucket="bkt", Key="k")
     assert len(t.calls) == 1
 
 
@@ -552,7 +554,7 @@ def test_each_attempt_is_signed_again_with_fresh_credentials(pauses):
         return orch_aws.Credentials(issued[-1], "s")
 
     t = Flaky([xml_error(500, "InternalError")])
-    orch_aws.S3("eu-west-2", provider, t).get_object(Bucket="b", Key="k")
+    orch_aws.S3("eu-west-2", provider, t).get_object(Bucket="bkt", Key="k")
     assert issued == ["AKID0", "AKID1"]
     assert "Credential=AKID0/" in t.calls[0]["headers"]["Authorization"]
     assert "Credential=AKID1/" in t.calls[1]["headers"]["Authorization"]
@@ -563,14 +565,14 @@ def test_each_attempt_gets_a_fresh_signing_time(pauses, monkeypatch):
     clock = iter([NOW, NOW + dt.timedelta(seconds=7)])
     monkeypatch.setattr(orch_aws, "utcnow", lambda: next(clock))
     t = Flaky([xml_error(500, "InternalError")])
-    s3_client(t).get_object(Bucket="b", Key="k")
+    s3_client(t).get_object(Bucket="bkt", Key="k")
     assert [c["headers"]["X-Amz-Date"] for c in t.calls] == ["20261102T103000Z", "20261102T103007Z"]
 
 
 def test_a_body_that_is_not_bytes_is_sent_once(pauses):
     t = Flaky([xml_error(503, "SlowDown")])
     with pytest.raises(orch_aws.ClientError):
-        s3_client(t).request("PutObject", "PUT", "https://b.s3.eu-west-2.amazonaws.com/k", {}, bytearray(b"x"))
+        s3_client(t).request("PutObject", "PUT", "https://bkt.s3.eu-west-2.amazonaws.com/k", {}, bytearray(b"x"))
     assert len(t.calls) == 1 and pauses == []
 
 
@@ -579,5 +581,57 @@ def test_complete_multipart_upload_error_inside_a_200_is_retried(pauses):
         [(200, "<Error><Code>InternalError</Code><Message>retry</Message></Error>", {})],
         ok=(200, "<CompleteMultipartUploadResult><ETag>x</ETag></CompleteMultipartUploadResult>", {}),
     )
-    s3_client(t).complete_multipart_upload(Bucket="b", Key="k", UploadId="u", MultipartUpload={"Parts": []})
+    s3_client(t).complete_multipart_upload(Bucket="bkt", Key="k", UploadId="u", MultipartUpload={"Parts": []})
     assert len(t.calls) == 2 and len(pauses) == 1
+
+
+# --- names spliced into the endpoint host ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "region",
+    ["eu-west-2", "us-east-1", "cn-north-1", "us-gov-west-1", "us-iso-east-1", "us-isob-east-1", "ap-southeast-4"],
+)
+def test_real_regions_are_accepted(region):
+    assert orch_aws.S3(region, lambda: CREDS).region == region
+
+
+@pytest.mark.parametrize(
+    "region",
+    ["", "eu-west", "EU-WEST-2", "eu-west-2.evil.example", "evil.example/x", "eu-west-2#", "eu-west-2 ", "e-west-2"],
+)
+def test_a_region_that_is_not_a_region_name_is_refused(region):
+    for make in (orch_aws.S3, orch_aws.SecretsManager, orch_aws.Sts):
+        with pytest.raises(ValueError, match="region"):
+            make(region, lambda: CREDS)
+
+
+@pytest.mark.parametrize("bucket", ["abc", "bucket-1", "my.bucket.name", "a" * 63, "0bucket9"])
+def test_real_bucket_names_are_accepted(bucket, monkeypatch):
+    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+    assert bucket in s3_client(FakeTransport([]))._url(bucket, "k")
+
+
+@pytest.mark.parametrize(
+    "bucket",
+    [
+        "",
+        "ab",
+        "a" * 64,
+        "Bucket",
+        "-bucket",
+        "bucket-",
+        "evil.example/x",
+        "b@evil.example",
+        "b:443",
+        "b#",
+        "b?x",
+        "b b",
+    ],
+)
+def test_a_bucket_that_is_not_a_bucket_name_is_refused(bucket, monkeypatch):
+    for endpoint in ("", "https://s3.example.vpce.amazonaws.com"):
+        monkeypatch.setenv("AWS_ENDPOINT_URL_S3", endpoint)
+        s3 = s3_client(FakeTransport([]))
+        with pytest.raises(ValueError, match="bucket"):
+            s3.get_object(Bucket=bucket, Key="k")

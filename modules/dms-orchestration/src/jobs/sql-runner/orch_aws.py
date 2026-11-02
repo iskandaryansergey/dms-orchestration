@@ -37,6 +37,7 @@ import hmac
 import json
 import os
 import random
+import re
 import ssl
 import sys
 import threading
@@ -64,6 +65,9 @@ SERVICES = {"s3": "S3", "sts": "STS", "secretsmanager": "SECRETS_MANAGER"}
 RETRY_ATTEMPTS = 5
 RETRY_BASE_SECONDS = 0.5
 RETRY_MAX_SECONDS = 20.0
+# Names spliced into an endpoint host (no other host, port, path or userinfo can come in).
+BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+REGION_NAME = re.compile(r"[a-z]{2}(-gov|-iso[a-z]*)?-[a-z]+-[0-9]+")
 RETRY_CODES = frozenset({"SlowDown", "Throttling", "ThrottlingException", "RequestTimeout", "RequestLimitExceeded"})
 
 
@@ -432,6 +436,8 @@ class Client:
     def __init__(
         self, service: str, region: str, credentials: Callable[[], Credentials], transport: Transport | None = None
     ):
+        if not REGION_NAME.fullmatch(region):
+            raise ValueError(f"not an AWS region name: {region!r}")
         self.service, self.region, self._credentials, self._transport = service, region, credentials, transport
         self.endpoint = os.environ.get(f"AWS_ENDPOINT_URL_{SERVICES.get(service, service.upper())}", "").rstrip("/")
         suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
@@ -538,6 +544,8 @@ class S3(Client):
         super().__init__("s3", region, credentials, transport)
 
     def _url(self, bucket: str, key: str = "", query: dict[str, str] | None = None) -> str:
+        if not BUCKET_NAME.fullmatch(bucket):
+            raise ValueError(f"not an S3 bucket name: {bucket!r}")
         path = "/" + _quote(key, safe="-_.~/") if key else "/"
         if self.endpoint:
             base = f"{self.endpoint}/{bucket}"
