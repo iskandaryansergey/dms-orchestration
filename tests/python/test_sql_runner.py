@@ -142,12 +142,63 @@ def test_psql_run_truncate_scope_skips_tables_missing_on_the_target(sql_env):
     runner = Runner()
     assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 0
     sql = Path(runner.calls[0][0][-1]).read_text()
-    assert sql.startswith("DO $orch$") and sql.rstrip().endswith("$orch$;")
+    assert sql.startswith("DO $orch$") and "\nEND\n$orch$;\n" in sql
     assert """listed text[] := ARRAY['"app"."a"', '"app"."b"'];""" in sql
     assert "to_regclass(t) IS NOT NULL" in sql and "to_regclass(t) IS NULL" in sql
     assert "RAISE NOTICE 'psql-run: skipped % table(s) missing on the target: %'" in sql
     assert "IF present IS NOT NULL THEN" in sql and "EXECUTE 'TRUNCATE TABLE ' || present || '';" in sql
     assert 'TRUNCATE TABLE "app"' not in sql  # no static TRUNCATE that fails on a missing table
+
+
+class ServerRunner(Runner):
+    """psql stand-in for --truncate-scope: writes what the server-side SELECT sends to ``\\o``."""
+
+    def __init__(self, answer: str, code: int = 0):
+        super().__init__(code)
+        self.answer = answer
+
+    def __call__(self, argv: list[str], env: dict[str, str], check: bool) -> Any:
+        sql = Path(argv[-1]).read_text()
+        (target,) = re.findall(r"^\\o '([^']+)'$", sql, re.M)
+        Path(target).write_text(self.answer + "\n")
+        return super().__call__(argv, env, check)
+
+
+def test_psql_run_truncate_scope_result_carries_the_skipped_tables_and_the_truncated_count(sql_env):
+    """SSM/Fargate: the skipped tables reach the job message and summary, not only the NOTICE in
+    the log, and `tables` counts what the server truncated, not the reset list."""
+    _scope_spec(sql_env, [f"app.t{i:02d}" for i in range(14)], 14)
+    missing = [f'"app"."t{i:02d}"' for i in range(1, 13)]
+    runner = ServerRunner(json.dumps({"truncated": 2, "missing": missing}))
+    assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 0
+    sql = Path(runner.calls[0][0][-1]).read_text()
+    assert "set_config('orch.truncate_result'" in sql and "current_setting('orch.truncate_result', true)" in sql
+    result = json.loads((sql_env / "out" / "result.json").read_text())
+    assert result["status"] == "ok"
+    summary = result["summary"]
+    assert summary["tables"] == 2 and summary["skippedMissing"] == 12
+    assert summary["skippedTables"] == [f"app.t{i:02d}" for i in range(1, 11)]
+    assert "truncated 2 table(s); skipped 12 table(s) missing on the target: app.t01, " in result["message"]
+    assert result["message"].endswith("app.t10 and 2 more")
+
+
+def test_psql_run_truncate_scope_with_nothing_missing_counts_the_truncated(sql_env):
+    _scope_spec(sql_env, ["app.a", "app.b"], 2)
+    runner = ServerRunner(json.dumps({"truncated": 2, "missing": None}))
+    assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 0
+    result = json.loads((sql_env / "out" / "result.json").read_text())
+    assert result["status"] == "ok" and result["summary"]["tables"] == 2
+    assert "skippedMissing" not in result["summary"] and "truncated 2 table(s)" in result["message"]
+
+
+def test_psql_run_truncate_scope_without_a_server_result_is_a_warning(sql_env):
+    """--on-error continue past a failed TRUNCATE: psql exits 0, the server set no result."""
+    _scope_spec(sql_env, ["app.a"], 1)
+    runner = ServerRunner("")
+    assert orch_sql.main(["--connection", "target", "--truncate-scope", "--on-error", "continue"], runner=runner) == 0
+    result = json.loads((sql_env / "out" / "result.json").read_text())
+    assert result["status"] == "warn" and "no truncate result" in result["message"]
+    assert "tables" not in result["summary"]
 
 
 def test_psql_run_truncate_keeps_the_given_list_as_is(sql_env):
