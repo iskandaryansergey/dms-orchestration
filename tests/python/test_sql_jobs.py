@@ -806,6 +806,7 @@ def test_truncate_scope_skips_tables_missing_on_the_target(pg, env):
     out = _run(spec)
     assert out["status"] == "ok", out
     assert out["summary"]["tables"] == 2 and out["summary"]["skippedMissing"] == 1
+    assert out["summary"]["skippedTables"] == ["app.b"]
     assert "app.b" in out["message"] and "missing on the target" in out["message"]
     check, trunc = pg.calls
     assert check["params"]["names"] == ['"app"."a"', '"app"."b"', '"app"."c"']
@@ -821,8 +822,25 @@ def test_truncate_scope_with_every_table_missing_truncates_nothing(pg, env):
         "dryRun": False,
         "tables": 0,
         "skippedMissing": 2,
+        "skippedTables": ["app.a", "app.b"],
     }
     assert len(pg.calls) == 1  # the check only, no TRUNCATE
+
+
+def test_truncate_scope_result_names_the_skipped_tables_and_counts_only_the_truncated(pg, env):
+    """The job result, not only the message text, carries the skipped tables (at most
+    MISSING_LISTED names, the count is full) and `tables` counts only what was truncated."""
+    names = [f"app.t{i:02d}" for i in range(14)]
+    pg.answers = {"to_regclass": [{"missing": f'"app"."t{i:02d}"'} for i in range(1, 13)]}
+    spec = _prepare(_sql_job({"truncateScope": True}, name="truncate"), phase="reset", ctx=_ctx(resetTables=names))
+    out = _run(spec)
+    assert out["status"] == "ok", out
+    summary = out["summary"]
+    assert summary["tables"] == 2 and summary["skippedMissing"] == 12
+    assert summary["skippedTables"] == [f"app.t{i:02d}" for i in range(1, 11)]
+    assert out["message"].startswith("truncated 2 table(s); skipped 12 table(s) missing on the target: app.t01, ")
+    assert out["message"].endswith("app.t10 and 2 more")
+    assert pg.calls[1]["sql"] == 'TRUNCATE TABLE "app"."t00", "app"."t13"'
 
 
 def test_single_transaction_wraps_every_file_and_rolls_back_on_error(pg, env):
