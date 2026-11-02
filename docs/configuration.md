@@ -23,7 +23,7 @@ The module follows the conventions of a shared modules registry:
   `https_egress_gateway_endpoints` (both `true`) open 443 to the VPC CIDR and to the S3/DynamoDB
   gateway prefix lists; `https_egress_cidr_blocks` and `https_egress_prefix_list_ids` add more.
   `lambda.reserved_concurrency = -1` means unreserved.
-- Every resource is tagged `ManagedBy = "terraform"` and `Module = "dms-orchestration"`, besides
+- Every resource is tagged `ManagedBy = "Terraform"` and `Module = "dms-orchestration"`, besides
   `dms-orch:module`, `dms-orch:environment` and the caller's `tags`.
 
 `modules/artifacts-bucket` follows the same conventions (`create`, `kms_key_arn = ""`,
@@ -125,14 +125,19 @@ sandbox).
   object lock for them. `modules/artifacts-bucket` creates a bucket with all five controls for a
   long-lived workspace; pass its `bucket_name` output as `artifacts_bucket_name`.
 - `kms_key_policy_requirements`: what a customer managed key must allow when `kms_key_arn` is
-  set, as the KMS key policy contract v2: a JSON list of items
-  `{sid, principals = {services, arns, roles}, actions, conditions, purpose}`. `roles` are
-  symbolic and resolved by the key module: `deployer` (the identity that applies this module:
-  it creates the encrypted resources) and `module` (the module's roles, whose ARNs are in
-  `arns`). The module does not manage the key policy.
-- `kms_key_policy_statements`: the same requirements as key policy statements (v1: `Sid`,
-  `Principal`, `Action`, `Condition`), concrete principals only, for a key policy written by
-  hand. Both are `"[]"` without `kms_key_arn`.
+  set, as the KMS key policy contract v2 in the shape the shared `kms` module compiles: a list
+  (not a JSON string) of items `{key, sid, principals = {services, arns, roles}, actions,
+  conditions, purpose}`. `key` is the CMK ARN (`kms_key_arn`) the item applies to; `conditions`
+  is a list of `{test, variable, values}` (`StringEquals` on `aws:SourceAccount` for the service
+  principals, on `kms:CallerAccount` for the deployer), `[]` when there are none. The only
+  symbolic role is `deployer` (the identity that applies this module: it creates the encrypted
+  resources), which the key module resolves to its deployers; the module's own roles and the
+  project job roles are listed by ARN in `arns`. Pass it whole:
+  `consumers = { dms = module.dms_orchestration.kms_key_policy_requirements }`. `[]` without
+  `kms_key_arn`. The module does not manage the key policy.
+- `kms_key_policy_statements`: the same requirements as key policy statements (v1 JSON: `Sid`,
+  `Principal`, `Action`, `Condition` with one block per test, values as lists), concrete
+  principals only, for a key policy written by hand. `"[]"` without `kms_key_arn`.
 - `operator_policy_json`: IAM policy for the operator role (CLI or CI): start, watch and stop
   runs, read reports, take the task lock for `orch.py restore`. It cannot upload job sets. Not
   attached by the module.
@@ -216,8 +221,8 @@ sandbox).
 | <a name="output_ecs_cluster_arn"></a> [ecs\_cluster\_arn](#output\_ecs\_cluster\_arn) | ECS cluster used for Fargate jobs (the module's or fargate.cluster\_arn). null when fargate.images is empty: Fargate is an optional runtime. |
 | <a name="output_jobs_security_group_id"></a> [jobs\_security\_group\_id](#output\_jobs\_security\_group\_id) | Security group of Lambda and Fargate jobs. Add it to the Aurora ingress rules (upstream aurora module: ingress\_rules.referenced\_security\_group\_id). |
 | <a name="output_jobset_publisher_policy_json"></a> [jobset\_publisher\_policy\_json](#output\_jobset\_publisher\_policy\_json) | IAM policy per project for whoever publishes that project's job sets (scripts/sync-jobs.sh): write and list jobs/<project>/ only. Not attached by the module. |
-| <a name="output_kms_key_policy_requirements"></a> [kms\_key\_policy\_requirements](#output\_kms\_key\_policy\_requirements) | KMS key policy contract v2 (JSON list) when kms\_key\_arn is set: one item per need with sid, principals {services, arns, roles}, actions, conditions and purpose; roles are symbolic (deployer, module). The module does not manage the key policy. |
-| <a name="output_kms_key_policy_statements"></a> [kms\_key\_policy\_statements](#output\_kms\_key\_policy\_statements) | The same requirements as key policy statements (v1: Sid, Principal, Action, Condition) with concrete principals only; the deployer item of the v2 contract is left out. |
+| <a name="output_kms_key_policy_requirements"></a> [kms\_key\_policy\_requirements](#output\_kms\_key\_policy\_requirements) | KMS key policy contract v2 as a list (pass it whole to the kms module: consumers = { dms = module.<name>.kms\_key\_policy\_requirements }); [] without kms\_key\_arn. One item per need: key (the CMK ARN), sid, principals {services, arns, roles}, actions, conditions [{test, variable, values}] and purpose. The only role is deployer (the identity that applies this module); the module's roles are listed in arns. The module does not manage the key policy. |
+| <a name="output_kms_key_policy_statements"></a> [kms\_key\_policy\_statements](#output\_kms\_key\_policy\_statements) | The same requirements as key policy statements (v1 JSON: Sid, Principal, Action, Condition) with concrete principals only; the deployer item of the v2 contract is left out. |
 | <a name="output_lambda_function_arns"></a> [lambda\_function\_arns](#output\_lambda\_function\_arns) | Lambda functions of the module. |
 | <a name="output_network_contract"></a> [network\_contract](#output\_network\_contract) | What the network must provide. The module creates no VPC endpoints (owned by the landing zone). |
 | <a name="output_operator_policy_json"></a> [operator\_policy\_json](#output\_operator\_policy\_json) | IAM policy for the operator role (CLI / CI): start, watch and stop runs, read reports, restore under the task lock. No job set uploads (jobset\_publisher\_policy\_json). Not attached by the module. |

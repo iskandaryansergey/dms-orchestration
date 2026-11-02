@@ -102,7 +102,7 @@ run "create_false_creates_nothing" {
       output.table_name == null, output.table_arn == null, output.artifacts_bucket == null, output.sns_topic_arn == null,
       output.jobs_security_group_id == null, output.ecs_cluster_arn == null, output.operator_policy_json == null,
       output.ssm_runner_policy_json == null, output.ssm_document_content == null, output.ssm_document_name == null,
-      output.kms_key_policy_requirements == "[]", output.kms_key_policy_statements == "[]",
+      length(output.kms_key_policy_requirements) == 0, output.kms_key_policy_statements == "[]",
       output.bucket_requirements == null, output.network_contract == null,
       output.run_request_example == null, length(output.verify_commands) == 0,
     ])
@@ -186,15 +186,18 @@ run "managed_by_and_module_tags" {
 
   assert {
     condition = alltrue([for t in [aws_dynamodb_table.this[0].tags, aws_iam_role.migrate[0].tags, aws_sfn_state_machine.job_runner[0].tags, aws_iam_role.job["ledger"].tags] :
-      t["ManagedBy"] == "terraform" && t["Module"] == "dms-orchestration" && t["dms-orch:module"] == "dms-orchestration" && t["CostCentre"] == "dms"
+      t["ManagedBy"] == "Terraform" && t["Module"] == "dms-orchestration" && t["dms-orch:module"] == "dms-orchestration" && t["CostCentre"] == "dms"
     ])
-    error_message = "every resource carries ManagedBy = terraform and Module = dms-orchestration besides the dms-orch:* tags"
+    error_message = "every resource carries ManagedBy = Terraform and Module = dms-orchestration besides the dms-orch:* tags"
   }
 }
 
-# KMS key policy contract v2: one item per need, principals by kind, symbolic roles the key
-# module resolves (deployer = the identity that applies this module, module = the module's
-# roles listed in arns). kms_key_policy_statements keeps the v1 statement list.
+# KMS key policy contract v2 as the shared kms module reads it (its variable consumers, output
+# contract_schema): a list of items {key, sid, principals {services, arns, roles}, actions,
+# conditions = [{test, variable, values}], purpose}. The only role is the built-in deployer;
+# the module's roles are listed as ARNs. The assertions below repeat the kms module's parser
+# rules (consumer_readable, machine, rejected, malformed, unresolved roles), so an item that
+# passes here compiles there. kms_key_policy_statements keeps the v1 statement list.
 run "kms_contract_v2_shape" {
   command = apply
 
@@ -203,34 +206,63 @@ run "kms_contract_v2_shape" {
   }
 
   assert {
-    condition = alltrue([for item in jsondecode(output.kms_key_policy_requirements) :
-      toset(keys(item)) == toset(["sid", "principals", "actions", "conditions", "purpose"])
+    condition     = can(concat(output.kms_key_policy_requirements, [])) && length(output.kms_key_policy_requirements) == 4
+    error_message = "kms_key_policy_requirements is a list (not a JSON string): consumers = { dms = module.x.kms_key_policy_requirements }"
+  }
+
+  assert {
+    condition = alltrue([for item in output.kms_key_policy_requirements :
+      toset(keys(item)) == toset(["key", "sid", "principals", "actions", "conditions", "purpose"])
       && toset(keys(item.principals)) == toset(["services", "arns", "roles"])
-      && length(item.actions) > 0 && item.purpose != ""
-      && alltrue([for r in item.principals.roles : contains(["deployer", "module"], r)])
+      && item.key == "arn:aws:kms:eu-west-2:111122223333:key/11111111-2222-3333-4444-555555555555"
+      && can(regex("^[A-Za-z0-9]+$", item.sid)) && item.purpose != ""
+      && length(item.actions) > 0
     ])
-    error_message = "every v2 item has sid, principals {services, arns, roles}, actions, conditions and purpose"
+    error_message = "every item names its key and has sid, principals {services, arns, roles}, actions, conditions and purpose"
+  }
+
+  assert {
+    condition = alltrue(flatten([for item in output.kms_key_policy_requirements : concat(
+      [for a in item.principals.arns : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/[^*?]+|user/[^*?]+)$", a))],
+      [for v in item.principals.services : can(regex("^[a-z0-9.-]+\\.amazonaws\\.com(\\.cn)?$", v))],
+      [for a in item.actions : can(regex("^kms:[A-Za-z]+\\*?$", a))],
+      [for r in item.principals.roles : r == "deployer"],
+      [length(item.principals.services) + length(item.principals.arns) + length(item.principals.roles) > 0],
+    )]))
+    error_message = "principals are IAM ARNs, service principals or the built-in deployer role; actions are kms: actions"
+  }
+
+  assert {
+    condition = alltrue([for item in output.kms_key_policy_requirements :
+      can(concat(item.conditions, []))
+      && alltrue([for c in item.conditions : toset(keys(c)) == toset(["test", "variable", "values"]) && c.test != "" && c.variable != "" && length(c.values) > 0])
+      && length(item.conditions) == length(distinct([for c in item.conditions : "${c.test}|${c.variable}"]))
+    ])
+    error_message = "conditions are a list of {test, variable, values} with values, each test and key once"
   }
 
   assert {
     condition = alltrue([
-      contains(one([for i in jsondecode(output.kms_key_policy_requirements) : i.principals.arns if i.sid == "ModuleRoles"]), "arn:aws:iam::111122223333:role/dms-orch-dev-job-ledger"),
-      one([for i in jsondecode(output.kms_key_policy_requirements) : i.principals.roles if i.sid == "ModuleRoles"]) == ["module"],
-      contains(one([for i in jsondecode(output.kms_key_policy_requirements) : i.principals.services if i.sid == "EventsToEncryptedQueueAndScheduler"]), "cloudwatch.amazonaws.com"),
-      one([for i in jsondecode(output.kms_key_policy_requirements) : i.conditions if i.sid == "StepFunctionsAndLogs"]).StringEquals["aws:SourceAccount"] == "111122223333",
-      one([for i in jsondecode(output.kms_key_policy_requirements) : i.principals.roles if i.sid == "Deployer"]) == ["deployer"],
+      contains(one([for i in output.kms_key_policy_requirements : i.principals.arns if i.sid == "ModuleRoles"]), "arn:aws:iam::111122223333:role/dms-orch-dev-job-ledger"),
+      length(one([for i in output.kms_key_policy_requirements : i.principals.roles if i.sid == "ModuleRoles"])) == 0,
+      contains(one([for i in output.kms_key_policy_requirements : i.principals.services if i.sid == "EventsToEncryptedQueueAndScheduler"]), "cloudwatch.amazonaws.com"),
+      jsonencode(one([for i in output.kms_key_policy_requirements : i.conditions if i.sid == "StepFunctionsAndLogs"])) == jsonencode([{ test = "StringEquals", variable = "aws:SourceAccount", values = ["111122223333"] }]),
+      jsonencode(one([for i in output.kms_key_policy_requirements : i.principals.roles if i.sid == "Deployer"])) == jsonencode(["deployer"]),
+      jsonencode(one([for i in output.kms_key_policy_requirements : i.conditions if i.sid == "Deployer"])) == jsonencode([{ test = "StringEquals", variable = "kms:CallerAccount", values = ["111122223333"] }]),
+      length(one([for i in output.kms_key_policy_requirements : i.conditions if i.sid == "ModuleRoles"])) == 0,
     ])
-    error_message = "v2 carries the module role ARNs, the service principals, the source account condition and the deployer"
+    error_message = "v2 carries the module role ARNs, the service principals, the account conditions and the deployer"
   }
 
   assert {
     condition = alltrue([
-      [for st in jsondecode(output.kms_key_policy_statements) : st.Sid] == [for i in jsondecode(output.kms_key_policy_requirements) : i.sid if length(i.principals.roles) == 0 || length(i.principals.arns) > 0],
+      [for st in jsondecode(output.kms_key_policy_statements) : st.Sid] == [for i in output.kms_key_policy_requirements : i.sid if length(i.principals.services) + length(i.principals.arns) > 0],
       contains(one([for st in jsondecode(output.kms_key_policy_statements) : st.Principal.AWS if st.Sid == "ModuleRoles"]), "arn:aws:iam::111122223333:role/dms-orch-dev-job-ledger"),
       contains(one([for st in jsondecode(output.kms_key_policy_statements) : st.Principal.Service if st.Sid == "EventsToEncryptedQueueAndScheduler"]), "cloudwatch.amazonaws.com"),
-      one([for st in jsondecode(output.kms_key_policy_statements) : st.Condition if st.Sid == "StepFunctionsAndLogs"]).StringEquals["aws:SourceAccount"] == "111122223333",
+      jsonencode(one([for st in jsondecode(output.kms_key_policy_statements) : st.Condition if st.Sid == "StepFunctionsAndLogs"])) == jsonencode({ StringEquals = { "aws:SourceAccount" = ["111122223333"] } }),
+      !can(one([for st in jsondecode(output.kms_key_policy_statements) : st.Condition if st.Sid == "ModuleRoles"])),
     ])
-    error_message = "kms_key_policy_statements is the v1 list (Sid, Principal, Action, Condition) built from the same items"
+    error_message = "kms_key_policy_statements is the v1 list (Sid, Principal, Action, Condition by test) built from the same items"
   }
 }
 
@@ -238,7 +270,7 @@ run "kms_contract_empty_without_a_cmk" {
   command = plan
 
   assert {
-    condition     = output.kms_key_policy_requirements == "[]" && output.kms_key_policy_statements == "[]"
+    condition     = length(output.kms_key_policy_requirements) == 0 && output.kms_key_policy_statements == "[]"
     error_message = "without kms_key_arn there are no key policy requirements"
   }
 }
