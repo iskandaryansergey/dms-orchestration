@@ -53,6 +53,11 @@ from xml.etree import ElementTree  # noqa: S405 - responses of AWS endpoints ove
 
 IMDS = "http://169.254.169.254"
 ECS_CREDENTIALS_HOST = "http://169.254.170.2"
+# Plain http goes only to these exact hosts: the link-local metadata endpoints (IMDS, ECS and
+# EKS pod identity container credentials) and this host (local test servers).
+METADATA_HOSTS = frozenset({"169.254.169.254", "169.254.170.2", "169.254.170.23"})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+CONTAINER_HOSTS = frozenset({"169.254.170.2", "169.254.170.23", "127.0.0.1"})
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 REFRESH_BEFORE_SECONDS = 300
 TIMEOUT_SECONDS = 60
@@ -115,16 +120,29 @@ _AWS_OPENER = urllib.request.build_opener(_NoRedirect)
 _LOCAL_OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 
+def endpoint_kind(url: str) -> str:
+    """``metadata``, ``loopback`` (plain http to an exact allowed host) or ``aws`` (https);
+    ValueError for anything else: another scheme, plain http elsewhere, userinfo, no host."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if host and "@" not in parts.netloc:
+        if parts.scheme == "https":
+            return "aws"
+        if parts.scheme == "http" and host in METADATA_HOSTS:
+            return "metadata"
+        if parts.scheme == "http" and host in LOOPBACK_HOSTS:
+            return "loopback"
+    raise ValueError(f"refusing endpoint {parts.scheme}://{host or '?'}: https, or plain http to a metadata host")
+
+
 def http_send(method: str, url: str, headers: dict[str, str], body: bytes | None = None) -> Response:
     """One HTTP request. Error statuses are returned, not raised; network errors raise OSError."""
-    local = url.startswith((IMDS, ECS_CREDENTIALS_HOST))
-    # Plain http only to the link-local metadata endpoints and to this host (local test servers).
-    if not url.startswith(("https://", "http://127.0.0.1:", "http://localhost:")) and not local:
-        raise ValueError(f"refusing a plain http AWS endpoint: {url.split('?')[0]}")
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)  # noqa: S310 - https or link-local
-    opener = _LOCAL_OPENER if local else _AWS_OPENER
+    kind = endpoint_kind(url)
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)  # noqa: S310 - checked above
+    # Metadata and this host: never through a proxy (the request may carry a credentials token).
+    opener = _AWS_OPENER if kind == "aws" else _LOCAL_OPENER
     try:
-        resp = opener.open(req, timeout=5 if local else TIMEOUT_SECONDS)
+        resp = opener.open(req, timeout=5 if kind == "metadata" else TIMEOUT_SECONDS)
     except urllib.error.HTTPError as err:
         return Response(err.code, {k.lower(): v for k, v in err.headers.items()}, err)
     return Response(resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp)
@@ -253,7 +271,9 @@ def container_credentials(transport: Transport | None = None) -> Credentials | N
     full = os.environ.get("AWS_CONTAINER_CREDENTIALS_FULL_URI")
     if relative:
         url = ECS_CREDENTIALS_HOST + relative
-    elif full and full.startswith(("http://169.254.170.2", "http://169.254.170.23", "http://127.0.0.1")):
+        if not relative.startswith("/") or urllib.parse.urlsplit(url).netloc != "169.254.170.2":
+            raise CredentialError("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI is not a path on the ECS host")
+    elif full and _container_host(full):
         url = full
     else:
         return None
@@ -269,6 +289,11 @@ def container_credentials(transport: Transport | None = None) -> Credentials | N
     data = json.loads(got.body.read())
     expires = _parse_time(data["Expiration"]) if data.get("Expiration") else None
     return Credentials(data["AccessKeyId"], data["SecretAccessKey"], data.get("Token"), expires)
+
+
+def _container_host(url: str) -> bool:
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme == "http" and "@" not in parts.netloc and parts.hostname in CONTAINER_HOSTS
 
 
 def env_credentials() -> Credentials | None:

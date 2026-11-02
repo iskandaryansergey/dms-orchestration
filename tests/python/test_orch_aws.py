@@ -635,3 +635,81 @@ def test_a_bucket_that_is_not_a_bucket_name_is_refused(bucket, monkeypatch):
         s3 = s3_client(FakeTransport([]))
         with pytest.raises(ValueError, match="bucket"):
             s3.get_object(Bucket=bucket, Key="k")
+
+
+# --- plain http only to the exact metadata and loopback hosts --------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,kind",
+    [
+        ("http://169.254.169.254/latest/api/token", "metadata"),
+        ("http://169.254.170.2/v2/credentials/x", "metadata"),
+        ("http://169.254.170.23/v1/credentials", "metadata"),
+        ("http://127.0.0.1:8080/b/k", "loopback"),
+        ("http://localhost:4566/b/k", "loopback"),
+        ("https://bkt.s3.eu-west-2.amazonaws.com/k", "aws"),
+        ("https://127.0.0.1:8443/b/k", "aws"),
+    ],
+)
+def test_endpoint_kinds(url, kind):
+    assert orch_aws.endpoint_kind(url) == kind
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254.evil.example/latest/api/token",
+        "http://169.254.170.2.evil.example/v2/credentials/x",
+        "http://169.254.170.23.evil.example/creds",
+        "http://169.254.169.254@evil.example/",
+        "http://169.254.170.2:80@evil.example/x",
+        "http://127.0.0.1:80@evil.example/",
+        "http://127.0.0.10/",
+        "http://localhost.evil.example:4566/",
+        "http://s3.eu-west-2.amazonaws.com/b/k",
+        "https://user:pw@bkt.s3.eu-west-2.amazonaws.com/k",
+        "ftp://169.254.169.254/",
+        "file:///etc/passwd",
+        "https:///nohost",
+    ],
+)
+def test_lookalike_metadata_and_loopback_hosts_are_refused(url):
+    with pytest.raises(ValueError):
+        orch_aws.http_send("GET", url, {})
+
+
+@pytest.mark.parametrize(
+    "full_uri",
+    [
+        "http://169.254.170.23.evil.example/creds",
+        "http://169.254.170.2@evil.example/creds",
+        "http://127.0.0.1.evil.example/creds",
+        "http://127.0.0.1:1@evil.example/creds",
+        "https://evil.example/creds",
+    ],
+)
+def test_a_container_credentials_uri_on_another_host_is_ignored(full_uri, monkeypatch):
+    monkeypatch.delenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", raising=False)
+    monkeypatch.setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", full_uri)
+    t = FakeTransport([])
+    assert orch_aws.container_credentials(t) is None
+    assert t.calls == []
+
+
+@pytest.mark.parametrize("full_uri", ["http://169.254.170.23/v1/credentials", "http://127.0.0.1:51679/creds"])
+def test_a_container_credentials_uri_on_an_allowed_host_is_used(full_uri, monkeypatch):
+    monkeypatch.delenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", raising=False)
+    monkeypatch.setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", full_uri)
+    task = {"AccessKeyId": "ASIATASK", "SecretAccessKey": "s", "Token": "t"}
+    t = FakeTransport([("GET", full_uri, (200, json.dumps(task), {}))])
+    assert orch_aws.container_credentials(t).access_key == "ASIATASK"
+
+
+@pytest.mark.parametrize("relative", ["@evil.example/creds", ".evil.example/creds", ":80@evil.example/x", "creds"])
+def test_a_relative_container_uri_cannot_move_off_the_ecs_host(relative, monkeypatch):
+    monkeypatch.setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", relative)
+    t = FakeTransport([])
+    with pytest.raises(orch_aws.CredentialError):
+        orch_aws.container_credentials(t)
+    assert t.calls == []
