@@ -1029,3 +1029,32 @@ def test_ssm_runtime_code_runs_on_the_python3_of_the_ami():
         assert not re.search(r"from datetime import [^\n]*\bUTC\b|datetime\.UTC", text), path.name
         if re.search(r"\w+ \| None|list\[|dict\[", text):
             assert "from __future__ import annotations" in text, path.name
+
+
+def _dollar_body(sql: str) -> tuple[str, str]:
+    (tag,) = re.findall(r"^DO (\$[A-Za-z0-9_]*\$)\n", sql, re.M)
+    body, rest = sql.split(tag + "\n", 1)[1].split("\n" + tag + ";\n", 1)
+    return tag, body
+
+
+def test_truncate_existing_sql_normal_names_use_the_plain_tag():
+    tag, body = _dollar_body(orch_sql.truncate_existing_sql(["app.a", "app.b"]))
+    assert tag == "$orch$" and '\'"app"."a"\'' in body and tag not in body
+
+
+@pytest.mark.parametrize("name", ["app.a$orch$b", "a$orch$b", "x$orch_1$.y$orch$"])
+def test_truncate_existing_sql_dollar_tag_never_occurs_in_the_body(name):
+    """`$` is a valid identifier character: a name holding the tag must not end the DO block."""
+    sql = orch_sql.truncate_existing_sql([name], cascade=True)
+    tag, body = _dollar_body(sql)
+    assert tag not in body
+    assert sql.count(tag) == 2 and orch_sql.quote_table(name, "postgresql").replace("'", "''") in body
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_psql_run_truncate_scope_bool_count_is_no_server_result(sql_env, value):
+    _scope_spec(sql_env, ["app.a"], 1)
+    runner = ServerRunner(json.dumps({"truncated": value, "missing": None}))
+    assert orch_sql.main(["--connection", "target", "--truncate-scope"], runner=runner) == 0
+    result = json.loads((sql_env / "out" / "result.json").read_text())
+    assert result["status"] == "warn" and "tables" not in result["summary"]

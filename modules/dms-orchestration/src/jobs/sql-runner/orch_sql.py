@@ -90,9 +90,8 @@ def truncate_existing_sql(tables: list[str], cascade: bool = False, result_path:
         return ""
     listed = ", ".join(sql_literal(quote_table(t, "postgresql"), "postgresql") for t in tables)
     tail = " CASCADE" if cascade else ""
-    sql = (
-        "DO $orch$\n"  # noqa: S608 - names checked by quote_table, passed as literals
-        "DECLARE\n"
+    body = (
+        "DECLARE\n"  # noqa: S608 - names checked by quote_table, passed as literals
         f"  listed text[] := ARRAY[{listed}];\n"
         "  present text;\n"
         "  present_count int;\n"
@@ -115,9 +114,14 @@ def truncate_existing_sql(tables: list[str], cascade: bool = False, result_path:
         "  END IF;\n"
         f"  PERFORM set_config('{TRUNCATE_RESULT_SETTING}',\n"
         "    json_build_object('truncated', present_count, 'missing', missing_list)::text, false);\n"
-        "END\n"
-        "$orch$;\n"
+        "END"
     )
+    # `$` is valid in an identifier: pick a dollar-quote tag the body does not hold.
+    tag, n = "$orch$", 0
+    while tag in body:
+        n += 1
+        tag = f"$orch_{n}$"
+    sql = f"DO {tag}\n{body}\n{tag};\n"
     if result_path is None:
         return sql
     target = result_path.as_posix()
@@ -142,7 +146,11 @@ def truncate_result(path: Path, tables: list[str]) -> tuple[str, str, dict[str, 
         record = json.loads(text) if text else None
     except (OSError, ValueError):
         record = None
-    if not isinstance(record, dict) or not isinstance(record.get("truncated"), int):
+    if (
+        not isinstance(record, dict)
+        or not isinstance(record.get("truncated"), int)
+        or isinstance(record["truncated"], bool)
+    ):
         return "warn", "no truncate result from the server (see the job log)", {}
     by_quoted = {quote_table(t, "postgresql"): t for t in tables}
     names = [by_quoted.get(str(q), str(q)) for q in record.get("missing") or []]
