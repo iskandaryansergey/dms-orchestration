@@ -419,7 +419,7 @@ variable "ssm" {
     project): every project needs one when enabled, and no two projects share an instance role
     or an instance. Select a runner's instances with instance_ids or target_tags (one of the
     two); instance_role_arn is the role of its instance profile: only that project's job role
-    trusts it (output ssm_runner_policy_json[<project>] lists what it needs). The 0.2 single
+    trusts it (output ssm_runner_policy_json, key <project>, lists what it needs). The 0.2 single
     runner (instance_ids, target_tags, instance_role_arn at the top level) is refused: move it
     under runners. document_name_override names an existing document (content in output
     ssm_document_content) instead of the module's <name>-<environment>-orch-job. runner_user
@@ -435,7 +435,7 @@ variable "ssm" {
     })), {})
     document_name_override = optional(string, "")
     runner_user            = optional(string, "orch")
-    # Removed in 0.3 (one runner per project): kept only to refuse them with a clear error.
+    # removed (one runner per project): only to refuse them with a clear error
     instance_ids      = optional(list(string), [])
     target_tags       = optional(map(string), {})
     instance_role_arn = optional(string, "")
