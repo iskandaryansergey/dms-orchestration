@@ -522,9 +522,22 @@ module "dms_orchestration" {
                 iam_policy_arn = try(module.aurora["target"].iam_database_auth.users[local.iam_user].policy_arn, "")
               }
           } : k => v if var.iam_auth })
-          # The e2e job sets are rebuilt per run (sandbox.py sync-jobs), so they are not pinned;
-          # runs still check every file against the bundle.sha256 uploaded with them.
-          jobs = { default_version = "e2e", allow_unpinned = true }
+          # The e2e job sets are pinned: totals of jobset_tool.py build over the templates as
+          # sandbox.py sync-jobs renders them (SQL Lambda ARN of the account, line endings of the
+          # host that syncs). A template change needs new totals here; other versions are refused.
+          jobs = {
+            default_version = "e2e"
+            allow_unpinned  = false
+            bundles = {
+              "e2e"          = "5f609b088112ec02220f3c2c248e433face746169973cd4e17d2bdadb073e426"
+              "e2e-dms-only" = "e90a6deb640a0ba216772a28b64c7cabd7bbe9621e665fbeb90182c1d7b340a2"
+              "e2e-postfail" = "e0fb4ed9d1c1cb6d9c3823c84820535a9beefbe5d4c90a406348000d2585a80e"
+              "e2e-sql"      = "2ec45df89fd1e48d621f65462c753307bfc897c020fdd783d12fc18e8abeb40b"
+              "e2e-recheck"  = "a39da6d6121755587c61e503355757757937b05bd566698b0fb7d39deb0cd23f"
+              "e2e-ssm"      = "3f8dfaf527a1f159a29d3a8a9a2062321efb16ceab5346b59f6bac726bbf459c"
+              "e2e-fargate"  = "e71ac1f678523a46bfbefb6ed7e225c8dfcb2f2d06bbc0b5bbe7f169d27a10da"
+            }
+          }
           # snapshot_dumps (s10snap): dump.method = snapshot, the job role may snapshot the target cluster.
           # app.audit_notes has no primary key, so DMS cannot validate it ("No primary Key"):
           # with the module default (true) every load would end FAILED DmsValidationErrors.
