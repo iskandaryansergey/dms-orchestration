@@ -58,6 +58,7 @@ def no_network_from_orch_aws(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError(f"orch_aws network call in a test: {method} {url.split('?')[0]}")
 
     monkeypatch.setattr(orch_aws, "send", refuse)
+    monkeypatch.setattr(orch_aws, "pause", lambda _seconds: None)  # retries never sleep in a test
 
 
 @pytest.fixture

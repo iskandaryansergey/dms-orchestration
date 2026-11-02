@@ -318,7 +318,7 @@ def test_s3_list_pages_until_the_listing_is_complete():
     assert [o["Key"] for p in pages for o in p["Contents"]] == ["jobs/a.sql", "jobs/b.sql"]
 
 
-def test_s3_errors_carry_the_botocore_shape():
+def test_s3_errors_carry_the_botocore_shape(pauses):
     missing = (404, "<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>", {})
     s3 = s3_client(FakeTransport([("GET", "https://b.s3", missing)]))
     with pytest.raises(orch_aws.ClientError) as err:
@@ -363,7 +363,7 @@ def test_s3_multipart_upload_with_kms():
     ]
 
 
-def test_s3_complete_multipart_upload_error_inside_a_200_is_an_error():
+def test_s3_complete_multipart_upload_error_inside_a_200_is_an_error(pauses):
     err_doc = (200, "<Error><Code>InternalError</Code><Message>retry</Message></Error>", {})
     s3 = s3_client(FakeTransport([("POST", "https://b.s3", err_doc)]))
     with pytest.raises(orch_aws.ClientError, match="InternalError"):
@@ -446,3 +446,138 @@ def test_orch_aws_can_be_embedded_in_the_ssm_document():
     assert "\nORCH_AWS_PY\n" not in text  # the here-document delimiter of orch-job.sh
     script = (ROOT / "modules" / "dms-orchestration" / "ssm" / "orch-job.sh.tftpl").read_text(encoding="utf-8")
     assert not re.search(r"import boto3|boto3\.", script) and "${orch_aws_py}" in script
+
+
+# --- retries (boto3 retried; the stdlib client must too) -------------------------------------
+
+
+@pytest.fixture
+def pauses(monkeypatch) -> list[float]:
+    slept: list[float] = []
+    monkeypatch.setattr(orch_aws, "pause", slept.append)
+    return slept
+
+
+class Flaky:
+    """Fails with each of ``failures`` in turn (an exception is raised, a tuple is answered), then 200."""
+
+    def __init__(self, failures: list[Any], ok: tuple[int, str, dict[str, str]] = (200, "{}", {})):
+        self.failures, self.ok = list(failures), ok
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None) -> orch_aws.Response:
+        self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": body})
+        answer = self.failures.pop(0) if self.failures else self.ok
+        if isinstance(answer, BaseException):
+            raise answer
+        status, data, resp_headers = answer
+        return orch_aws.Response(status, resp_headers, Body(data))
+
+
+def xml_error(status: int, code: str) -> tuple[int, str, dict[str, str]]:
+    return status, f"<Error><Code>{code}</Code><Message>m</Message></Error>", {}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ConnectionResetError(104, "Connection reset by peer"),
+        TimeoutError("timed out"),
+        orch_aws.urllib.error.URLError(ConnectionRefusedError(111, "refused")),
+        xml_error(500, "InternalError"),
+        xml_error(502, "502"),
+        xml_error(503, "SlowDown"),
+        xml_error(503, "ServiceUnavailable"),
+        xml_error(400, "RequestTimeout"),
+        xml_error(400, "Throttling"),
+        (400, json.dumps({"__type": "com.amazonaws#ThrottlingException", "message": "rate"}), {}),
+        xml_error(400, "RequestLimitExceeded"),
+    ],
+)
+def test_transient_failures_are_retried(failure, pauses):
+    t = Flaky([failure, failure])
+    s3 = s3_client(t)
+    assert s3.put_object(Bucket="b", Key="k", Body=b"payload") == {"ETag": ""}
+    assert len(t.calls) == 3 and len(pauses) == 2
+    assert all(c["body"] == b"payload" for c in t.calls)  # the same bytes every attempt
+
+
+def test_retries_stop_after_five_attempts_with_growing_jittered_backoff(pauses):
+    t = Flaky([xml_error(503, "SlowDown")] * 10)
+    with pytest.raises(orch_aws.ClientError, match="SlowDown"):
+        s3_client(t).get_object(Bucket="b", Key="k")
+    assert len(t.calls) == 5 and len(pauses) == 4
+    for i, p in enumerate(pauses):
+        assert 0 <= p <= orch_aws.RETRY_BASE_SECONDS * 2**i
+
+
+def test_a_network_error_on_the_last_attempt_is_raised(pauses):
+    t = Flaky([ConnectionResetError(104, "reset")] * 5)
+    with pytest.raises(ConnectionResetError):
+        s3_client(t).get_object(Bucket="b", Key="k")
+    assert len(t.calls) == 5
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        xml_error(403, "AccessDenied"),
+        xml_error(404, "NoSuchKey"),
+        xml_error(400, "InvalidRequest"),
+        (400, json.dumps({"__type": "ResourceNotFoundException", "message": "no"}), {}),
+        (307, "", {"location": "https://elsewhere/"}),
+    ],
+)
+def test_other_client_errors_are_not_retried(failure, pauses):
+    t = Flaky([failure])
+    with pytest.raises(orch_aws.ClientError):
+        s3_client(t).get_object(Bucket="b", Key="k")
+    assert len(t.calls) == 1 and pauses == []
+
+
+def test_a_certificate_failure_is_not_retried(pauses):
+    import ssl
+
+    t = Flaky([orch_aws.urllib.error.URLError(ssl.SSLCertVerificationError("bad cert"))] * 5)
+    with pytest.raises(orch_aws.urllib.error.URLError):
+        s3_client(t).get_object(Bucket="b", Key="k")
+    assert len(t.calls) == 1
+
+
+def test_each_attempt_is_signed_again_with_fresh_credentials(pauses):
+    issued: list[str] = []
+
+    def provider() -> orch_aws.Credentials:
+        issued.append(f"AKID{len(issued)}")
+        return orch_aws.Credentials(issued[-1], "s")
+
+    t = Flaky([xml_error(500, "InternalError")])
+    orch_aws.S3("eu-west-2", provider, t).get_object(Bucket="b", Key="k")
+    assert issued == ["AKID0", "AKID1"]
+    assert "Credential=AKID0/" in t.calls[0]["headers"]["Authorization"]
+    assert "Credential=AKID1/" in t.calls[1]["headers"]["Authorization"]
+    assert all("X-Amz-Date" in c["headers"] for c in t.calls)
+
+
+def test_each_attempt_gets_a_fresh_signing_time(pauses, monkeypatch):
+    clock = iter([NOW, NOW + dt.timedelta(seconds=7)])
+    monkeypatch.setattr(orch_aws, "utcnow", lambda: next(clock))
+    t = Flaky([xml_error(500, "InternalError")])
+    s3_client(t).get_object(Bucket="b", Key="k")
+    assert [c["headers"]["X-Amz-Date"] for c in t.calls] == ["20261102T103000Z", "20261102T103007Z"]
+
+
+def test_a_body_that_is_not_bytes_is_sent_once(pauses):
+    t = Flaky([xml_error(503, "SlowDown")])
+    with pytest.raises(orch_aws.ClientError):
+        s3_client(t).request("PutObject", "PUT", "https://b.s3.eu-west-2.amazonaws.com/k", {}, bytearray(b"x"))
+    assert len(t.calls) == 1 and pauses == []
+
+
+def test_complete_multipart_upload_error_inside_a_200_is_retried(pauses):
+    t = Flaky(
+        [(200, "<Error><Code>InternalError</Code><Message>retry</Message></Error>", {})],
+        ok=(200, "<CompleteMultipartUploadResult><ETag>x</ETag></CompleteMultipartUploadResult>", {}),
+    )
+    s3_client(t).complete_multipart_upload(Bucket="b", Key="k", UploadId="u", MultipartUpload={"Parts": []})
+    assert len(t.calls) == 2 and len(pauses) == 1

@@ -36,8 +36,11 @@ import hashlib
 import hmac
 import json
 import os
+import random
+import ssl
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,6 +59,12 @@ CHUNK = 1024 * 1024
 UTC = dt.timezone.utc  # noqa: UP017 - the AMI's python3 is 3.9 (UTC alias from 3.11 only)
 # Service name in AWS_ENDPOINT_URL_<SERVICE> and the signing name.
 SERVICES = {"s3": "S3", "sts": "STS", "secretsmanager": "SECRETS_MANAGER"}
+# Retries (as the SDKs' standard mode): network errors, 5xx and these error codes; at most
+# RETRY_ATTEMPTS attempts with full-jitter exponential backoff, each attempt signed again.
+RETRY_ATTEMPTS = 5
+RETRY_BASE_SECONDS = 0.5
+RETRY_MAX_SECONDS = 20.0
+RETRY_CODES = frozenset({"SlowDown", "Throttling", "ThrottlingException", "RequestTimeout", "RequestLimitExceeded"})
 
 
 class ClientError(Exception):
@@ -119,6 +128,13 @@ def http_send(method: str, url: str, headers: dict[str, str], body: bytes | None
 
 # The transport every client uses unless it is given one (tests replace it: no network).
 send = http_send
+# Waits between retries and the signing clock (tests replace them: no sleeping).
+pause = time.sleep
+
+
+def utcnow() -> dt.datetime:
+    return dt.datetime.now(UTC)
+
 
 if TYPE_CHECKING:  # the AMI's python3 (3.9) cannot evaluate `bytes | None` at run time
     Transport = Callable[[str, str, dict[str, str], bytes | None], Response]
@@ -158,7 +174,7 @@ def sign(
     """The request headers with ``Authorization`` (SigV4). ``url`` carries the encoded path and
     the query exactly as sent; the query is canonicalised (sorted, RFC 3986 encoded)."""
     parts = urllib.parse.urlsplit(url)
-    stamp = (now or dt.datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
+    stamp = (now or utcnow()).strftime("%Y%m%dT%H%M%SZ")
     out = {k: v for k, v in headers.items() if k.lower() not in ("authorization", "host")}
     out.update({"Host": parts.netloc, "X-Amz-Date": stamp})
     if creds.token:
@@ -422,14 +438,53 @@ class Client:
         self.default_host = f"{service}.{region}.{suffix}"
 
     def request(
-        self, operation: str, method: str, url: str, headers: dict[str, str] | None = None, body: bytes = b""
+        self,
+        operation: str,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"",
+        error_in_200: bool = False,
     ) -> Response:
+        """The response of a 2xx; retries transient failures (``RETRY_CODES``, 5xx, network
+        errors). Only a ``bytes`` body is sent again: anything else gets one attempt.
+        ``error_in_200``: a 200 whose body is an ``<Error>`` document is an error (S3
+        CompleteMultipartUpload); the body is then read and returned as bytes."""
         payload = hashlib.sha256(body).hexdigest()
-        signed = sign(method, url, headers or {}, payload, self._credentials(), self.region, self.service)
-        resp = (self._transport or send)(method, url, signed, body if method in ("PUT", "POST") else None)
-        if resp.status >= 300:
-            raise _error(operation, resp)
-        return resp
+        attempts = RETRY_ATTEMPTS if isinstance(body, bytes) else 1
+        for attempt in range(1, attempts + 1):
+            last = attempt == attempts
+            # Signed again each attempt: fresh X-Amz-Date, fresh credentials if they rotated.
+            signed = sign(method, url, headers or {}, payload, self._credentials(), self.region, self.service)
+            try:
+                resp = (self._transport or send)(method, url, signed, body if method in ("PUT", "POST") else None)
+            except OSError as err:
+                if last or not _transient(err):
+                    raise
+                pause(_backoff(attempt))
+                continue
+            if error_in_200 and resp.status == 200:
+                data = resp.body.read()
+                errored = data.lstrip().startswith(b"<") and _local(_xml(data).tag) == "Error"
+                resp = Response(500 if errored else 200, resp.headers, _Bytes(data))
+            if resp.status < 300:
+                return resp
+            err = _error(operation, resp)
+            if last or not (resp.status >= 500 or err.response["Error"]["Code"] in RETRY_CODES):
+                raise err
+            pause(_backoff(attempt))
+        raise AssertionError("unreachable")
+
+
+def _transient(err: OSError) -> bool:
+    """A network error worth another attempt; a failed certificate check is not one."""
+    reason = getattr(err, "reason", err)
+    return not isinstance(reason, ssl.SSLCertVerificationError) and not isinstance(err, ssl.SSLCertVerificationError)
+
+
+def _backoff(attempt: int) -> float:
+    """Full jitter: uniform in [0, base * 2^(attempt-1)], capped."""
+    return random.uniform(0, min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * 2 ** (attempt - 1)))  # noqa: S311
 
 
 def _call_query(client: Client, operation: str, body: bytes) -> ElementTree.Element:
@@ -560,11 +615,9 @@ class S3(Client):
             for p in MultipartUpload["Parts"]
         )
         body = f"<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>".encode()
-        resp = self.request("CompleteMultipartUpload", "POST", self._url(Bucket, Key, {"uploadId": UploadId}), {}, body)
-        data = resp.body.read()
-        # S3 can answer 200 with an error document once the upload has started.
-        if _local(_xml(data).tag) == "Error":
-            raise _error("CompleteMultipartUpload", Response(500, {}, _Bytes(data)))
+        # S3 can answer 200 with an error document once the upload has started (error_in_200).
+        url = self._url(Bucket, Key, {"uploadId": UploadId})
+        self.request("CompleteMultipartUpload", "POST", url, {}, body, error_in_200=True).body.read()
         return {}
 
     def abort_multipart_upload(self, Bucket: str, Key: str, UploadId: str) -> dict[str, Any]:  # noqa: N803
