@@ -523,19 +523,19 @@ module "dms_orchestration" {
               }
           } : k => v if var.iam_auth })
           # The e2e job sets are pinned: totals of jobset_tool.py build over the templates as
-          # sandbox.py sync-jobs renders them (SQL Lambda ARN of the account, line endings of the
-          # host that syncs). A template change needs new totals here; other versions are refused.
+          # sandbox.py sync-jobs renders them (SQL Lambda ARN of the account; LF on every host).
+          # A template change needs new totals here; other versions are refused.
           jobs = {
             default_version = "e2e"
             allow_unpinned  = false
             bundles = {
-              "e2e"          = "5f609b088112ec02220f3c2c248e433face746169973cd4e17d2bdadb073e426"
-              "e2e-dms-only" = "e90a6deb640a0ba216772a28b64c7cabd7bbe9621e665fbeb90182c1d7b340a2"
-              "e2e-postfail" = "e0fb4ed9d1c1cb6d9c3823c84820535a9beefbe5d4c90a406348000d2585a80e"
-              "e2e-sql"      = "2ec45df89fd1e48d621f65462c753307bfc897c020fdd783d12fc18e8abeb40b"
-              "e2e-recheck"  = "a39da6d6121755587c61e503355757757937b05bd566698b0fb7d39deb0cd23f"
-              "e2e-ssm"      = "3f8dfaf527a1f159a29d3a8a9a2062321efb16ceab5346b59f6bac726bbf459c"
-              "e2e-fargate"  = "e71ac1f678523a46bfbefb6ed7e225c8dfcb2f2d06bbc0b5bbe7f169d27a10da"
+              "e2e"          = "6681afa75c72f9349febd9fe0e90a1933c38ac01f9e6338b7734b645681c941a"
+              "e2e-dms-only" = "6cfa9b95085bf21f25fc02c5ec6c28e3766d3dbe411678877b82d1e76a72b9df"
+              "e2e-postfail" = "2d91671a26ff18d81780126f72248191aa4dd0f71f291f502416950cfea313c4"
+              "e2e-sql"      = "797dcca80b9c1d758f3400a0761f6cbbc49445897326b9ea30780320c2a3bff1"
+              "e2e-recheck"  = "76bf87144d7ec8fc6f41ab5a11c6687e68fae20a4e427bfee3f58da3743eec5b"
+              "e2e-ssm"      = "dfa2b6e0d9926b07c873cb1e57385451a99a777b8ca8a9c9fb72983c71dd909b"
+              "e2e-fargate"  = "94c44b838e45fe27dbc566dd8b143c6dd741cdb15e216a927099e544c7f6869b"
             }
           }
           # snapshot_dumps (s10snap): dump.method = snapshot, the job role may snapshot the target cluster.
