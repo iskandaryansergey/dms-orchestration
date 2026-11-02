@@ -126,12 +126,15 @@ S1p, S2, S3, S5, S6 green; 16/16 AWS TestState cases.
   tests in its pre-check and waits for a running test.
 * **Secrets created in the same plan break the upstream module's `for_each`** (`endpoints_with_secret`
   keyed on `secret_arn != ""`): plan fails with `Invalid for_each argument`; a second
-  `destroy` after the secrets are gone fails the same way. Workaround: `apply
-  -target=aws_secretsmanager_secret.db` first, `destroy -target` by `state list`
-  (README). Fix proposed upstream (contract 2.3).
+  `destroy` after the secrets are gone fails the same way. Fixed upstream from 08def61
+  (contract 2.3): a sandbox run on it applied without `-target` and destroyed in one pass
+  (181 resources), so the README no longer has the targeted steps.
 * **IAM eventual consistency** on the first full apply: a resource that assumes a role
   created seconds earlier is refused; the second `apply` succeeds without changes to the
-  configuration. The sandbox runbook retries once.
+  configuration. The sandbox runbook retries once. One cause was ordering, not
+  propagation: VPC Lambdas and the job-runner machine were created before the inline
+  policies of their roles (`CreateNetworkInterface`, managed rule of `ecs:runTask.sync`); they
+  now `depends_on` those policies (§9.6).
 * **The orchestrator refuses `reload-target` for a task that never ran** (`InvalidStartType`,
   DMS accepts only `start-replication` for it); the e2e asks `start-replication` on the
   first run and `reload-target` afterwards.
@@ -226,9 +229,13 @@ input and must take the "already started" branch (`WriteReport`, `RESUMED`), not
   posts came from `event-handler`.
 * **PostgreSQL 17 client, Aurora 16 server:** `pg_restore` writes `\restrict <key>` and
   `SET transaction_timeout = 0;` in the SQL header; Aurora 16 refuses the parameter. The restore
-  pipes `pg_restore -f -` into `psql --single-transaction` and drops that header line.
-* **Every `terraform apply` resets the target's `MaxFileSize` to 0** (the upstream dms module, contract 2.6)
-  and with it the connection status: `sbx test-connections` after each apply.
+  drops that header line. `psql --single-transaction` does not wrap a script read from stdin,
+  so the restore sends `BEGIN;` first and `COMMIT;` only after `pg_restore` exited 0
+  (`ROLLBACK;` otherwise).
+* **`terraform apply` reset the target's `MaxFileSize` to 0** with upstream dms modules before
+  commit `08def61` (contract 2.6), and with it the connection status; from that commit on an
+  apply keeps the setting. The orchestrator still refuses a PostgreSQL target endpoint with
+  `MaxFileSize = 0` before the start (outside `plan`), as a safety check.
 * **TestState** against AWS: 25/25 cases (AWS refuses a `context` without a mock). The
   error name `StepFunctions.ExecutionAlreadyExistsException` is only mocked in those cases, not
   seen from a real call.
@@ -293,3 +300,34 @@ The full stack with every optional part (`sql_runner`, `assessment`, `sqs_fanout
 * **Regression on the final image:** S10 (restore baseline), S4, S14, guard, S16 (9 stale
   notifications drained first), S13, postdie (own lock gone 0.1 s after the end) and the final S1
   green; both S1 posts started by `event-handler`. TestState against AWS: 29/29.
+
+### 9.6 0.2.0 on the SSM runtime, live
+
+The stack with `ssm_runner`, `snapshot_dumps`, `assessment`, `sqs_fanout`, no image, upstream
+08def61.
+
+* **Apply and destroy:** one `terraform apply` without `-target`; the first pass failed on
+  ordering (a VPC Lambda and the job-runner machine created before their role policies), the
+  second completed. Destroy: 181 resources in one pass, `verify_destroyed` empty.
+* **Validation default:** with `fail_on_validation_errors = true` a load of a table without a
+  primary key ends `FAILED` `DmsValidationErrors` ("validation state No primary Key"): DMS cannot
+  validate such a table. The sandbox task turned the flag off for that reason; since then the
+  state is reported (`validationSkippedTables`), not failed. A row changed by a
+  trigger on the target (`e2e.py s21-validation`): `DmsValidationErrors` naming the table with
+  the flag on, `COMPLETED_WITH_VALIDATION_ERRORS` with it off.
+* **Pinned context:** reading `context.json` by `VersionId` needs `s3:GetObjectVersion`; without
+  it every post stopped `ContextNotPinned` (AccessDenied).
+* **SSM runner:** psql needs the RDS CA bundle; an AMI has none at the image's path. The
+  runtime zip carries the pinned bundle and orch-job points the clients at it.
+* **TestState:** AWS refuses a mock on a `Choice` and validates mocked results against the API
+  schema (an SSM `CommandId` has 36 characters). A `States.Timeout` was retried by the
+  `States.TaskFailed` retrier of `StartReplicationTask`; an explicit `States.Timeout` retrier
+  with `MaxAttempts 0` comes first now. 47/47 against AWS after the fixes.
+* **604 tables (`e2e.py s4big`):** the reset list went to `inspect/reset-tables.json` (604), the
+  Lambda SQL runtime truncated all of them in one statement, DMS loaded them in about 90 s, and
+  DMS validation was still running after 40 minutes. After such a run is stopped and the extra
+  tables are dropped on both sides, the next run takes its reset list (604) from the DMS table
+  statistics of the stopped run and its truncate failed on the missing tables (fail-closed);
+  since then `truncateScope` skips tables missing on the target and names them.
+* **Bucket controls:** a dump object written without SSE-KMS is denied (`DenyDumpsWithoutKms`),
+  also for the operator.

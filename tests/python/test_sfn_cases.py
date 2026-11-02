@@ -39,11 +39,22 @@ def test_there_are_cases_for_the_risky_states():
         ("migrate.asl.json", "ArmGuard"),
         ("migrate.asl.json", "CheckAssessmentStatus"),
         ("migrate.asl.json", "StartReplicationTask"),
+        ("migrate.asl.json", "CheckTaskUnchanged"),
+        ("migrate.asl.json", "CheckReset"),
+        ("migrate.asl.json", "ResolveContext"),
+        ("post.asl.json", "HandOverLock"),
         ("migrate.asl.json", "CheckDryRun"),
+        ("migrate.asl.json", "CheckContextVersion"),
+        ("migrate.asl.json", "RecordContextVersion"),
+        ("post.asl.json", "TakeOverLock"),
         ("post.asl.json", "CheckOutcome"),
         ("post.asl.json", "CheckAutoResume"),
         ("post.asl.json", "StartResume"),
         ("job-runner.asl.json", "CheckStatus"),
+        ("job-runner.asl.json", "RunSsmJob"),
+        ("job-runner.asl.json", "GetSsmInvocation"),
+        ("job-runner.asl.json", "CheckSsmStatus"),
+        ("job-runner.asl.json", "NormalizeSsmResult"),
     } <= states
 
 
@@ -72,6 +83,24 @@ def test_generated_cases_are_up_to_date():
     for name, body in mod.CASES.items():
         path = CASES[0].parent / f"{name}.json"
         assert path.exists() and json.loads(path.read_text()) == body, f"run tests/sfn/make_cases.py ({name})"
+
+
+def test_cases_mock_only_task_states():
+    """Seen live: AWS TestState refuses a mock on a Choice ("State type 'Choice' is not supported
+    when a mock is specified"); only Task states take one."""
+    for path in CASES:
+        case = json.loads(path.read_text())
+        state = render(case["definition"])["States"][case["state"]]
+        assert "mock" not in case or state["Type"] == "Task", path.stem
+
+
+def test_mocked_ssm_command_ids_have_the_api_length():
+    """Seen live: TestState validates a mock against the API schema ("Field 'CommandId' is smaller
+    than the minimum length"); SSM command ids are 36 characters."""
+    for path in CASES:
+        result = (json.loads(path.read_text()).get("mock") or {}).get("result") or {}
+        command_id = (result.get("Command") or {}).get("CommandId", result.get("CommandId"))
+        assert command_id is None or len(command_id) == 36, path.stem
 
 
 def test_teststate_requests_send_context_only_with_a_mock():

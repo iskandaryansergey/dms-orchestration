@@ -21,9 +21,13 @@ jobs:
     name: static checks
     runs-on: ubuntu-24.04
     steps:
+      # On a pull request, check out the branch head, not the merge commit GitHub synthesizes:
+      # that commit is authored by whoever's account opened the PR, and the denylist would
+      # flag it although it is never part of the history that gets merged.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: gitleaks (secrets)
         run: |
@@ -52,10 +56,11 @@ jobs:
           tflint_version: v0.55.0
 
       - name: tflint
-        working-directory: modules/dms-orchestration
         run: |
           tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
-          tflint --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+          for m in modules/dms-orchestration modules/artifacts-bucket; do
+            tflint --chdir "$m" --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+          done
 
       - name: trivy config (IaC misconfiguration)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -77,14 +82,11 @@ jobs:
 
       - name: ruff
         run: |
-          uv run --only-group dev ruff check src tests scripts examples
-          uv run --only-group dev ruff format --check src tests scripts examples
+          uv run --only-group dev ruff check modules/dms-orchestration/src tests scripts examples
+          uv run --only-group dev ruff format --check modules/dms-orchestration/src tests scripts examples
 
       - name: shellcheck
-        run: shellcheck scripts/*.sh src/jobs/sql-runner/bin/orch-job
-
-      - name: hadolint
-        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < src/jobs/sql-runner/Dockerfile
+        run: shellcheck scripts/*.sh modules/dms-orchestration/src/jobs/sql-runner/bin/orch-job
 
       - name: terraform-docs (docs/configuration.md is up to date)
         env:
@@ -111,12 +113,16 @@ jobs:
         with:
           version: "0.13.0"
       - run: uv sync --frozen
+      # The Lambda SQL runtime ships pg8000 in the zip: rebuild it from the hashed requirements and
+      # compare every file; the RDS CA bundle must match its pin.
+      - name: vendored SQL driver and CA bundle
+        run: make vendor-check
       - name: pytest (unit, lambdas, state machine paths, sql-runner)
         run: |
-          uv run pytest --cov=src/shared --cov=src/lambdas --cov=src/jobs/sql-runner \
+          uv run pytest --cov=modules/dms-orchestration/src/shared --cov=modules/dms-orchestration/src/lambdas --cov=modules/dms-orchestration/src/jobs/sql-runner \
             --cov-report=term --cov-report=xml --cov-fail-under=85 --junitxml=pytest.xml
       - name: shared library coverage >= 85%
-        run: uv run coverage report --include='src/shared/*' --fail-under=85
+        run: uv run coverage report --include='modules/dms-orchestration/src/shared/*' --fail-under=85
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -126,12 +132,13 @@ jobs:
             coverage.xml
 
   terraform-test:
-    name: terraform test (${{ matrix.terraform }})
+    name: terraform test (${{ matrix.module }}, ${{ matrix.terraform }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         terraform: ["1.9.8", "latest"]
+        module: ["dms-orchestration", "artifacts-bucket"]
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -140,12 +147,12 @@ jobs:
           terraform_wrapper: false
       - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
       - name: init + validate
-        working-directory: modules/dms-orchestration
+        working-directory: modules/${{ matrix.module }}
         run: |
           terraform init -backend=false -input=false
           terraform validate
       - name: terraform test (mock provider, no AWS)
-        working-directory: modules/dms-orchestration
+        working-directory: modules/${{ matrix.module }}
         run: terraform test
 
   # The sandbox needs the upstream aurora/dms modules; the repository names none. With the
@@ -213,13 +220,20 @@ jobs:
         if: vars.AWS_TESTSTATE_ROLE_ARN != ''
         run: uv run python tests/sfn/run_teststate.py
 
+  # The image is for the optional Fargate runtime only (ADR 0011): the module never builds it
+  # and the default path does not use it. Set the repository variable BUILD_SQL_RUNNER_IMAGE
+  # to 'true' to lint, build and scan it.
   image:
     name: sql-runner image
+    if: vars.BUILD_SQL_RUNNER_IMAGE == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: hadolint
+        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < modules/dms-orchestration/src/jobs/sql-runner/Dockerfile
       - name: build
-        run: docker build -f src/jobs/sql-runner/Dockerfile -t sql-runner:ci .
+        # PowerShell is off by default; the smoke test covers the image with it.
+        run: docker build -f modules/dms-orchestration/src/jobs/sql-runner/Dockerfile --build-arg INSTALL_POWERSHELL=true -t sql-runner:ci .
       - name: smoke test
         run: |
           docker run --rm --entrypoint psql sql-runner:ci --version

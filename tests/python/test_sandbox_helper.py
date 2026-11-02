@@ -1,4 +1,4 @@
-"""examples/sandbox/scripts/sandbox.py: the sandbox-only workaround for MaxFileSize = 0."""
+"""examples/sandbox/scripts/sandbox.py: sandbox-only helpers."""
 
 from __future__ import annotations
 
@@ -16,41 +16,43 @@ spec.loader.exec_module(sandbox)
 
 
 class FakeDms:
-    def __init__(self, endpoints):
-        self.endpoints = endpoints
-        self.modified = []
+    """Only TestConnection and DescribeConnections: any other DMS call fails the test."""
 
-    def describe_endpoints(self, Filters):
-        arn = Filters[0]["Values"][0]
-        return {"Endpoints": [e for e in self.endpoints if e["EndpointArn"] == arn]}
+    def __init__(self):
+        self.tested = []
 
-    def modify_endpoint(self, EndpointArn, PostgreSQLSettings):
-        self.modified.append((EndpointArn, PostgreSQLSettings))
+    def test_connection(self, ReplicationInstanceArn, EndpointArn):  # noqa: N803
+        self.tested.append((ReplicationInstanceArn, EndpointArn))
         return {}
 
-
-def ep(arn, kind, engine="aurora-postgresql", max_file_size=0):
-    settings = {} if max_file_size is None else {"MaxFileSize": max_file_size}
-    return {"EndpointArn": arn, "EndpointType": kind, "EngineName": engine, "PostgreSQLSettings": settings}
+    def describe_connections(self, Filters):  # noqa: N803
+        return {"Connections": [{"EndpointIdentifier": a, "Status": "successful"} for _, a in self.tested]}
 
 
-def test_target_postgres_with_zero_max_file_size_is_raised_to_the_default():
-    # Seen live: the provider sends max_file_size = 0 in postgres_settings (the upstream
-    # dms module), and DMS 3.5.4 then loads 0 rows into a PostgreSQL target and never ends.
-    dms = FakeDms([ep("src", "SOURCE"), ep("tgt", "TARGET"), ep("ok", "TARGET", max_file_size=32768)])
-    fixed = sandbox.fix_target_max_file_size(dms, ["src", "tgt", "ok"])
-    assert fixed == ["tgt"]
-    assert dms.modified == [("tgt", {"MaxFileSize": 32768})]
+def test_the_max_file_size_workaround_is_gone():
+    # Fixed in the upstream dms module from the minimum commit in upstream.env.example (contract 2.6).
+    assert not hasattr(sandbox, "fix_target_max_file_size")
+    assert "MaxFileSize" not in SCRIPT.read_text(encoding="utf-8")
 
 
-def test_other_engines_and_unset_size_are_left_alone():
-    dms = FakeDms([ep("my", "TARGET", engine="mysql"), ep("unset", "TARGET", max_file_size=None)])
-    assert sandbox.fix_target_max_file_size(dms, ["my", "unset"]) == []
-    assert dms.modified == []
+def test_test_connections_only_tests_the_connections(monkeypatch, capsys):
+    dms = FakeDms()
+
+    class Session:
+        def client(self, name):
+            assert name == "dms"
+            return dms
+
+    monkeypatch.setattr(sandbox, "session", lambda out: Session())
+    monkeypatch.setattr(sandbox.time, "sleep", lambda s: pytest.fail("no wait when nothing is testing"))
+    out = {"replication_instance_arn": "ri", "endpoint_arns": {"source": "src", "target": "tgt"}}
+    sandbox.cmd_test_connections(out)
+    assert dms.tested == [("ri", "src"), ("ri", "tgt")]
+    assert "successful" in capsys.readouterr().out
 
 
 def test_connection_test_already_running_is_not_an_error():
-    # Seen live: ModifyEndpoint (the MaxFileSize fix) starts a connection test by itself.
+    # Seen live: ModifyEndpoint starts a connection test by itself, so one can already be running.
     from botocore.exceptions import ClientError
 
     class Busy:
@@ -96,6 +98,28 @@ def test_build_sources_older_than_the_tree_are_listed(tmp_path):
     )
     assert sandbox.stale_build_sources(archive, tmp_path) == ["src/changed.py", "src/gone.py"]
     assert sandbox.stale_build_sources(_zip({"src/same.py": b"same\n"}), tmp_path) == []
+
+
+def test_build_image_refuses_when_the_sandbox_build_is_off(monkeypatch, capsys):
+    """CodeBuild is a sandbox convenience behind var.sql_runner (off by default): without it
+    the outputs carry no project, and build-image stops before any AWS call."""
+
+    def no_session(out):
+        raise AssertionError("must not call AWS")
+
+    monkeypatch.setattr(sandbox, "session", no_session)
+    out = {"artifacts_bucket": "bkt", "sql_runner_codebuild_project": None, "sql_runner_repository": None}
+    assert sandbox.cmd_build_image(out, "abc1234") == 2
+    assert "sql_runner=true" in capsys.readouterr().out
+
+
+def test_sandbox_build_is_off_by_default_and_sandbox_only():
+    tf = (SCRIPT.parents[1] / "variables.tf").read_text(encoding="utf-8")
+    block = tf[tf.index('variable "sql_runner" {') :]
+    block = block[: block.index("\n}\n")]
+    assert "default     = false" in block and "Sandbox only" in block
+    header = (SCRIPT.parents[1] / "sql_runner.tf").read_text(encoding="utf-8").split("\n\n")[0]
+    assert "never part of the module" in header
 
 
 def test_build_image_refuses_stale_sources_before_starting_a_build(tmp_path, monkeypatch, capsys):
@@ -224,6 +248,40 @@ def test_e2e_has_the_live_checks_of_the_run6_fixes_by_name_only():
     assert 'pf.get("error") == "RestoredTarget"' in text  # S10: a plan after the restore never resumes
 
 
+def test_e2e_has_s1ssm_by_name_only_and_s10_restores_on_the_runtime_of_the_sandbox():
+    text = E2E.read_text(encoding="utf-8")
+    assert "e2e.py s1ssm" in text and 'scenarios["s1ssm"] = s1ssm' in text
+    assert '"s1ssm": s1ssm' not in text  # needs ssm_runner = true
+    assert '"--runtime"' in text and '"e2e-ssm" if on_ssm else "e2e-fargate"' in text  # S10 on SSM
+
+
+def test_the_sandbox_runner_instance_is_a_stand_in_for_the_team_ami():
+    tf = re.sub(r"[ ]+", " ", (SANDBOX / "ssm_runner.tf").read_text(encoding="utf-8"))
+    assert tf.count("count = var.ssm_runner ? 1 : 0") >= 4  # role, profile, instance, policy
+    assert "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64" in tf
+    assert 'var.runner_ami_id != "" ? var.runner_ami_id' in tf
+    assert 'http_tokens = "required"' in tf and "associate_public_ip_address = false" in tf
+    assert "encrypted = true" in tf
+    assert "module.dms_orchestration.ssm_runner_policy_json" in tf
+    assert "AmazonSSMManagedInstanceCore" in tf
+    variables = (SANDBOX / "variables.tf").read_text(encoding="utf-8")
+    for name in ("ssm_runner", "runner_ami_id"):
+        assert f'variable "{name}"' in variables
+    assert "default = false" in re.sub(
+        r"[ ]+", " ", variables[variables.index('variable "ssm_runner"') :].split("}")[0]
+    )
+    main = re.sub(r"\s+", " ", (SANDBOX / "main.tf").read_text(encoding="utf-8"))
+    assert "enabled = var.ssm_runner" in main and "instance_ids = aws_instance.ssm_runner[*].id" in main
+    assert '"ec2messages", "ssmmessages"' in main  # agent endpoints from the network contract
+
+
+def test_the_ssm_job_set_runs_its_command_jobs_on_ssm():
+    text = (SANDBOX / "jobs" / "jobset-ssm.yaml.tmpl").read_text(encoding="utf-8")
+    assert "runtime: ssm" in text and "image:" not in text
+    helper = (SANDBOX / "scripts" / "sandbox.py").read_text(encoding="utf-8")
+    assert 'cmd_sync_jobs(out, "jobset-ssm.yaml.tmpl", "e2e-ssm")' in helper
+
+
 def test_the_sandbox_wires_the_queue_only_behind_the_variable():
     tf = re.sub(r"[ ]+", " ", (SANDBOX / "fanout.tf").read_text(encoding="utf-8"))
     assert 'file("${path.module}/fanout-filter-policy.json")' in tf
@@ -274,3 +332,45 @@ def test_resume_collision_is_caught_as_already_started():
 )
 def test_resume_collision_checks_fail_on_anything_else(events):
     assert not all(sandbox.resume_collision_checks(events).values())
+
+
+def test_big_tables_are_one_statement_with_a_primary_key_and_one_row_on_the_source():
+    source = sandbox.big_tables_sql(600, rows=True)
+    target = sandbox.big_tables_sql(600, rows=False)
+    drop = sandbox.big_tables_sql(600, drop=True)
+    for sql in (source, target, drop):
+        assert sql.startswith("DO $$") and sql.rstrip().endswith("$$") and "1..600" in sql
+    assert "PRIMARY KEY" in source and "INSERT INTO" in source and "ON CONFLICT DO NOTHING" in source
+    assert "PRIMARY KEY" in target and "INSERT INTO" not in target
+    assert "DROP TABLE IF EXISTS" in drop and "CREATE" not in drop
+    assert sandbox.big_table_name(7) == "app.e2e_big_0007"
+    with pytest.raises(ValueError):
+        sandbox.big_tables_sql(10000, rows=True)
+
+
+def test_seed_tables_option_adds_only_the_big_tables(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sandbox, "outputs", lambda: {"region": "us-east-1"})
+    monkeypatch.setattr(sandbox, "data_api", lambda out, db, sql, secret=None: calls.append((db, sql)) or [])
+    monkeypatch.setattr(sandbox, "cmd_counts", lambda out: {})
+    assert sandbox.main(["seed", "--tables", "600"]) == 0
+    assert [db for db, _ in calls] == ["source", "target"]
+    assert all("e2e_big_" in sql for _, sql in calls)
+
+
+def test_sync_jobs_uploads_the_sql_and_recheck_job_sets():
+    helper = (SANDBOX / "scripts" / "sandbox.py").read_text(encoding="utf-8")
+    assert 'cmd_sync_jobs(out, "jobset-sql.yaml.tmpl", "e2e-sql")' in helper
+    assert 'cmd_sync_jobs(out, "jobset-recheck.yaml.tmpl", "e2e-recheck")' in helper
+    sql = (SANDBOX / "jobs" / "jobset-sql.yaml.tmpl").read_text(encoding="utf-8")
+    assert 'when: "run.dryRun"' in sql and "truncateScope: true" in sql
+
+
+PLANNED = ["dry-ro", "s4big", "s17-lock-lost", "s18-recheck", "s20-tampered-jobset", "s21-validation"]
+
+
+@pytest.mark.parametrize("name", PLANNED)
+def test_e2e_has_the_planned_scenarios_by_name_only(name):
+    text = E2E.read_text(encoding="utf-8")
+    assert f"e2e.py {name} " in text and f'scenarios["{name}"] = ' in text
+    assert f'"{name}": ' not in text.split("names = argv or list(scenarios)")[0].split("def main")[-1]

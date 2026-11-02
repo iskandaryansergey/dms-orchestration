@@ -1,0 +1,26 @@
+{
+  "definition": "job-runner.asl.json",
+  "state": "CheckSsmStatus",
+  "variables": {
+    "input": {},
+    "attempt": 1,
+    "spec": {
+      "timeoutSeconds": 600
+    },
+    "result": null,
+    "exitCode": 2,
+    "ecsError": null,
+    "ssmRunners": ["i-0aaa"],
+    "ssmInstanceId": "i-0aaa",
+    "ssmCommandId": "cmd-1",
+    "ssmStatus": "Failed",
+    "ssmPolls": 3
+  },
+  "expect": {
+    "status": "SUCCEEDED",
+    "nextState": "FetchSsmResult",
+    "variables": {
+      "ssmStatus": "Failed"
+    }
+  }
+}

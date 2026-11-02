@@ -6,25 +6,25 @@
 # clusters and job-set prefixes live on a role per project:
 #   * Fargate jobs get it as the task role (RunTask Overrides.TaskRoleArn);
 #   * built-in Lambda jobs assume it (sts:AssumeRole) for their database calls.
-# The shared ecs_task and lambda_jobs roles keep no secret access.
+# The shared ecs_task and lambda_jobs roles keep no secret access and no run artifacts.
 # ARNs are built from names (like the state machine ARNs) so policies can refer
 # to them before the roles exist.
 ############################################
 
 locals {
-  job_role_names = { for p in keys(var.projects) : p => "${local.prefix}-job-${p}" }
+  job_role_names = { for p in keys(local.projects) : p => "${local.prefix}-job-${p}" }
   job_role_arns  = { for p, n in local.job_role_names : p => "arn:${local.partition}:iam::${local.account_id}:role/${n}" }
 
   project_secret_arns = {
-    for p, proj in var.projects : p => distinct(flatten([
-      for t in values(proj.tasks) : [for c in values(t.connections) : c.secret_arn if c.secret_arn != null]
+    for p, proj in local.projects : p => distinct(flatten([
+      for t in values(proj.tasks) : [for c in values(t.connections) : c.secret_arn if c.secret_arn != ""]
     ]))
   }
 
   # auth = "iam" connections, keyed "<project>/<task>/<connection>" (known
   # at plan); the policy ARN itself may come from a module applied in the same plan.
   iam_database_connections = merge(flatten([
-    for p, proj in var.projects : [
+    for p, proj in local.projects : [
       for task_key, t in proj.tasks : {
         for name, c in t.connections : "${p}/${task_key}/${name}" => { project = p, policy_arn = c.iam_policy_arn } if c.auth == "iam"
       }
@@ -32,7 +32,7 @@ locals {
   ])...)
 
   project_data_api_arns = {
-    for p, proj in var.projects : p => distinct(compact(flatten([
+    for p, proj in local.projects : p => distinct(compact(flatten([
       for t in values(proj.tasks) : [for c in values(t.connections) : c.data_api_cluster_arn]
     ])))
   }
@@ -40,35 +40,43 @@ locals {
   # dump.method = snapshot: the target clusters of the project's tasks with
   # snapshot_dumps. Snapshots themselves are scoped by the project tag (job_role_policies).
   project_snapshot_clusters = {
-    for p, proj in var.projects : p => distinct(compact([
+    for p, proj in local.projects : p => distinct(compact([
       for t in values(proj.tasks) : try(coalesce(t.connections["target"].cluster_arn, t.connections["target"].data_api_cluster_arn), null) if t.defaults.snapshot_dumps
     ]))
   }
 
   project_job_prefixes = {
-    for p in keys(var.projects) : p => coalescelist(
+    for p in keys(local.projects) : p => coalescelist(
       distinct([for r in values(local.task_registrations) : trim(r.jobs.s3Prefix, "/") if r.project == p]),
       ["jobs/${p}"],
     )
   }
 
   job_role_assume = {
-    for p in keys(var.projects) : p => jsonencode({
+    for p in keys(local.projects) : p => jsonencode({
       Version = "2012-10-17"
-      Statement = [
-        merge(jsondecode(local.ecs_assume).Statement[0], { Sid = "EcsTasksOfThisAccount" }),
-        {
+      Statement = concat(
+        # Fargate runtime only (fargate.images): the job role is the task role override.
+        local.fargate_enabled ? [merge(jsondecode(local.ecs_assume).Statement[0], { Sid = "EcsTasksOfThisAccount" })] : [],
+        [{
           Sid       = "BuiltinJobsLambda"
           Effect    = "Allow"
-          Principal = { AWS = aws_iam_role.lambda_jobs.arn }
+          Principal = { AWS = aws_iam_role.lambda_jobs[0].arn }
           Action    = "sts:AssumeRole"
-        },
-      ]
+          },
+          ], local.ssm_enabled ? [{
+            # SSM runtime: orch-job on a runner instance assumes the job role of the run's project
+            # (docs/security.md: every project trusts the same runner role).
+            Sid       = "SsmRunnerInstances"
+            Effect    = "Allow"
+            Principal = { AWS = var.ssm.instance_role_arn }
+            Action    = "sts:AssumeRole"
+      }] : [])
     })
   }
 
   job_role_policies = {
-    for p in keys(var.projects) : p => {
+    for p in keys(local.projects) : p => {
       Version = "2012-10-17"
       Statement = concat([
         {
@@ -85,10 +93,12 @@ locals {
           Condition = { StringLike = { "s3:prefix" = [for prefix in local.project_job_prefixes[p] : "${prefix}/*"] } }
         },
         {
+          # Specs, results and artifacts of this project's jobs only: runs/<project>/<runId>/jobs/.
+          # context.json and reports (runs/<project>/<runId>/) are not reachable from a job.
           Sid      = "RunSpecsAndResults"
           Effect   = "Allow"
           Action   = ["s3:GetObject", "s3:PutObject"]
-          Resource = ["${local.bucket_arn}/runs/*"]
+          Resource = ["${local.bucket_arn}/runs/${p}/*/jobs/*"]
         },
         {
           # pg-dump-s3 / pg-restore-s3: only this project's dumps
@@ -113,12 +123,39 @@ locals {
           Action   = ["rds:CreateDBClusterSnapshot", "rds:DescribeDBClusterSnapshots"]
           Resource = local.project_snapshot_clusters[p]
           }], length(local.project_snapshot_clusters[p]) == 0 ? [] : [{
-          # A new snapshot must carry the project tag (builtin dump/cluster_snapshot tags it).
-          Sid       = "CreateProjectSnapshots"
-          Effect    = "Allow"
-          Action    = ["rds:CreateDBClusterSnapshot", "rds:AddTagsToResource"]
-          Resource  = ["arn:${local.partition}:rds:${local.region}:${local.account_id}:cluster-snapshot:${p}-*"]
-          Condition = { StringEquals = { "aws:RequestTag/dms-orch:project" = p } }
+          # Snapshots are scoped by the project tag, not by the identifier: a new snapshot must
+          # carry this project's tag (builtin dump/cluster_snapshot tags it on create). Both keys
+          # are required; RDS evaluation on CreateDBClusterSnapshot is proven by e2e s10snap.
+          Sid      = "CreateProjectSnapshots"
+          Effect   = "Allow"
+          Action   = ["rds:CreateDBClusterSnapshot"]
+          Resource = ["arn:${local.partition}:rds:${local.region}:${local.account_id}:cluster-snapshot:*"]
+          Condition = { StringEquals = {
+            "rds:req-tag/dms-orch:project"    = p
+            "aws:RequestTag/dms-orch:project" = p
+          } }
+          }], length(local.project_snapshot_clusters[p]) == 0 ? [] : [{
+          # Tags on this project's snapshots; the project tag itself cannot be moved to another project.
+          Sid      = "TagOwnSnapshots"
+          Effect   = "Allow"
+          Action   = ["rds:AddTagsToResource"]
+          Resource = ["arn:${local.partition}:rds:${local.region}:${local.account_id}:cluster-snapshot:*"]
+          Condition = {
+            StringEquals         = { "rds:cluster-snapshot-tag/dms-orch:project" = p }
+            StringEqualsIfExists = { "aws:RequestTag/dms-orch:project" = p }
+          }
+          }], length(local.project_snapshot_clusters[p]) == 0 ? [] : [{
+          # Tag on create: a snapshot without the project tag key, named like this project's
+          # (no project key is a prefix of another), gets only this project's tag. Another
+          # project's snapshot carries its tag and is out of reach for retag-and-delete.
+          Sid      = "TagNewSnapshots"
+          Effect   = "Allow"
+          Action   = ["rds:AddTagsToResource"]
+          Resource = ["arn:${local.partition}:rds:${local.region}:${local.account_id}:cluster-snapshot:${p}-*"]
+          Condition = {
+            Null         = { "rds:cluster-snapshot-tag/dms-orch:project" = "true" }
+            StringEquals = { "aws:RequestTag/dms-orch:project" = p }
+          }
           }], length(local.project_snapshot_clusters[p]) == 0 ? [] : [{
           # Retention (cleanup/cluster_snapshots): only snapshots tagged with this project.
           Sid       = "ManageProjectSnapshots"

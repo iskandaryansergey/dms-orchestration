@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "jobset.schema.json",
+  "title": "DMS orchestration job set",
+  "description": "Pre/reset/post/on_failure jobs of one project task. Authored as jobset.yaml, converted to jobset.json by scripts/jobset_tool.py and synced to s3://<artifacts>/jobs/<project>/<jobsVersion>/.",
+  "type": "object",
+  "required": ["schemaVersion", "phases"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "integer", "enum": [1] },
+    "description": { "type": "string" },
+    "defaults": { "$ref": "#/$defs/jobDefaults" },
+    "phases": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pre": { "$ref": "#/$defs/jobList" },
+        "reset": { "$ref": "#/$defs/jobList" },
+        "post": { "$ref": "#/$defs/jobList" },
+        "on_failure": { "$ref": "#/$defs/jobList" }
+      }
+    }
+  },
+  "$defs": {
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "backoffSeconds": { "type": "integer", "minimum": 0, "maximum": 3600 }
+      }
+    },
+    "jobDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "runtime": { "$ref": "#/$defs/runtime" },
+        "image": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,39}$" },
+        "timeoutSeconds": { "type": "integer", "minimum": 10, "maximum": 86400 },
+        "retry": { "$ref": "#/$defs/retry" },
+        "idempotent": { "type": "boolean" },
+        "onError": { "type": "string", "enum": ["fail", "continue", "warn"] }
+      }
+    },
+    "runtime": {
+      "type": "string",
+      "enum": ["lambda", "ssm", "fargate"],
+      "description": "lambda: built-in, project and sql jobs; ssm: a command on a managed instance; fargate: a command in an image"
+    },
+    "sqlFile": { "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./-]{0,255}$", "maxLength": 256 },
+    "sql": {
+      "type": "object",
+      "description": "SQL in the Lambda SQL runtime (pg8000): exactly one of file, inline or truncateScope",
+      "additionalProperties": false,
+      "properties": {
+        "connection": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "registered connection, default target" },
+        "file": {
+          "description": "bundle file or files, checked against bundle.sha256; {{ }} placeholders become SQL literals or identifiers",
+          "type": ["string", "array"],
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./-]{0,255}$",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/sqlFile" }
+        },
+        "inline": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "vars": { "type": "object", "description": "var.<name> in the SQL; values may use {{ }} templates" },
+        "singleTransaction": { "type": "boolean", "description": "all files in one transaction (each file is one otherwise)" },
+        "truncateScope": { "type": "boolean", "description": "truncate ctx.resetTables (the full list, also above the payload cap)" },
+        "cascade": { "type": "boolean", "description": "TRUNCATE ... CASCADE, with truncateScope only" }
+      }
+    },
+    "jobList": {
+      "type": "array",
+      "maxItems": 40,
+      "items": { "$ref": "#/$defs/job" }
+    },
+    "job": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,47}$" },
+        "description": { "type": "string", "maxLength": 512 },
+        "runtime": { "$ref": "#/$defs/runtime" },
+        "sql": { "$ref": "#/$defs/sql" },
+        "handler": {
+          "type": "string",
+          "pattern": "^builtin:[a-z0-9_]+/[a-z0-9_]+$",
+          "description": "Built-in Lambda job, e.g. builtin:checks/postgresql_source_grants"
+        },
+        "function": {
+          "type": "string",
+          "pattern": "^arn:aws[a-z-]*:lambda:[a-z0-9-]+:[0-9]{12}:function:[A-Za-z0-9_-]+(:[A-Za-z0-9_$-]+)?$",
+          "description": "Project-owned Lambda; must be listed in the module variable job_lambda_arns"
+        },
+        "image": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,39}$" },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "type": "string", "maxLength": 1024 }
+        },
+        "with": { "type": "object" },
+        "when": { "type": "string", "maxLength": 512 },
+        "timeoutSeconds": { "type": "integer", "minimum": 10, "maximum": 86400 },
+        "retry": { "$ref": "#/$defs/retry" },
+        "idempotent": { "type": "boolean" },
+        "onError": { "type": "string", "enum": ["fail", "continue", "warn"] },
+        "artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "upload": { "type": "array", "items": { "type": "string", "pattern": "^/out/" } }
+          }
+        }
+      }
+    }
+  }
+}

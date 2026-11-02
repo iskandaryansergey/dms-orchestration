@@ -1,0 +1,47 @@
+{
+  "definition": "job-runner.asl.json",
+  "state": "RunSsmJob",
+  "variables": {
+    "input": {
+      "job": {
+        "name": "dump-target",
+        "index": 0
+      },
+      "phase": "dump",
+      "runId": "ledger-core-1",
+      "dryRun": false
+    },
+    "attempt": 2,
+    "spec": {
+      "specS3Uri": "s3://dms-orch-artifacts-test/runs/ledger/ledger-core-1/jobs/dump/00-dump-target/spec.json",
+      "jobRoleArn": "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger",
+      "timeoutSeconds": 21600
+    },
+    "result": null,
+    "exitCode": 0,
+    "ecsError": null,
+    "ssmRunners": ["i-0aaa", "i-0bbb"],
+    "ssmInstanceId": null,
+    "ssmCommandId": null,
+    "ssmStatus": null,
+    "ssmPolls": 0
+  },
+  "mock": {
+    "result": {
+      "Command": {
+        "CommandId": "0f2c4a1e-7b3d-4e5f-9a6b-1c2d3e4f5a6b",
+        "Status": "Pending"
+      }
+    }
+  },
+  "expect": {
+    "status": "SUCCEEDED",
+    "nextState": "WaitSsm",
+    "variables": {
+      "ssmCommandId": "0f2c4a1e-7b3d-4e5f-9a6b-1c2d3e4f5a6b",
+      "ssmInstanceId": "i-0bbb",
+      "ssmStatus": "Pending",
+      "ssmPolls": 0
+    }
+  }
+}

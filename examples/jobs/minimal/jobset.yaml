@@ -2,17 +2,13 @@
 # build the indexes after the load and compare row counts.
 #
 # Connections (registered in Terraform, projects.<p>.tasks.<t>.connections): source and
-# target, both with data_api_cluster_arn (the row counts run through the Data API).
+# target with host and secret_arn. Every job runs in Lambda: sql jobs and the SQL built-ins
+# reach the databases through pg8000 with TLS verify-full; no image is needed.
 #
 # Validate: uv run python scripts/jobset_tool.py validate examples/jobs/minimal
 # Upload:   scripts/sync-jobs.sh <project> <version> examples/jobs/minimal
 schemaVersion: 1
 description: connection check, reset of partial tables, indexes after the load, row counts
-
-defaults:
-  runtime: fargate            # jobs with a command run in the sql-runner image
-  image: sql-runner           # key in the module variable fargate.images
-  timeoutSeconds: 1800
 
 phases:
   pre:
@@ -21,11 +17,12 @@ phases:
 
   reset:
     - name: truncate-tables
-      command: [psql-run, --connection, target, --truncate, "{{ ctx.resetTables }}"]
+      sql: { connection: target, truncateScope: true }   # ctx.resetTables of the spec file, any size
 
   post:
     - name: indexes
-      command: [psql-run, --connection, target, --file, sql/indexes.sql]
+      sql: { connection: target, file: sql/indexes.sql }
+      when: "not run.dryRun"                # it writes; a dry run session is read-only
 
     - name: row-counts
       handler: builtin:checks/row_counts

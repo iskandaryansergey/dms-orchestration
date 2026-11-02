@@ -2,10 +2,12 @@
 """Sandbox helper: seed data, upload the job set, look at DMS and run timelines.
 
     sandbox.py seed                       # schema + data on the source, dms_source password
-    sandbox.py test-connections           # MaxFileSize 0 fix on PG targets, TestConnection of every endpoint
-    sandbox.py sync-jobs                  # jobs/jobset*.yaml.tmpl as jobs/ledger/e2e/, e2e-dms-only/
-    sandbox.py build-image <git-sha>      # CodeBuild: sql-runner image -> ECR; fails on HIGH/CRITICAL
+    sandbox.py seed --tables 600          # only app.e2e_big_0001…0600 (e2e s4big), one row each
+    sandbox.py test-connections           # TestConnection of every endpoint
+    sandbox.py sync-jobs                  # jobs/jobset*.yaml.tmpl as jobs/ledger/e2e/ and the others
+    sandbox.py build-image <git-sha>      # sandbox only (sql_runner=true): CodeBuild image -> ECR
     sandbox.py sync-jobs-fargate          # jobs/jobset-fargate.yaml.tmpl as jobs/ledger/e2e-fargate/
+    sandbox.py sync-jobs-ssm              # jobs/jobset-ssm.yaml.tmpl as jobs/ledger/e2e-ssm/ (ssm_runner)
     sandbox.py sync-jobs-iam              # jobs/jobset-iam.yaml.tmpl as jobs/ledger/e2e-iam/ (iam_auth)
     sandbox.py counts                     # row counts source vs target
     sandbox.py sql <source|target> "SQL"  # one statement
@@ -134,6 +136,34 @@ def cmd_seed(out: dict[str, Any]) -> None:
     cmd_counts(out)
 
 
+BIG_TABLES_MAX = 2000
+
+
+def big_table_name(i: int) -> str:
+    return f"app.e2e_big_{i:04d}"
+
+
+def big_tables_sql(n: int, rows: bool = False, drop: bool = False) -> str:
+    """One DO block for ``n`` small tables ``app.e2e_big_0001…`` (e2e s4big: a reset above the
+    500-table payload cap). ``rows``: one row each (the source); ``drop``: drop them again."""
+    if not 0 < n <= BIG_TABLES_MAX:
+        raise ValueError(f"--tables must be 1..{BIG_TABLES_MAX}, got {n}")
+    name = "format('app.e2e_big_%s', lpad(i::text, 4, '0'))"
+    if drop:
+        body = f"EXECUTE 'DROP TABLE IF EXISTS ' || {name};"
+    else:
+        body = f"EXECUTE 'CREATE TABLE IF NOT EXISTS ' || {name} || ' (id int PRIMARY KEY, v text NOT NULL)';"
+        if rows:
+            body += f" EXECUTE 'INSERT INTO ' || {name} || ' VALUES (1, ''x'') ON CONFLICT DO NOTHING';"  # noqa: S608 - no input
+    return f"DO $$ BEGIN FOR i IN 1..{n} LOOP {body} END LOOP; END $$"
+
+
+def cmd_seed_big(out: dict[str, Any], n: int) -> None:
+    data_api(out, "source", big_tables_sql(n, rows=True))
+    data_api(out, "target", big_tables_sql(n))
+    print(f"{n} table(s) {big_table_name(1)}…{big_table_name(n)}: one row each on the source, empty on the target")
+
+
 def cmd_counts(out: dict[str, Any]) -> dict[str, Any]:
     result = {}
     for table in TABLES:
@@ -198,7 +228,11 @@ def cmd_build_image(out: dict[str, Any], tag: str) -> int:
     """CodeBuild builds the sql-runner image (sql_runner.tf) and pushes it only if trivy
     finds no fixable HIGH/CRITICAL; ECR then scans it on push (report only). Refuses when the
     source zip in S3 is older than the working tree: the tags are immutable, so a build from
-    old sources would publish old code under the new tag for good."""
+    old sources would publish old code under the new tag for good. Sandbox only: the module
+    never builds an image, and without ``-var sql_runner=true`` there is no project to start."""
+    if not out.get("sql_runner_codebuild_project"):
+        print("no sandbox image build: apply with -var sql_runner=true first (sandbox only, off by default)")
+        return 2
     s = session(out)
     archive = s.client("s3").get_object(Bucket=out["artifacts_bucket"], Key=BUILD_SOURCE_KEY)["Body"].read()
     stale = stale_build_sources(archive, REPO)
@@ -241,32 +275,6 @@ def cmd_build_image(out: dict[str, Any], tag: str) -> int:
     return 0
 
 
-DMS_DEFAULT_MAX_FILE_SIZE_KB = 32768
-
-
-def fix_target_max_file_size(dms: Any, endpoint_arns: list[str]) -> list[str]:
-    """Raise MaxFileSize = 0 on PostgreSQL targets to the DMS default; return the fixed ARNs.
-
-    The upstream dms module always renders postgres_settings for a PostgreSQL target, and the
-    provider then sends max_file_size = 0 (it is in state as 0). DMS 3.5.4 with that loads
-    0 rows into the target and never finishes (seen live, docs/dms-observations.md).
-    The module does not expose the field; until it does, set it through the API. That
-    resets the endpoint's connection test, so run this before TestConnection.
-    """
-    fixed = []
-    for arn in endpoint_arns:
-        for e in dms.describe_endpoints(Filters=[{"Name": "endpoint-arn", "Values": [arn]}])["Endpoints"]:
-            settings = e.get("PostgreSQLSettings") or {}
-            if (
-                e["EndpointType"].upper() == "TARGET"
-                and e["EngineName"] in ("postgres", "aurora-postgresql")
-                and settings.get("MaxFileSize") == 0
-            ):
-                dms.modify_endpoint(EndpointArn=arn, PostgreSQLSettings={"MaxFileSize": DMS_DEFAULT_MAX_FILE_SIZE_KB})
-                fixed.append(arn)
-    return fixed
-
-
 def start_connection_test(dms: Any, ri: str, arn: str) -> bool:
     """TestConnection; False if a test is already running (ModifyEndpoint starts one itself)."""
     try:
@@ -281,8 +289,6 @@ def start_connection_test(dms: Any, ri: str, arn: str) -> bool:
 def cmd_test_connections(out: dict[str, Any]) -> None:
     dms = session(out).client("dms")
     ri = out["replication_instance_arn"]
-    for arn in fix_target_max_file_size(dms, list(out["endpoint_arns"].values())):
-        print(f"MaxFileSize 0 -> {DMS_DEFAULT_MAX_FILE_SIZE_KB} KB on {arn}")
     for arn in out["endpoint_arns"].values():
         start_connection_test(dms, ri, arn)
     deadline = time.monotonic() + 600
@@ -503,7 +509,9 @@ def main(argv: list[str]) -> int:
         return cmd_fetch_upstream(argv[1:])
     out = outputs()
     cmd, args = argv[0], argv[1:]
-    if cmd == "seed":
+    if cmd == "seed" and args[:1] == ["--tables"]:
+        cmd_seed_big(out, int(args[1]))
+    elif cmd == "seed":
         cmd_seed(out)
     elif cmd == "test-connections":
         cmd_test_connections(out)
@@ -511,8 +519,12 @@ def main(argv: list[str]) -> int:
         cmd_sync_jobs(out)
         cmd_sync_jobs(out, "jobset-dms-only.yaml.tmpl", "e2e-dms-only")
         cmd_sync_jobs(out, "jobset-postfail.yaml.tmpl", "e2e-postfail")
+        cmd_sync_jobs(out, "jobset-sql.yaml.tmpl", "e2e-sql")
+        cmd_sync_jobs(out, "jobset-recheck.yaml.tmpl", "e2e-recheck")
     elif cmd == "sync-jobs-fargate":
         cmd_sync_jobs(out, "jobset-fargate.yaml.tmpl", "e2e-fargate")
+    elif cmd == "sync-jobs-ssm":
+        cmd_sync_jobs(out, "jobset-ssm.yaml.tmpl", "e2e-ssm")
     elif cmd == "sync-jobs-iam":
         cmd_sync_jobs(out, "jobset-iam.yaml.tmpl", "e2e-iam")
     elif cmd == "build-image":

@@ -60,7 +60,7 @@ for agents is [`AGENTS.md`](../AGENTS.md).
 - The [`Makefile`](../Makefile) as the single entry point for commands; CI runs the same ones.
 - State machine cases in `tests/sfn/cases/`: an executable specification of the ASL
   branches (`make teststate-dry` builds the requests offline).
-- Schemas in `src/shared/schemas/` and the generated
+- Schemas in `modules/dms-orchestration/src/shared/schemas/` and the generated
   [configuration reference](configuration.md): contracts that tests keep in sync with code.
 - The denylist gate: a mechanical check instead of a reviewer's memory.
 

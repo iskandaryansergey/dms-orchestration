@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run_request.schema.json",
+  "title": "DMS orchestration run request",
+  "description": "Input of the migrate state machine (and of post for operation=post). Only project and taskKey are required; other values fall back to the task defaults registered in SSM, then to the defaults below.",
+  "type": "object",
+  "required": [
+    "project",
+    "taskKey"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "enum": [
+        "1"
+      ],
+      "default": "1"
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,39}$"
+    },
+    "taskKey": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,39}$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,80}$",
+      "description": "operation=post: the run whose post phase is repeated"
+    },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "migrate",
+        "resume",
+        "plan",
+        "post"
+      ],
+      "default": "migrate",
+      "description": "migrate: pre-flight, start DMS, end (post starts on the DMS event); resume: continue a task stopped at a checkpoint; plan: inspect and pre-flight only, report what would happen; post: repeat the post phase of runId (with fromJob: skip jobs already ok)"
+    },
+    "startType": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "start-replication",
+        "resume-processing",
+        "reload-target"
+      ],
+      "default": "auto"
+    },
+    "completion": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "task-stopped"
+      ],
+      "description": "The first iteration is a full load; CDC and cutover belong to the database team"
+    },
+    "failOnTableErrors": {
+      "type": "boolean"
+    },
+    "failOnValidationErrors": {
+      "type": "boolean",
+      "description": "DMS validation gates the run: a table not validated, with failed validation records or full-load error rows fails DmsValidationErrors; false succeeds as COMPLETED_WITH_VALIDATION_ERRORS. A table without a primary key (DMS cannot validate it) never fails the run; the report lists it in validationSkippedTables. Default: the task's fail_on_validation_errors (true)"
+    },
+    "targetReset": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {
+          "type": "string",
+          "enum": [
+            "never",
+            "if-interrupted",
+            "always"
+          ]
+        }
+      }
+    },
+    "allowReset": {
+      "type": "boolean",
+      "default": false,
+      "description": "Pre-flight may turn a manual verdict into reset (truncate the scope, reload-target). Without it a dirty target stops the run as MANUAL"
+    },
+    "preflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxIterations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "description": "prepare → pre-jobs → check again, at most this many times (default 3), then manual"
+        },
+        "exactCountMaxRows": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000000,
+          "description": "count(*) only for tables up to this estimate (default 1000000); larger ones use reltuples"
+        },
+        "verifyRuntime": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "lambda",
+            "fargate"
+          ],
+          "description": "Where the target check runs: lambda (Data API), fargate (psql, verify-target in the sql-runner image), auto (default: fargate for a big last baseline or a target without Data API, when the image exists)"
+        },
+        "fargateAboveTables": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "auto: Fargate when the last baseline had more tables in scope (default 500)"
+        },
+        "fargateAboveBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "auto: Fargate when the last baseline's database was larger (default 53687091200, 50 GiB)"
+        },
+        "allowNoFingerprint": {
+          "type": "boolean",
+          "default": false,
+          "description": "A fresh task without a target fingerprint (no target check) is ready instead of manual (NoFingerprint); it is never reset"
+        }
+      }
+    },
+    "dump": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "pg-dump",
+            "snapshot"
+          ],
+          "description": "pg-dump: pg_dump -Fc of the scope streamed to dumps/ in S3; snapshot: Aurora cluster snapshot (task with snapshot_dumps), restored by the database team as a new cluster"
+        },
+        "snapshotAboveBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The report advises dump.method=snapshot when the target database (pg_database_size) is larger (default 107374182400, 100 GiB)"
+        }
+      }
+    },
+    "assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "failOnWarning": {
+          "type": "boolean"
+        }
+      }
+    },
+    "jobSet": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,39}$",
+      "default": "default"
+    },
+    "jobsVersion": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+    },
+    "autoResume": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "onlyCategories": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z_]+$",
+            "not": {
+              "const": "EXTERNAL_STOP",
+              "description": "EXTERNAL_STOP never resumes by itself (someone stopped the task on purpose)"
+            }
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 6,
+      "description": "Set by post when it chains an auto-resume; operators leave it out"
+    },
+    "parentRunId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,80}$",
+      "description": "Set by post when it chains an auto-resume: the run that failed"
+    },
+    "parentStartedAt": {
+      "type": "string",
+      "maxLength": 40,
+      "description": "Set by post when it chains an auto-resume: when the failed run called StartReplicationTask (tells a task DMS restarted itself from a foreign run)"
+    },
+    "fromJob": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,47}$",
+      "description": "operation=post: start at this post job, skipping the ones already ok"
+    },
+    "dryRun": {
+      "type": "boolean",
+      "default": false
+    },
+    "notify": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "onSuccess": {
+          "type": "boolean",
+          "default": true
+        },
+        "onFailure": {
+          "type": "boolean",
+          "default": true
+        },
+        "onStart": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "requestedBy": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "changeRef": {
+      "type": "string",
+      "maxLength": 64
+    }
+  }
+}

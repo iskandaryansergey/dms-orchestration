@@ -101,8 +101,32 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_https" {
   cidr_ipv4         = var.vpc_cidr
 }
 
+locals {
+  # What the module's network_contract asks for with these variables: rds (snapshot_dumps),
+  # ec2messages and ssmmessages (the SSM runtime; ssm is in interface_endpoints already),
+  # ecr.api and ecr.dkr (the optional Fargate runtime, with sql_runner_image_tag). Not read from
+  # the module output: module.dms depends on these endpoints and the module reads module.dms,
+  # so that would be a cycle; the check below compares the two.
+  interface_endpoints = toset(concat(
+    var.interface_endpoints,
+    var.snapshot_dumps ? ["rds"] : [],
+    var.ssm_runner ? ["ec2messages", "ssmmessages"] : [],
+    local.sql_runner_image != "" ? ["ecr.api", "ecr.dkr"] : [],
+  ))
+}
+
+check "endpoints_cover_the_network_contract" {
+  assert {
+    condition = alltrue([
+      for e in module.dms_orchestration.network_contract.required_vpc_endpoints :
+      contains(local.interface_endpoints, e) if contains(["rds", "ec2messages", "ssmmessages", "ecr.api", "ecr.dkr"], e)
+    ])
+    error_message = "network_contract.required_vpc_endpoints lists an interface endpoint the sandbox does not create."
+  }
+}
+
 resource "aws_vpc_endpoint" "interface" {
-  for_each            = toset(concat(var.interface_endpoints, local.sql_runner_image != "" ? ["ecr.api", "ecr.dkr"] : [], var.snapshot_dumps ? ["rds"] : []))
+  for_each            = local.interface_endpoints
   vpc_id              = aws_vpc.this.id
   service_name        = "com.amazonaws.${var.region}.${each.key}"
   vpc_endpoint_type   = "Interface"
@@ -368,6 +392,16 @@ resource "aws_vpc_security_group_egress_rule" "sql_lambda_vpc" {
   cidr_ipv4         = var.vpc_cidr
 }
 
+# truncate reads spec.json from S3: the gateway endpoint's addresses (prefix list) are outside
+# the VPC CIDR.
+resource "aws_vpc_security_group_egress_rule" "sql_lambda_s3" {
+  security_group_id = aws_security_group.sql_lambda.id
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  prefix_list_id    = aws_vpc_endpoint.gateway["s3"].prefix_list_id
+}
+
 resource "aws_iam_role" "sql_lambda" {
   name = local.sql_lambda
   assume_role_policy = jsonencode({
@@ -385,8 +419,12 @@ resource "aws_iam_role_policy" "sql_lambda" {
   name = "db-secrets"
   role = aws_iam_role.sql_lambda.id
   policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = [aws_secretsmanager_secret.db["source"].arn, aws_secretsmanager_secret.db["target"].arn] }]
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = [aws_secretsmanager_secret.db["source"].arn, aws_secretsmanager_secret.db["target"].arn] },
+      # truncate reads the full reset list from the job's spec.json (above the payload cap).
+      { Effect = "Allow", Action = ["s3:GetObject"], Resource = ["arn:aws:s3:::${module.dms_orchestration.artifacts_bucket}/runs/*/jobs/*/spec.json"] },
+    ]
   })
 }
 
@@ -428,6 +466,7 @@ module "dms_orchestration" {
   subnet_ids  = aws_subnet.public[*].id
   # The VPC is created in this same plan, so the module cannot read its CIDR for the
   # jobs SG egress for_each (Invalid for_each argument): pass it as a known value.
+  https_egress_vpc_cidr    = false
   https_egress_cidr_blocks = [var.vpc_cidr]
 
   # The upstream dms module outputs, same names (docs/upstream-modules-contract.md). Named one by
@@ -480,12 +519,17 @@ module "dms_orchestration" {
                 host           = module.aurora["target"].cluster_endpoint
                 port           = 5432
                 database       = "ledger"
-                iam_policy_arn = try(module.aurora["target"].iam_database_auth.users[local.iam_user].policy_arn, null)
+                iam_policy_arn = try(module.aurora["target"].iam_database_auth.users[local.iam_user].policy_arn, "")
               }
           } : k => v if var.iam_auth })
-          jobs = { default_version = "e2e" }
+          # The e2e job sets are rebuilt per run (sandbox.py sync-jobs), so they are not pinned;
+          # runs still check every file against the bundle.sha256 uploaded with them.
+          jobs = { default_version = "e2e", allow_unpinned = true }
           # snapshot_dumps (s10snap): dump.method = snapshot, the job role may snapshot the target cluster.
-          defaults = { target_reset_policy = "if-interrupted", run_timeout_seconds = 7200, fail_on_table_errors = true, snapshot_dumps = var.snapshot_dumps }
+          # app.audit_notes has no primary key, so DMS cannot validate it ("No primary Key"):
+          # with the module default (true) every load would end FAILED DmsValidationErrors.
+          # No longer needed since such tables are reported, not failed (validationSkippedTables).
+          defaults = { target_reset_policy = "if-interrupted", run_timeout_seconds = 7200, fail_on_table_errors = true, fail_on_validation_errors = false, snapshot_dumps = var.snapshot_dumps }
         }
       }
     }
@@ -498,7 +542,7 @@ module "dms_orchestration" {
   table_deletion_protection   = false
   log_retention_days          = 1
   watchdog_interval_minutes   = 5
-  acknowledged_checks         = ["no_cmk", "no_fargate_images", "lambda_reserved_concurrency"]
+  acknowledged_checks         = ["no_cmk", "lambda_reserved_concurrency"]
 
   # Premigration assessment step (S14), from the dms module's output, off by default per run.
   assessment = var.assessment ? {
@@ -506,6 +550,13 @@ module "dms_orchestration" {
     bucket   = module.dms.premigration_assessment.bucket
     folder   = module.dms.premigration_assessment.folder
   } : null
+
+  # ssm_runner.tf: long jobs (pg-dump, restore, e2e-ssm) on the runner instance.
+  ssm = {
+    enabled           = var.ssm_runner
+    instance_ids      = aws_instance.ssm_runner[*].id
+    instance_role_arn = one(aws_iam_role.ssm_runner[*].arn)
+  }
 
   # sql_runner.tf: the image built by CodeBuild, when its tag is given.
   fargate = {

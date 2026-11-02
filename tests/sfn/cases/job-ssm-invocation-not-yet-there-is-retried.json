@@ -1,0 +1,29 @@
+{
+  "definition": "job-runner.asl.json",
+  "state": "GetSsmInvocation",
+  "variables": {
+    "input": {},
+    "attempt": 1,
+    "spec": {
+      "timeoutSeconds": 600
+    },
+    "result": null,
+    "exitCode": -1,
+    "ecsError": null,
+    "ssmRunners": ["i-0aaa"],
+    "ssmInstanceId": "i-0aaa",
+    "ssmCommandId": "cmd-1",
+    "ssmStatus": "Pending",
+    "ssmPolls": 1
+  },
+  "mock": {
+    "errorOutput": {
+      "error": "Ssm.InvocationDoesNotExistException",
+      "cause": "Invocation does not exist"
+    }
+  },
+  "retrierRetryCount": 0,
+  "expect": {
+    "status": "RETRIABLE"
+  }
+}

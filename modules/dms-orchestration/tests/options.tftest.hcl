@@ -49,7 +49,7 @@ run "bring_your_own_bucket_topic_cluster_sg" {
   }
 
   assert {
-    condition     = jsondecode(aws_sfn_state_machine.job_runner.definition).States.RunFargateJob.Arguments.Cluster == var.fargate.cluster_arn
+    condition     = jsondecode(aws_sfn_state_machine.job_runner[0].definition).States.RunFargateJob.Arguments.Cluster == var.fargate.cluster_arn
     error_message = "jobs run in the caller's cluster"
   }
 
@@ -61,6 +61,31 @@ run "bring_your_own_bucket_topic_cluster_sg" {
   assert {
     condition     = jsonencode(aws_lambda_function.this["watchdog"].vpc_config[0].security_group_ids) == jsonencode(toset(["sg-0aaaabbbbccccdddd"]))
     error_message = "Lambda uses the caller's security groups"
+  }
+
+  assert {
+    condition     = jsonencode([for c in jsondecode(output.bucket_requirements) : c.Control]) == jsonencode(["Versioning", "DefaultEncryption", "DenyInsecureTransport", "DenyDumpsWithoutKms", "Lifecycle"])
+    error_message = "bucket_requirements lists the five controls a brought bucket must have"
+  }
+
+  assert {
+    condition = alltrue([
+      one([for c in jsondecode(output.bucket_requirements) : c.Status if c.Control == "Versioning"]) == "Enabled",
+      one([for c in jsondecode(output.bucket_requirements) : c.SSEAlgorithm if c.Control == "DefaultEncryption"]) == "aws:kms",
+      one([for c in jsondecode(output.bucket_requirements) : c.Statement.Condition.Bool["aws:SecureTransport"] if c.Control == "DenyInsecureTransport"]) == "false",
+      jsonencode(one([for c in jsondecode(output.bucket_requirements) : c.Statement.Resource if c.Control == "DenyDumpsWithoutKms"])) == jsonencode(["arn:aws:s3:::platform-dms-artifacts/dumps/*"]),
+    ])
+    error_message = "the controls name the caller's bucket: versioning on, SSE-KMS, TLS only, dumps only with SSE-KMS"
+  }
+
+  assert {
+    condition = alltrue([
+      one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.Expiration.Days if r.Filter.Prefix == "runs/"]) == 365,
+      one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.Expiration.Days if r.Filter.Prefix == "dumps/"]) == 14,
+      one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.NoncurrentVersionExpiration.NoncurrentDays if r.Filter.Prefix == "jobs/"]) == 90,
+      one([for r in one([for c in jsondecode(output.bucket_requirements) : c.Rules if c.Control == "Lifecycle"]) : r.AbortIncompleteMultipartUpload.DaysAfterInitiation if r.Filter.Prefix == ""]) == 7,
+    ])
+    error_message = "lifecycle rules carry the module's retention values for runs/, dumps/ and jobs/ and abort incomplete uploads bucket-wide"
   }
 
   assert {
@@ -84,7 +109,7 @@ run "customer_managed_key" {
   }
 
   assert {
-    condition     = aws_dynamodb_table.this[0].server_side_encryption[0].kms_key_arn == var.kms_key_arn && aws_sqs_queue.dlq.kms_master_key_id == var.kms_key_arn
+    condition     = aws_dynamodb_table.this[0].server_side_encryption[0].kms_key_arn == var.kms_key_arn && aws_sqs_queue.dlq[0].kms_master_key_id == var.kms_key_arn
     error_message = "table and DLQ encrypted with the CMK"
   }
 
@@ -94,7 +119,7 @@ run "customer_managed_key" {
   }
 
   assert {
-    condition     = length(jsondecode(output.kms_key_policy_requirements)) == 3
+    condition     = length(jsondecode(output.kms_key_policy_statements)) == 3 && length(jsondecode(output.kms_key_policy_requirements)) == 4
     error_message = "key policy requirements are published"
   }
 
@@ -104,23 +129,49 @@ run "customer_managed_key" {
   }
 
   assert {
-    condition     = contains(one([for st in jsondecode(output.kms_key_policy_requirements) : st.Principal.Service if st.Sid == "EventsToEncryptedQueueAndScheduler"]), "cloudwatch.amazonaws.com")
+    condition     = contains(one([for st in jsondecode(output.kms_key_policy_statements) : st.Principal.Service if st.Sid == "EventsToEncryptedQueueAndScheduler"]), "cloudwatch.amazonaws.com")
     error_message = "the CMK key policy must let CloudWatch alarms publish to the encrypted topic"
   }
 
   assert {
-    condition     = contains(one([for st in jsondecode(output.kms_key_policy_requirements) : st.Principal.AWS if st.Sid == "ModuleRoles"]), "arn:aws:iam::111122223333:role/dms-orch-stage-job-ledger")
+    condition     = contains(one([for st in jsondecode(output.kms_key_policy_statements) : st.Principal.AWS if st.Sid == "ModuleRoles"]), "arn:aws:iam::111122223333:role/dms-orch-stage-job-ledger")
     error_message = "project job roles must be allowed to use the CMK"
   }
 
   assert {
-    condition     = length([for st in jsondecode(aws_iam_role_policy.lambda_waiter.policy).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
+    condition     = length([for st in jsondecode(aws_iam_role_policy.lambda_waiter[0].policy).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
     error_message = "roles may use the CMK"
   }
 
   assert {
     condition     = aws_lambda_function.this["dms_event_handler"].reserved_concurrent_executions == 5 && aws_lambda_function.this["resolve_context"].reserved_concurrent_executions == -1
     error_message = "reserved concurrency only for the event handler and watchdog"
+  }
+}
+
+# Fargate is the optional third runtime (ADR 0011): images turn on the cluster, the task
+# definitions, the ECS roles and the ECR endpoints, all of which are absent by default.
+run "fargate_optional" {
+  command = apply
+
+  assert {
+    condition     = length(aws_ecs_cluster.this) == 1 && output.ecs_cluster_arn == aws_ecs_cluster.this[0].arn
+    error_message = "fargate.images without cluster_arn creates the cluster and exports its ARN"
+  }
+
+  assert {
+    condition     = keys(aws_ecs_task_definition.job) == ["sql-runner"] && length(aws_iam_role.ecs_execution) == 1 && length(aws_iam_role.ecs_task) == 1
+    error_message = "one task definition per image and the ECS execution and task roles"
+  }
+
+  assert {
+    condition     = contains(output.network_contract.required_vpc_endpoints, "ecr.api") && contains(output.network_contract.required_vpc_endpoints, "ecr.dkr")
+    error_message = "Fargate pulls the image through the ECR endpoints"
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_role.job["ledger"].assume_role_policy, "EcsTasksOfThisAccount") && jsondecode(aws_ssm_parameter.task["ledger/core"].value).runtimes.fargate == true
+    error_message = "job roles trust ECS tasks and the registration lists the Fargate runtime"
   }
 }
 
@@ -144,6 +195,25 @@ run "advisory_checks_warn" {
   ]
 }
 
+run "sql_jobs_off_and_no_images_without_warnings" {
+  command = apply
+
+  variables {
+    lambda  = { sql_jobs_enabled = false }
+    fargate = {}
+  }
+
+  # No sql_jobs function, no route to it, nothing to invoke; no image is not a warning any more.
+  assert {
+    condition = (
+      !contains(keys(aws_lambda_function.this), "sql_jobs")
+      && aws_lambda_function.this["prepare_job"].environment[0].variables.SQL_JOBS_ARN == ""
+      && !anytrue([for r in flatten([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st.Resource if st.Sid == "InvokeJobLambdas"]) : strcontains(r, "sql_jobs")])
+    )
+    error_message = "lambda.sql_jobs_enabled = false removes the function and its routes"
+  }
+}
+
 run "platform_checks_outside_the_sandbox" {
   command = plan
 
@@ -153,4 +223,71 @@ run "platform_checks_outside_the_sandbox" {
 
   # stage without the platform topic and with state in the DMS workspace: both advisories fire
   expect_failures = [check.own_sns_topic_outside_sandbox, check.state_in_the_dms_workspace]
+}
+
+# SSM runtime with a document the platform registers itself (ssm.document_name_override): the
+# module ships the runtime zip and the content, the job-runner may send only that document.
+run "ssm_runtime_with_a_platform_document" {
+  command = apply
+
+  variables {
+    kms_key_arn = "arn:aws:kms:eu-west-2:111122223333:key/11111111-2222-3333-4444-555555555555"
+    ssm = {
+      enabled                = true
+      target_tags            = { Role = "dms-runner" }
+      instance_role_arn      = "arn:aws:iam::111122223333:role/team-dms-runner"
+      document_name_override = "platform-dms-orch-job"
+      runner_user            = "dmsjob"
+    }
+  }
+
+  assert {
+    condition     = length(aws_ssm_document.orch_job) == 0 && output.ssm_document_name == "platform-dms-orch-job"
+    error_message = "with document_name_override the module creates no document"
+  }
+
+  assert {
+    condition     = one([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st.Resource if st.Sid == "SendJobDocument"]) == ["arn:aws:ssm:eu-west-2:111122223333:document/platform-dms-orch-job"]
+    error_message = "the job-runner sends only the named document"
+  }
+
+  assert {
+    condition     = strcontains(output.ssm_document_content, aws_s3_object.ssm_runtime[0].key) && strcontains(output.ssm_document_content, "runner_user='dmsjob'")
+    error_message = "the content to register names the uploaded runtime zip and the runner user"
+  }
+
+  assert {
+    condition     = aws_s3_object.ssm_runtime[0].server_side_encryption == "aws:kms" && aws_s3_object.ssm_runtime[0].kms_key_id == var.kms_key_arn
+    error_message = "the runtime zip is encrypted with the CMK"
+  }
+
+  assert {
+    condition     = length([for st in jsondecode(output.ssm_runner_policy_json).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
+    error_message = "the runner instance profile can decrypt the runtime zip and the job objects"
+  }
+}
+
+run "ssm_runtime_needs_runners_and_the_instance_role" {
+  command = plan
+
+  variables {
+    ssm = { enabled = true }
+  }
+
+  expect_failures = [var.ssm]
+}
+
+run "ssm_runtime_never_runs_jobs_as_root" {
+  command = plan
+
+  variables {
+    ssm = {
+      enabled           = true
+      instance_ids      = ["i-0123456789abcdef0"]
+      instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner"
+      runner_user       = "root"
+    }
+  }
+
+  expect_failures = [var.ssm]
 }

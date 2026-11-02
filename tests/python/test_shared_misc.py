@@ -112,6 +112,7 @@ BAD_REQUESTS = [
     {"project": "ledger", "taskKey": "core", "dryRun": "yes"},
     {"project": "ledger", "taskKey": "core", "autoResume": {"maxAttempts": 9}},
     {"project": "ledger", "taskKey": "core", "autoResume": {"onlyCategories": ["A", "A"]}},
+    {"project": "ledger", "taskKey": "core", "autoResume": {"onlyCategories": ["DMS_RESTART", "EXTERNAL_STOP"]}},
     {"project": "ledger", "taskKey": "core", "jobsVersion": "../../etc"},
     # v4: the first iteration is a full load; waiting for CDC is no longer part of the contract
     {"project": "ledger", "taskKey": "core", "completion": "full-load-complete"},
@@ -138,6 +139,18 @@ def test_validator_agrees_with_jsonschema_on_run_requests(req):
         ours_ok = False
     assert ours_ok == reference_ok
     assert ours_ok == (req in GOOD_REQUESTS)
+
+
+def test_external_stop_is_refused_as_an_auto_resume_category_with_a_clear_message():
+    """s19 (review item 5): someone stopped the task on purpose; it is never retryable, so a
+    request that lists it would only look as if it resumed by itself."""
+    req = {"project": "ledger", "taskKey": "core", "autoResume": {"onlyCategories": ["EXTERNAL_STOP"]}}
+    with pytest.raises(validation.ValidationError) as err:
+        validation.validate("run_request", req)
+    assert err.value.errors == [
+        "$.autoResume.onlyCategories[0]: 'EXTERNAL_STOP' is not allowed: "
+        "EXTERNAL_STOP never resumes by itself (someone stopped the task on purpose)"
+    ]
 
 
 def test_with_defaults_fills_nested_defaults_without_mutating_input():

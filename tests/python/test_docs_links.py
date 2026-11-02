@@ -89,8 +89,8 @@ def test_agents_md_names_only_existing_make_targets_and_paths():
     for required in ("lint", "test", "teststate-dry", "denylist", "sandbox-validate", "docs-check"):
         assert required in {t for cmd in named for t in cmd.split()}, required
     for contract in (
-        "src/shared/schemas/run_request.schema.json",
-        "src/shared/schemas/jobset.schema.json",
+        "modules/dms-orchestration/src/shared/schemas/run_request.schema.json",
+        "modules/dms-orchestration/src/shared/schemas/jobset.schema.json",
         "modules/dms-orchestration/asl/",
     ):
         assert contract in agents and (ROOT / contract).exists(), contract
@@ -182,14 +182,49 @@ def test_getting_started_follows_the_runbook_order():
 # --- README, architecture, RUNBOOK, sandbox walkthrough ---------------------------------------
 
 
-def test_readme_is_the_entry_point_of_release_0_1_0():
+def test_getting_started_needs_no_image():
+    text = read("docs/getting-started.md")
+    prerequisites = text.split("## 1. Prerequisites", 1)[1].split("\n## ", 1)[0]
+    for row in (ln for ln in prerequisites.splitlines() if "sql-runner" in ln or "Fargate" in ln):
+        assert "optional" in row.lower(), row
+    minimum = text.split("```hcl", 1)[1].split("```", 1)[0]
+    assert "fargate" not in minimum, "the minimal wiring runs without the optional Fargate runtime"
+
+
+def test_readme_is_the_entry_point_of_release_0_2_0():
     text = read("README.md")
     assert "## Status" not in text
-    assert "## Release 0.1.0" in text and "](CHANGELOG.md)" in text
+    assert "## Release 0.2.0" in text and "](CHANGELOG.md)" in text
     for target in ("docs/getting-started.md", "docs/architecture.md", "RUNBOOK.md", "docs/troubleshooting.md"):
         assert f"]({target})" in text, target
     sources = re.findall(r'^\s*source\s*=\s*"([^"]+)"', text, re.MULTILINE)
     assert sources and all("<org>/dms-orchestration" in s for s in sources), sources
+
+
+@pytest.mark.parametrize("doc", ["README.md", "docs/getting-started.md"])
+def test_module_sources_name_the_current_release(doc):
+    sources = re.findall(r'^\s*source\s*=\s*"([^"]+)"', read(doc), re.MULTILINE)
+    assert sources and all(s.endswith("?ref=v0.2.0") for s in sources), sources
+
+
+OLD_RUN_PREFIX = re.compile(r"runs/<runId>/")
+
+
+def test_run_artifacts_are_named_under_the_project():
+    """Run artifacts live under runs/<project>/<runId>/; the 0.1 layout is gone from docs and code."""
+    module = ROOT / "modules/dms-orchestration"
+    files = [ROOT / d for d in DOCS if d != "CHANGELOG.md"] + sorted((module / "src").rglob("*.py"))
+    stale = [
+        str(p.relative_to(ROOT))
+        for p in files
+        if "vendor" not in p.parts and OLD_RUN_PREFIX.search(p.read_text(encoding="utf-8"))
+    ]
+    assert not stale, f"runs/<runId>/ instead of runs/<project>/<runId>/: {stale}"
+
+
+def test_observations_do_not_describe_the_old_restore():
+    text = read("docs/dms-observations.md")
+    assert "into `psql --single-transaction`" not in text, "the restore wraps the stream in BEGIN/COMMIT"
 
 
 def test_architecture_is_one_page_with_existing_components():
@@ -231,9 +266,13 @@ def test_sandbox_walkthrough_names_every_scenario_variable_and_mask():
     )
     assert not missing, f"scenarios without a command in the sandbox README: {missing}"
     variables = re.findall(r'^variable "([a-z_]+)"', read("examples/sandbox/variables.tf"), re.MULTILINE)
-    toggles = [v for v in variables if v in ("sql_runner", "assessment", "snapshot_dumps", "iam_auth", "sqs_fanout")]
-    assert len(toggles) == 5
-    for v in [*toggles, "operator_cidr", "sql_runner_image_tag"]:
+    toggles = [
+        v
+        for v in variables
+        if v in ("sql_runner", "ssm_runner", "assessment", "snapshot_dumps", "iam_auth", "sqs_fanout")
+    ]
+    assert len(toggles) == 6
+    for v in [*toggles, "operator_cidr", "sql_runner_image_tag", "runner_ami_id"]:
         assert f"TF_VAR_{v}" in text, v
     name = re.search(r'variable "name" \{[^}]*default\s*=\s*"([^"]+)"', read("examples/sandbox/variables.tf"), re.S)
     assert f"verify_destroyed.py --match {name.group(1)}" in text
@@ -268,10 +307,31 @@ def test_state_machine_doc_names_only_real_states():
     names = set(re.findall(r"\b[A-Z][a-z]+(?:[A-Z][a-z0-9]*)+\b", diagrams))
     states = _asl_states()
     assert {"ResolveContext", "TargetVerify", "ArmGuard", "StartResume", "WriteReport"} <= names & states
-    code = "".join(p.read_text(encoding="utf-8") for p in [*(ROOT / "modules/dms-orchestration/asl").glob("*.json"),
-                                                          *(ROOT / "src").rglob("*.py")])  # fmt: skip
+    module = ROOT / "modules/dms-orchestration"
+    sources = [*(module / "asl").glob("*.json"), *(module / "src").rglob("*.py")]
+    code = "".join(p.read_text(encoding="utf-8") for p in sources)
     unknown = sorted(n for n in names - states if n not in code)
     assert not unknown, f"docs/state-machine.md names states that do not exist: {unknown}"
+
+
+STATE_MACHINE_TOPICS = (
+    "RecheckTask",
+    "CheckContextVersion",
+    "RecordContextVersion",
+    "LockLost",
+    "FindSsmRunner",
+    "RunSsmJob",
+    "GetSsmInvocation",
+    "DmsValidationErrors",
+    "COMPLETED_WITH_VALIDATION_ERRORS",
+    "failOnValidationErrors",
+)
+
+
+def test_state_machine_doc_covers_the_0_2_states_and_outcomes():
+    text = read("docs/state-machine.md")
+    missing = [t for t in STATE_MACHINE_TOPICS if t not in text]
+    assert not missing, f"not in docs/state-machine.md: {missing}"
 
 
 @pytest.mark.parametrize("doc", ["docs/state-machine.md", "docs/preflight.md"])
@@ -283,7 +343,7 @@ def test_state_machine_and_preflight_docs_are_current(doc):
 
 def test_preflight_doc_lists_every_manual_reason_and_verdict():
     text = read("docs/preflight.md")
-    preflight = (ROOT / "src/shared/preflight.py").read_text(encoding="utf-8")
+    preflight = (ROOT / "modules/dms-orchestration/src/shared/preflight.py").read_text(encoding="utf-8")
     # manual("<Reason>", ...) calls, plus the two reasons Verdict("manual", ...) spells out.
     reasons = set(re.findall(r'manual\("([A-Za-z]+)"', preflight)) | {"PreflightTablesMissing", "ResetNotConfigured"}
     assert {"RestoredTarget", "TargetChanged", "TargetNotEmpty", "AlreadyCompleted"} <= reasons

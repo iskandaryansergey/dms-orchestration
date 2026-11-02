@@ -78,15 +78,17 @@ module.dms_orchestration.aws_ssm_parameter.task`. The adapter above avoids it.
 
 ### 2.3 Known defect of one implementation: endpoint secrets created in the same plan → `Invalid for_each argument`
 
-One implementation filters endpoints on `e.secret_arn != ""` to build the `for_each` of
-the per-endpoint secret-access IAM role. When the secret is created in the same
-configuration its ARN is unknown at plan, so the map keys are unknown and the plan
-fails. Workaround in the sandbox: `terraform apply -target=aws_secretsmanager_secret.db`
-first. The same unknown keys fail a second `destroy` once the secrets are gone;
-workaround: `destroy -target` by `state list` (sandbox README).
-Fix for such an implementation: key the map on static configuration —
-`e.username == "" && e.secret_access_role_arn == ""` (an endpoint is on the secret path
-exactly when it has no username; a validation requires one credential source).
+Fixed upstream from 08def61; the orchestrator no longer works around it. Use a commit at or
+after it (`UPSTREAM_MODULES_REF`, [`upstream.env.example`](../examples/sandbox/upstream.env.example)).
+
+Before that commit the implementation filtered endpoints on `e.secret_arn != ""` to build
+the `for_each` of the per-endpoint secret-access IAM role. When the secret is created in
+the same configuration its ARN is unknown at plan, so the map keys are unknown and the plan
+fails; the same unknown keys fail a second `destroy` once the secrets are gone. The fix
+keys the map on static configuration — `e.username == "" && e.secret_access_role_arn == ""`
+(an endpoint is on the secret path exactly when it has no username; a validation requires
+one credential source). Any other implementation must plan with secrets created in the
+same configuration.
 
 ### 2.4 Defaults the orchestrator relies on
 
@@ -96,7 +98,7 @@ exactly when it has no username; a validation requires one credential source).
 | any `terraform apply` that changes a running task **stops it** | a run in progress sees an unexpected stop | RUNBOOK: no applies of the dms module during a run |
 | `target_table_prep_mode = DO_NOTHING`; `DROP_AND_CREATE`/`TRUNCATE_BEFORE_LOAD` need an explicit opt-in | the target schema must exist; truncation on reset is our `reset` job | ✅ consistent with `target_reset_policy` |
 | `control_schema = "dms_control"` | the schema must exist on the target before the first start | sandbox seed creates it; on the target platform — the target-schema pipeline |
-| `validation_enabled = true` | full-load task keeps running for validation after the load | handled by the outcome evaluation |
+| `validation_enabled = true` | full-load task keeps running for validation after the load | handled by the outcome evaluation; validation mismatches fail the run unless `fail_on_validation_errors = false` |
 | `TableErrorPolicy = SUSPEND_TABLE`, escalation `STOP_TASK` after `table_error_max` (50) | a table error does not fail the task | our `fail_on_table_errors` defaults to `true`: the run fails `DmsTableErrors` before post-jobs |
 | `create_log_group = true`, `log_retention_days = 30`, **`log_group_skip_destroy = true`** | our log tail works from the first run; the group survives `destroy` | sandbox sets `log_group_skip_destroy = false` |
 | `create_event_subscriptions` (SNS) | independent of our EventBridge rule on `aws.dms` | ✅ no conflict |
@@ -118,12 +120,17 @@ exactly when it has no username; a validation requires one credential source).
 
 ### 2.6 Known defect of one implementation: `MaxFileSize = 0` on a PostgreSQL target
 
-One implementation renders `postgres_settings` for a PostgreSQL target without
-`max_file_size`; provider 5.100 then sends 0. DMS 3.5.4 never loads a row (sandbox:
-every table `Before load` for 8 and 40 min; with 32768 KB the load takes ~10 s).
-Sandbox workaround: `sbx test-connections` sets 32768 through `ModifyEndpoint`.
-Fix for such an implementation: `postgres.max_file_size = optional(number, 32768)`, sent
-for targets and part of the target's settings hash (left out of the source hash, so
-sources are not replaced). Existing PostgreSQL target endpoints are replaced once on
-upgrade (the provider sends `postgres_settings` on create only), and their tasks with
-them.
+Fixed upstream from 08def61; the orchestrator no longer works around it. Use a commit at or
+after it.
+
+Before that commit the implementation rendered `postgres_settings` for a PostgreSQL target
+without `max_file_size`; provider 5.100 then sends 0. DMS 3.5.4 never loads a row (sandbox:
+every table `Before load` for 8 and 40 min; with 32768 KB the load takes ~10 s). The fix:
+`postgres.max_file_size = optional(number, 32768)`, sent for targets and part of the
+target's settings hash (left out of the source hash, so sources are not replaced).
+Existing PostgreSQL target endpoints are replaced once on upgrade (the provider sends
+`postgres_settings` on create only), and their tasks with them.
+
+The check in `inspect_task` (`endpoint_problems`) stays as a safety net for an older
+commit, another implementation or a manual change: a target with `MaxFileSize = 0` is
+reported before the task starts, and a run other than `plan` is refused.

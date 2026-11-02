@@ -1,0 +1,46 @@
+{
+  "definition": "job-runner.asl.json",
+  "state": "RunSsmJob",
+  "variables": {
+    "input": {
+      "job": {
+        "name": "dump-target",
+        "index": 0
+      },
+      "phase": "dump",
+      "runId": "ledger-core-1",
+      "dryRun": false
+    },
+    "attempt": 1,
+    "spec": {
+      "specS3Uri": "s3://dms-orch-artifacts-test/runs/ledger/ledger-core-1/jobs/dump/00-dump-target/spec.json",
+      "jobRoleArn": "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger",
+      "timeoutSeconds": 21600
+    },
+    "result": null,
+    "exitCode": 0,
+    "ecsError": null,
+    "ssmRunners": ["i-0aaa"],
+    "ssmInstanceId": null,
+    "ssmCommandId": null,
+    "ssmStatus": null,
+    "ssmPolls": 0
+  },
+  "mock": {
+    "errorOutput": {
+      "error": "Ssm.InvalidInstanceIdException",
+      "cause": "Instances not in a valid state"
+    }
+  },
+  "expect": {
+    "status": "CAUGHT_ERROR",
+    "nextState": "RecordJob",
+    "variables": {
+      "result": {
+        "status": "fail",
+        "message": "SSM sendCommand failed: Ssm.InvalidInstanceIdException: Instances not in a valid state",
+        "summary": {}
+      }
+    }
+  }
+}

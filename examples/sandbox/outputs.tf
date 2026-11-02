@@ -81,6 +81,11 @@ output "ssm_prefix" {
   value = trimsuffix(module.dms_orchestration.ssm_parameter_names["ledger/core"], "/ledger/core")
 }
 
+output "ssm_runner" {
+  description = "SSM runner instance id (ssm_runner = true), else null: e2e s1ssm and s10 on SSM."
+  value       = one(aws_instance.ssm_runner[*].id)
+}
+
 output "fanout_queue_url" {
   description = "S16 queue (sqs_fanout = true), else null."
   value       = var.sqs_fanout ? aws_sqs_queue.fanout[0].url : null

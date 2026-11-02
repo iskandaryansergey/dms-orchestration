@@ -58,4 +58,4 @@ two entry points).
   different input — treated as "already started". The e2e scenario `idem-sfn` raises a real collision from
   `post`'s `StartResume` against AWS (`docs/testing.md`).
 - Removed: `register_waiter`, `.waitForTaskToken`, `heartbeat_seconds`,
-  `WAITER#*`, callback resend, `src/shared/waiting.py`, `task-runner.asl.json`.
+  `WAITER#*`, callback resend, `modules/dms-orchestration/src/shared/waiting.py`, `task-runner.asl.json`.

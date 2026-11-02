@@ -32,7 +32,7 @@ variables {
               database   = "ledger"
             }
           }
-          jobs = { default_version = "v1" }
+          jobs = { default_version = "v1", bundles = { v1 = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0" } }
         }
       }
     }
@@ -55,14 +55,14 @@ run "state_machines" {
   }
 
   assert {
-    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner]) : m.type == "STANDARD"])
+    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner[0]]) : m.type == "STANDARD"])
     error_message = "state machines must be STANDARD (ADR 0001)"
   }
 
   # Review finding 9: state input/output (table names, job summaries, DMS messages)
   # stays out of CloudWatch Logs unless the caller opts in.
   assert {
-    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner]) : !m.logging_configuration[0].include_execution_data])
+    condition     = alltrue([for m in concat(values(aws_sfn_state_machine.run), [aws_sfn_state_machine.job_runner[0]]) : !m.logging_configuration[0].include_execution_data])
     error_message = "execution data must not be logged by default"
   }
 
@@ -109,7 +109,7 @@ run "state_machines" {
   }
 
   assert {
-    condition     = aws_cloudwatch_event_rule.execution_status.event_pattern == jsonencode({ source = ["aws.states"], "detail-type" = ["Step Functions Execution Status Change"], detail = { status = ["FAILED", "TIMED_OUT", "ABORTED"], stateMachineArn = [for m in ["migrate", "post"] : "arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run[m].name}"] } })
+    condition     = aws_cloudwatch_event_rule.execution_status[0].event_pattern == jsonencode({ source = ["aws.states"], "detail-type" = ["Step Functions Execution Status Change"], detail = { status = ["FAILED", "TIMED_OUT", "ABORTED"], stateMachineArn = [for m in ["migrate", "post"] : "arn:aws:states:eu-west-2:111122223333:stateMachine:${aws_sfn_state_machine.run[m].name}"] } })
     error_message = "release_lock listens to both run machines"
   }
 
@@ -124,17 +124,17 @@ run "state_machines" {
   }
 
   assert {
-    condition     = jsonencode(jsondecode(aws_sfn_state_machine.job_runner.definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.Subnets) == jsonencode(var.subnet_ids)
+    condition     = jsonencode(jsondecode(aws_sfn_state_machine.job_runner[0].definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.Subnets) == jsonencode(var.subnet_ids)
     error_message = "Fargate jobs must run in the module subnets"
   }
 
   assert {
-    condition     = jsondecode(aws_sfn_state_machine.job_runner.definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp == "DISABLED"
+    condition     = jsondecode(aws_sfn_state_machine.job_runner[0].definition).States.RunFargateJob.Arguments.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp == "DISABLED"
     error_message = "Fargate jobs get no public IP by default"
   }
 
   assert {
-    condition     = aws_sfn_state_machine.run["migrate"].logging_configuration[0].level == "ALL" && startswith(aws_cloudwatch_log_group.sfn.name, "/aws/vendedlogs/states/")
+    condition     = aws_sfn_state_machine.run["migrate"].logging_configuration[0].level == "ALL" && startswith(aws_cloudwatch_log_group.sfn[0].name, "/aws/vendedlogs/states/")
     error_message = "state machine logs go to a /aws/vendedlogs/ group"
   }
 
@@ -173,6 +173,12 @@ run "storage_and_registration" {
     error_message = "fail_on_table_errors defaults to true"
   }
 
+  # Tables DMS did not validate fail the run unless the task opts out.
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).defaults.failOnValidationErrors == true
+    error_message = "fail_on_validation_errors defaults to true"
+  }
+
   assert {
     condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).taskArn == var.dms.task_arns.core
     error_message = "registration must carry the task ARN from the DMS module"
@@ -191,6 +197,14 @@ run "storage_and_registration" {
   assert {
     condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).jobs.s3Prefix == "jobs/ledger"
     error_message = "default job set prefix is jobs/<project>"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ssm_parameter.task["ledger/core"].value).jobs.bundles == { v1 = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0" }
+      && jsondecode(aws_ssm_parameter.task["ledger/core"].value).jobs.allowUnpinned == false
+    )
+    error_message = "the registration carries the pinned bundle hashes; unpinned job sets are refused by default"
   }
 
   assert {
@@ -215,8 +229,33 @@ run "lambda_and_events" {
   command = apply
 
   assert {
-    condition     = length(aws_lambda_function.this) == 9
-    error_message = "9 Lambda functions expected (register_waiter is gone)"
+    condition     = length(aws_lambda_function.this) == 10
+    error_message = "10 Lambda functions expected (register_waiter is gone, sql_jobs on by default)"
+  }
+
+  # Lambda SQL runtime (ADR 0011): the default for sql: jobs, the full Lambda timeout, more memory.
+  assert {
+    condition = (
+      aws_lambda_function.this["sql_jobs"].timeout == 900
+      && aws_lambda_function.this["sql_jobs"].memory_size == 1024
+      && aws_lambda_function.this["sql_jobs"].handler == "lambdas.sql_jobs.handler.handler"
+      && aws_lambda_function.this["sql_jobs"].role == aws_iam_role.lambda_jobs[0].arn
+      && aws_lambda_function.this["builtin_jobs"].memory_size == 512
+    )
+    error_message = "sql_jobs: 900 s, 1024 MB, the jobs role; the others keep lambda.memory_mb"
+  }
+
+  assert {
+    condition     = endswith(aws_lambda_function.this["prepare_job"].environment[0].variables.SQL_JOBS_ARN, ":function:dms-orch-sandbox-sql_jobs")
+    error_message = "prepare_job routes sql jobs to the sql_jobs function"
+  }
+
+  assert {
+    condition = (
+      contains(flatten([for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st.Resource if st.Sid == "InvokeJobLambdas"]), aws_lambda_function.this["sql_jobs"].arn)
+      && contains(flatten([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st.Resource if st.Sid == "Logs"]), "${aws_cloudwatch_log_group.lambda["sql_jobs"].arn}:*")
+    )
+    error_message = "the job runner invokes sql_jobs; sql_jobs logs to its own group with the jobs role"
   }
 
   assert {
@@ -230,22 +269,22 @@ run "lambda_and_events" {
   }
 
   assert {
-    condition     = jsondecode(aws_cloudwatch_event_rule.dms_task_state.event_pattern).source == ["aws.dms"]
+    condition     = jsondecode(aws_cloudwatch_event_rule.dms_task_state[0].event_pattern).source == ["aws.dms"]
     error_message = "DMS rule listens to aws.dms"
   }
 
   assert {
-    condition     = jsondecode(aws_cloudwatch_event_rule.execution_status.event_pattern).detail.status == ["FAILED", "TIMED_OUT", "ABORTED"]
+    condition     = jsondecode(aws_cloudwatch_event_rule.execution_status[0].event_pattern).detail.status == ["FAILED", "TIMED_OUT", "ABORTED"]
     error_message = "lock safety net on FAILED/TIMED_OUT/ABORTED"
   }
 
   assert {
-    condition     = aws_scheduler_schedule.watchdog.schedule_expression == "rate(5 minutes)"
+    condition     = aws_scheduler_schedule.watchdog[0].schedule_expression == "rate(5 minutes)"
     error_message = "watchdog every 5 minutes by default"
   }
 
   assert {
-    condition     = aws_cloudwatch_event_target.dms_task_state.dead_letter_config[0].arn == aws_sqs_queue.dlq.arn
+    condition     = aws_cloudwatch_event_target.dms_task_state[0].dead_letter_config[0].arn == aws_sqs_queue.dlq[0].arn
     error_message = "undeliverable DMS events go to the DLQ"
   }
 
@@ -267,11 +306,11 @@ run "lambda_and_events" {
   # The pre-check checks/connections runs TestConnection itself,
   # only on this replication instance and the registered endpoints.
   assert {
-    condition = toset(flatten([one([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Resource if st.Sid == "TestEndpointConnections"])])) == toset([
+    condition = toset(flatten([one([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st.Resource if st.Sid == "TestEndpointConnections"])])) == toset([
       "arn:aws:dms:eu-west-2:111122223333:rep:RI1",
       "arn:aws:dms:eu-west-2:111122223333:endpoint:SRC",
       "arn:aws:dms:eu-west-2:111122223333:endpoint:TGT",
-    ]) && one([for st in jsondecode(aws_iam_role_policy.lambda_jobs.policy).Statement : st.Action if st.Sid == "TestEndpointConnections"]) == ["dms:TestConnection"]
+    ]) && one([for st in jsondecode(aws_iam_role_policy.lambda_jobs[0].policy).Statement : st.Action if st.Sid == "TestEndpointConnections"]) == ["dms:TestConnection"]
     error_message = "built-in jobs may run TestConnection on the registered endpoints only"
   }
 
@@ -333,7 +372,121 @@ run "dumps_are_kms_only_and_expire" {
   }
 
   assert {
+    condition     = one([for r in aws_s3_bucket_lifecycle_configuration.artifacts[0].rule : r.abort_incomplete_multipart_upload[0].days_after_initiation if r.id == "abort-incomplete-uploads" && r.filter[0].prefix == ""]) == 7
+    error_message = "incomplete multipart uploads are aborted bucket-wide after 7 days"
+  }
+
+  assert {
     condition     = strcontains(aws_s3_bucket_policy.artifacts[0].policy, "DenyDumpsWithoutKms")
     error_message = "dumps/ accept only SSE-KMS"
+  }
+}
+
+run "network_contract_without_snapshot_dumps" {
+  command = plan
+
+  assert {
+    condition     = !contains(output.network_contract.required_vpc_endpoints, "rds")
+    error_message = "no rds endpoint while no task has snapshot_dumps"
+  }
+}
+
+# dump.method = snapshot calls the RDS API from the jobs: the rds interface endpoint becomes required.
+run "network_contract_with_snapshot_dumps" {
+  command = plan
+
+  variables {
+    job_secret_arns = ["arn:aws:secretsmanager:eu-west-2:111122223333:secret:dms/ledger/target/runner-XyZ123"]
+    projects = {
+      ledger = {
+        tasks = {
+          core = {
+            connections = {
+              target = {
+                engine               = "postgresql"
+                secret_arn           = "arn:aws:secretsmanager:eu-west-2:111122223333:secret:dms/ledger/target/runner-XyZ123"
+                data_api_cluster_arn = "arn:aws:rds:eu-west-2:111122223333:cluster:ledger-target"
+              }
+            }
+            defaults = { snapshot_dumps = true }
+          }
+        }
+      }
+    }
+  }
+
+  assert {
+    condition     = contains(output.network_contract.required_vpc_endpoints, "rds")
+    error_message = "a task with snapshot_dumps makes the rds endpoint required"
+  }
+}
+
+# Fargate is an optional third runtime (ADR 0011): with the default fargate = {} the module
+# creates no ECS cluster, no task definitions, no ECS roles and asks for no ECR endpoints.
+run "no_ecs_resources_by_default" {
+  command = apply
+
+  variables {
+    fargate = {}
+  }
+
+  assert {
+    condition     = length(aws_ecs_cluster.this) == 0 && length(aws_ecs_task_definition.job) == 0
+    error_message = "no ECS cluster and no task definitions without fargate.images"
+  }
+
+  assert {
+    condition     = length(aws_iam_role.ecs_execution) == 0 && length(aws_iam_role.ecs_task) == 0 && length(aws_iam_role_policy.ecs_execution) == 0 && length(aws_iam_role_policy.ecs_task) == 0
+    error_message = "no ECS execution or task roles without fargate.images"
+  }
+
+  assert {
+    condition     = output.ecs_cluster_arn == null && output.task_definition_arns == {}
+    error_message = "ecs_cluster_arn is null without fargate.images"
+  }
+
+  assert {
+    condition     = !contains(output.network_contract.required_vpc_endpoints, "ecr.api") && !contains(output.network_contract.required_vpc_endpoints, "ecr.dkr")
+    error_message = "no ECR endpoints in the network contract without fargate.images"
+  }
+
+  assert {
+    condition     = !strcontains(aws_iam_role.job["ledger"].assume_role_policy, "ecs-tasks.amazonaws.com") && !strcontains(aws_iam_role_policy.job_runner[0].policy, "ecs:RunTask") && !strcontains(aws_iam_role_policy.job_runner[0].policy, "iam:PassRole")
+    error_message = "no job role trusts ECS tasks and the job-runner neither runs tasks nor passes roles"
+  }
+
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).runtimes.fargate == false && aws_lambda_function.this["prepare_job"].environment[0].variables.TASK_DEFINITIONS == "{}"
+    error_message = "the registration and prepare_job know there is no Fargate runtime"
+  }
+}
+
+# The SSM runtime is opt-in: nothing of it exists and nothing can reach a runner by default.
+run "no_ssm_runtime_by_default" {
+  command = apply
+
+  assert {
+    condition     = length(aws_ssm_document.orch_job) == 0 && length(aws_s3_object.ssm_runtime) == 0 && length(data.archive_file.ssm_runtime) == 0
+    error_message = "no document and no runtime zip without ssm.enabled"
+  }
+
+  assert {
+    condition     = !strcontains(aws_iam_role_policy.job_runner[0].policy, "ssm:") && !strcontains(aws_iam_role.job["ledger"].assume_role_policy, "SsmRunnerInstances")
+    error_message = "without ssm.enabled the job-runner sends no command and no job role trusts a runner"
+  }
+
+  assert {
+    condition     = aws_lambda_function.this["prepare_job"].environment[0].variables.SSM_JOBS == "0" && aws_lambda_function.this["resolve_context"].environment[0].variables.SSM_JOBS == "0"
+    error_message = "prepare_job refuses runtime ssm and dumps stay off SSM"
+  }
+
+  assert {
+    condition     = output.ssm_runner_policy_json == null && output.ssm_document_content == null && !contains(output.network_contract.required_vpc_endpoints, "ec2messages")
+    error_message = "no SSM outputs and no SSM agent endpoints by default"
+  }
+
+  assert {
+    condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).runtimes == { ssm = false, fargate = true }
+    error_message = "the registration tells orch.py restore which runtimes exist"
   }
 }

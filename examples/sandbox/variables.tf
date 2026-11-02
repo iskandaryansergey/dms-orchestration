@@ -54,8 +54,20 @@ variable "interface_endpoints" {
   default     = ["states", "dms", "ssm", "sns", "logs", "sts", "secretsmanager", "rds-data"]
 }
 
+variable "ssm_runner" {
+  description = "SSM runner instance (ssm_runner.tf) and the module's SSM runtime: pg-dump, restore and e2e-ssm jobs run on it (TF_VAR_ssm_runner=true)."
+  type        = bool
+  default     = false
+}
+
+variable "runner_ami_id" {
+  description = "AMI of the SSM runner: the team AMI (psql, pg_dump, pg_restore, bash, python3 with boto3). Empty = latest Amazon Linux 2023 as a stand-in, the tools installed at boot from its own repository."
+  type        = string
+  default     = ""
+}
+
 variable "sql_runner" {
-  description = "Fargate sql-runner (sql_runner.tf): ECR repository and CodeBuild project."
+  description = "Sandbox only, off by default: ECR repository and CodeBuild project for the optional Fargate runtime (sql_runner.tf). The module never builds an image."
   type        = bool
   default     = false
 }
