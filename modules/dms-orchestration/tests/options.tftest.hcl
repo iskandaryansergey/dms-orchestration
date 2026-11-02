@@ -234,8 +234,7 @@ run "ssm_runtime_with_a_platform_document" {
     kms_key_arn = "arn:aws:kms:eu-west-2:111122223333:key/11111111-2222-3333-4444-555555555555"
     ssm = {
       enabled                = true
-      target_tags            = { Role = "dms-runner" }
-      instance_role_arn      = "arn:aws:iam::111122223333:role/team-dms-runner"
+      runners                = { ledger = { target_tags = { Role = "dms-runner" }, instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner" } }
       document_name_override = "platform-dms-orch-job"
       runner_user            = "dmsjob"
     }
@@ -262,7 +261,7 @@ run "ssm_runtime_with_a_platform_document" {
   }
 
   assert {
-    condition     = length([for st in jsondecode(output.ssm_runner_policy_json).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
+    condition     = length([for st in jsondecode(output.ssm_runner_policy_json["ledger"]).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
     error_message = "the runner instance profile can decrypt the runtime zip and the job objects"
   }
 }
@@ -282,10 +281,9 @@ run "ssm_runtime_never_runs_jobs_as_root" {
 
   variables {
     ssm = {
-      enabled           = true
-      instance_ids      = ["i-0123456789abcdef0"]
-      instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner"
-      runner_user       = "root"
+      enabled     = true
+      runners     = { ledger = { instance_ids = ["i-0123456789abcdef0"], instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner" } }
+      runner_user = "root"
     }
   }
 

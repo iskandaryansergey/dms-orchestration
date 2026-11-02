@@ -47,9 +47,8 @@ run "create_false_creates_nothing" {
     permissions_boundary_arn = "arn:aws:iam::111122223333:policy/boundary"
     fargate                  = { images = { sql-runner = "111122223333.dkr.ecr.eu-west-2.amazonaws.com/dms-orch/sql-runner:0.1.0" } }
     ssm = {
-      enabled           = true
-      instance_ids      = ["i-0123456789abcdef0"]
-      instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner"
+      enabled = true
+      runners = { ledger = { instance_ids = ["i-0123456789abcdef0"], instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner" } }
     }
     assessment = {
       role_arn = "arn:aws:iam::111122223333:role/dms-assessment"
@@ -101,7 +100,7 @@ run "create_false_creates_nothing" {
       length(output.ssm_parameter_names) == 0, length(output.jobset_publisher_policy_json) == 0,
       output.table_name == null, output.table_arn == null, output.artifacts_bucket == null, output.sns_topic_arn == null,
       output.jobs_security_group_id == null, output.ecs_cluster_arn == null, output.operator_policy_json == null,
-      output.ssm_runner_policy_json == null, output.ssm_document_content == null, output.ssm_document_name == null,
+      length(output.ssm_runner_policy_json) == 0, output.ssm_document_content == null, output.ssm_document_name == null,
       length(output.kms_key_policy_requirements) == 0, output.kms_key_policy_statements == "[]",
       output.bucket_requirements == null, output.network_contract == null,
       output.run_request_example == null, length(output.verify_commands) == 0,
@@ -125,7 +124,7 @@ run "unset_optional_strings_are_empty" {
     condition = alltrue([
       var.create, var.kms_key_arn == "", var.permissions_boundary_arn == "", var.artifacts_bucket_name == "",
       var.fargate.cluster_arn == "", var.dms.log_group_name == "", var.assessment.role_arn == "",
-      var.ssm.instance_role_arn == "", var.ssm.document_name_override == "",
+      length(var.ssm.runners) == 0, var.ssm.document_name_override == "",
       var.lambda.artifact_s3_bucket == "", var.lambda.reserved_concurrency == -1,
       var.https_egress_vpc_cidr, var.https_egress_gateway_endpoints,
       length(var.https_egress_cidr_blocks) == 0, length(var.https_egress_prefix_list_ids) == 0,

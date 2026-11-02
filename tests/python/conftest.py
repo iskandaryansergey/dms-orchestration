@@ -48,6 +48,18 @@ def create_table(ddb: Any, name: str = TABLE) -> Any:
     )
 
 
+@pytest.fixture(autouse=True)
+def no_network_from_orch_aws(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runtime's standard-library AWS client (orch_aws) never reaches the network in a test:
+    moto patches botocore only. A test that needs a transport passes its own."""
+    import orch_aws
+
+    def refuse(method: str, url: str, *_a: Any) -> Any:
+        raise AssertionError(f"orch_aws network call in a test: {method} {url.split('?')[0]}")
+
+    monkeypatch.setattr(orch_aws, "send", refuse)
+
+
 @pytest.fixture
 def aws() -> Iterator[None]:
     from shared import aws as shared_aws

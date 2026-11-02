@@ -61,7 +61,7 @@ variable "ssm_runner" {
 }
 
 variable "runner_ami_id" {
-  description = "AMI of the SSM runner: the team AMI (psql, pg_dump, pg_restore, bash, python3 with boto3). Empty = latest Amazon Linux 2023 as a stand-in, the tools installed at boot from its own repository."
+  description = "AMI of the SSM runner: the team AMI (SSM agent, psql, pg_dump, pg_restore, bash, python3 with the standard library only). Empty = latest Amazon Linux 2023 as a stand-in, the tools installed at boot from its own repository."
   type        = string
   default     = ""
 }

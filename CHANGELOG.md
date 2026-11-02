@@ -6,6 +6,19 @@ observed AWS behaviour behind the fixes is in [docs/dms-observations.md](docs/dm
 
 ## [Unreleased]
 
+Breaking: the SSM runtime takes one runner per project (`ssm.runners`); see *Changed* and the
+upgrade note.
+
+### Security
+- SSM runners are per project, never shared. Each project's job role trusts only its own
+  runner's instance role; `ssm_runner_policy_json` is a map per project whose policy assumes
+  only that project's job role; the job-runner's `ssm:SendCommand` has one statement per
+  project and `FindSsmRunner` looks only for the job's project's runner (`prepare_job` puts
+  `project` into the spec). A job on one project's runner can no longer act as another
+  project's job role (the residual risk of 0.2 in `docs/security.md` and ADR 0011).
+- The module refuses `ssm.enabled` without a runner for every project, a runner of an unknown
+  project, and two projects sharing an instance role, an instance or the same `target_tags`.
+
 ### Changed
 - **Breaking:** `kms_key_policy_requirements` is a list, not a JSON string, in the shape the
   shared `kms` module compiles (`consumers = { dms = module.dms_orchestration.kms_key_policy_requirements }`):
@@ -19,6 +32,29 @@ observed AWS behaviour behind the fixes is in [docs/dms-observations.md](docs/dm
 - **Breaking:** the tag `ManagedBy` is `"Terraform"` (was `"terraform"`), the convention of the
   shared modules; `Module` and the `dms-orch:*` tags are unchanged. Tag-based policies, cost
   reports or queries that match the lower-case value need the new one.
+- **Breaking:** `ssm.instance_ids`, `ssm.target_tags` and `ssm.instance_role_arn` are replaced
+  by `ssm.runners = { <project> = { instance_role_arn, instance_ids | target_tags } }`; the old
+  fields fail validation with a pointer to `ssm.runners`.
+- **Breaking:** `ssm_runner_policy_json` is a map `{ <project> = policy JSON }`, like
+  `jobset_publisher_policy_json`; it was one policy (`null` when off). It no longer depends on
+  the `ssm` input (present whenever the module creates resources), so a runner module can take
+  its project's policy as an input while `ssm.runners` takes the runner's instance and role.
+- The SSM runner needs python3 with the standard library only: no boto3, no AWS CLI. The
+  runtime's AWS calls (S3, Secrets Manager, STS, the RDS IAM token) go through `orch_aws.py`,
+  a SigV4 client on the standard library (signatures tested against botocore); the document
+  carries it to fetch the runtime zip. The Fargate image runs the same code (it keeps boto3 for
+  job scripts). New exit code 98: the instance profile cannot read the runtime zip.
+- Sandbox: the stand-in runner installs no boto3; it is the runner of its one project
+  (`ssm.runners.ledger`).
+
+### Upgrade (0.2 → next)
+- Give every project its own runner (for example one dms-sql-bastion per project, README) and
+  replace the `ssm` input:
+  `ssm = { enabled = true, runners = { <project> = { instance_ids = [...], instance_role_arn = "..." } } }`
+  (or `target_tags` per runner). A 0.2 configuration fails validation until then.
+- Attach `module.<name>.ssm_runner_policy_json["<project>"]` to that project's runner role
+  instead of the one shared policy, then remove the shared runner role from the old runner.
+- Let running SSM jobs finish before the apply: the job roles' trust changes with it.
 
 ### Fixed
 - `psql-run --truncate-scope` (PostgreSQL, SSM and Fargate runtimes) puts the skipped tables in

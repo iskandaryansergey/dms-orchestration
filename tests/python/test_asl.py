@@ -104,7 +104,7 @@ def test_template_only_uses_known_placeholders(name):
         "assign_public_ip",
         "artifacts_bucket",
         "ssm_document_name",
-        "ssm_instance_filters_json",
+        "ssm_runner_filters_json",
         "jobs_log_group_name",
     }
     assert template_variables(name) <= known
@@ -1070,7 +1070,11 @@ def test_migrate_and_post_pass_the_dry_run_flag_of_the_run_to_every_job():
 
 # --- SSM Run Command runtime (runner instance from the team AMI) ---------------------
 
-SSM_SPEC = {"runtime": "ssm", "jobRoleArn": "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"}
+SSM_SPEC = {
+    "runtime": "ssm",
+    "project": "ledger",
+    "jobRoleArn": "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger",
+}
 
 
 def ssm_mocks(job_spec: dict[str, Any], **over: Any) -> dict[str, Any]:
@@ -1089,7 +1093,10 @@ def test_ssm_job_sends_the_module_document_and_polls_until_terminal():
     run = run_job(ssm_mocks(spec(**SSM_SPEC, timeoutSeconds=7200, dryRun=True)), {**JOB_INPUT, "dryRun": True})
     assert run.status == "SUCCEEDED" and run.output["summary"] == {"restored": 4}
     assert run.called("RunFargateJob") == [] and run.called("InvokeLambdaJob") == []
-    assert run.called("FindSsmRunner")[0]["Filters"] == [{"Key": "PingStatus", "Values": ["Online"]}]
+    assert run.called("FindSsmRunner")[0]["Filters"] == [
+        {"Key": "InstanceIds", "Values": ["i-0aaa"]},
+        {"Key": "PingStatus", "Values": ["Online"]},
+    ]
     send = run.called("RunSsmJob")[0]
     assert send["DocumentName"] == "dms-orch-test-orch-job" and send["InstanceIds"] == ["i-0aaa"]
     # The command itself is never a parameter: orch-job reads it from spec.json.
@@ -1122,7 +1129,22 @@ def test_ssm_terminal_failure_is_a_job_failure_even_if_result_says_ok(status):
 def test_ssm_without_a_runner_online_fails_without_sending():
     run = run_job(ssm_mocks(spec(**SSM_SPEC), FindSsmRunner=lambda _a: {"InstanceInformationList": []}))
     assert run.status == "FAILED" and run.called("RunSsmJob") == []
-    assert "no SSM runner instance online" in json.loads(run.cause)["message"]
+    assert "no SSM runner instance of the project online" in json.loads(run.cause)["message"]
+
+
+def test_ssm_job_looks_only_for_its_own_projects_runner():
+    run = run_job(ssm_mocks(spec(**{**SSM_SPEC, "project": "cards"})))
+    assert run.status == "SUCCEEDED"
+    assert run.called("FindSsmRunner")[0]["Filters"] == [
+        {"Key": "tag:Migration", "Values": ["cards"]},
+        {"Key": "PingStatus", "Values": ["Online"]},
+    ]
+
+
+def test_ssm_job_of_a_project_without_a_runner_fails_without_sending():
+    run = run_job(ssm_mocks(spec(**{**SSM_SPEC, "project": "unknown"})))
+    assert run.status == "FAILED" and run.called("RunSsmJob") == []
+    assert "SSM runner lookup failed" in json.loads(run.cause)["message"]
 
 
 def test_ssm_send_failure_is_a_job_failure():

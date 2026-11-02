@@ -77,6 +77,7 @@ def dump_env(aws, tmp_path, monkeypatch):
     monkeypatch.setenv("ORCH_WORK_DIR", str(tmp_path))
     monkeypatch.setenv("ORCH_ARTIFACTS_BUCKET", BUCKET)
     monkeypatch.delenv("ORCH_DRY_RUN", raising=False)
+    monkeypatch.setattr(orch_dump, "_s3", lambda: s3)  # moto patches boto3, not orch_aws
     return {"s3": s3, "out": out, "tmp": tmp_path}
 
 

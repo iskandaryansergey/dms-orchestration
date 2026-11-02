@@ -73,6 +73,15 @@ module "dms_orchestration" {
   job_secret_arns             = [var.source_runner_secret_arn, var.target_runner_secret_arn]
   kms_key_arn                 = var.kms_key_arn  # "" only in a sandbox
   database_security_group_ids = [var.target_db_security_group_id, var.source_db_security_group_id]
+
+  # Long jobs on SSM: one runner per project, never shared (one dms-sql-bastion per project,
+  # RUNBOOK §16).
+  ssm = {
+    enabled = true
+    runners = {
+      for p, b in module.sql_bastion : p => { instance_ids = [b.instance_id], instance_role_arn = b.role_arn }
+    }
+  }
 }
 ```
 
@@ -90,8 +99,8 @@ project), SSM parameters, alarms and, unless you bring them, a DynamoDB table, a
 an SNS topic; the module's tags include `ManagedBy` and `Module`. No ECS cluster, no ECR
 endpoints and no container image by default: SQL jobs run in a Lambda, long jobs
 (`pg_dump`/`pg_restore`, long DDL, scripts) on SSM-managed instances built from your AMI
-(`ssm`; one runner per project, since projects sharing a runner are not isolated from each
-other), and Fargate is an optional third runtime that appears only with `fargate.images`, a
+(`ssm.runners`: one runner per project, never shared; python3 with the standard library is
+enough), and Fargate is an optional third runtime that appears only with `fargate.images`, a
 pre-pushed image pinned by digest. The module never builds an image
 ([ADR 0011](docs/adr/0011-job-runtimes.md)).
 

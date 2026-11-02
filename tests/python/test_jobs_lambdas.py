@@ -173,6 +173,8 @@ def test_prepare_ssm_job_gets_the_job_role_and_only_routing_fields(jobs_env, mon
     j = job(runtime="ssm", image=None, command=["pg-dump-s3", "--connection", "target", "--label", "{{ run.runId }}"])
     spec = handler(event(j, phase="dump"))["spec"]
     assert spec["runtime"] == "ssm" and spec["jobRoleArn"] == "arn:aws:iam::111122223333:role/dms-orch-test-job-ledger"
+    # The job-runner picks the runner of this project (ssm.runners), never another one.
+    assert spec["project"] == "ledger"
     assert "taskDefinitionArn" not in spec and "functionArn" not in spec
     assert spec["specS3Uri"] == f"s3://{BUCKET}/runs/ledger/run-1/jobs/dump/01-reset-target/spec.json"
     assert not {"ctx", "connections", "previous", "with", "failure"} & set(spec)

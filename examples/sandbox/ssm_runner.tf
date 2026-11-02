@@ -4,7 +4,8 @@
 #
 # The target platform builds it from the team AMI (var.runner_ami_id). Without one the
 # sandbox takes the latest Amazon Linux 2023 as a stand-in and installs the PostgreSQL client
-# and boto3 at boot from the AL2023 repository (served from S3: the S3 gateway endpoint).
+# at boot from the AL2023 repository (served from S3: the S3 gateway endpoint). No boto3: the
+# runtime needs python3 with the standard library only, like the team AMI.
 # No public IP, IMDSv2 only, the jobs security group (443 to the endpoints, 5432 to Aurora).
 # Everything here goes with `terraform destroy`.
 ############################################
@@ -20,7 +21,7 @@ locals {
   ssm_runner_user_data = var.runner_ami_id != "" ? null : <<-EOT
     #!/bin/bash
     set -euo pipefail
-    dnf install -y "postgresql${split(".", var.aurora_engine_version)[0]}" python3-boto3
+    dnf install -y "postgresql${split(".", var.aurora_engine_version)[0]}"
   EOT
 }
 
@@ -43,12 +44,13 @@ resource "aws_iam_role_policy_attachment" "ssm_runner_core" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Runtime zip, the project job roles, command output: the module's contract for the profile.
+# Runtime zip, the ledger job role only, command output: the module's contract for the profile
+# of the ledger project's runner.
 resource "aws_iam_role_policy" "ssm_runner" {
   count  = var.ssm_runner ? 1 : 0
   name   = "dms-orchestration-runner"
   role   = aws_iam_role.ssm_runner[0].id
-  policy = module.dms_orchestration.ssm_runner_policy_json
+  policy = module.dms_orchestration.ssm_runner_policy_json["ledger"]
 }
 
 resource "aws_iam_instance_profile" "ssm_runner" {

@@ -31,10 +31,13 @@ Three runtimes, chosen per job (`runtime: lambda | ssm | fargate`):
   requirements (`uv pip install --require-hashes --only-binary :all:`); `make vendor-check`
   rebuilds it in CI and compares every file. Nothing is downloaded at run time.
 * **SSM (long jobs).** `pg-dump`, `orch.py restore`, long DDL and scripts run through SSM Run
-  Command on instances built from the team AMI (`ssm.enabled`, `ssm.instance_ids` or
-  `ssm.target_tags`). The module ships the runtime as a zip in the artifacts bucket; the
-  document checks its sha256 and runs orch-job as `ssm.runner_user`, which assumes the
-  project's job role from the instance profile. Off by default.
+  Command on instances built from the team AMI, one runner per project (`ssm.enabled`,
+  `ssm.runners`: per project `instance_ids` or `target_tags` and the instance role; for
+  example one dms-sql-bastion per project). The module ships the runtime as a zip in the
+  artifacts bucket; the document checks its sha256 and runs orch-job as `ssm.runner_user`,
+  which assumes the project's job role from the instance profile. The runtime needs python3
+  with the standard library only (no boto3, no AWS CLI on the AMI): `orch_aws.py` signs its
+  requests with SigV4, and the document carries it to fetch the zip. Off by default.
 * **Fargate (optional).** The `sql-runner` image stays for whoever prefers containers: with a
   non-empty `fargate.images` the module creates the ECS cluster (unless `fargate.cluster_arn`),
   the task definitions and the ECS roles, and the network contract asks for the ECR endpoints.
@@ -89,12 +92,20 @@ command fails the job instead of hanging the run.
   dependencies follow the same rule (`modules/dms-orchestration/src/jobs/sql-runner/requirements.in` compiled with
   hashes).
 * The zip of every module Lambda carries the vendored driver (about 3 MB unpacked).
-* **Residual risk of SSM: projects sharing a runner are not isolated from each other.** Every
-  project's job role trusts the one runner instance role, and jobs run under one local user that
-  can reach the instance metadata. A job of one project on a runner can act as another project's
-  job role, and anyone with a session or `SendCommand` on a runner can do the same and read a
-  running job's files ([security.md](../security.md)). We recommend one runner (selected by a
-  tag) per project; because the job roles of one module instance all trust the same instance
-  role, a project that needs its own boundary gets its own runners with their own instance
-  profile role, that is its own module instance (`ssm.target_tags`, `ssm.instance_role_arn`).
-  Keep session access to the runners as narrow as access to the job roles.
+* **SSM runners are per project, never shared (0.3).** 0.2 had one runner selection and one
+  instance role for all projects, so a job of one project on a runner could act as another
+  project's job role. Now `ssm.runners` has one runner per project: its job role trusts only
+  that runner's instance role, the runner's policy (`ssm_runner_policy_json`, key `<project>`)
+  assumes only that job role, the job-runner sends a job only to its project's runner, and the
+  module refuses a shared instance role or instance. What remains is per project: anyone with a
+  session or `SendCommand` on a project's runner can use that project's job role and read a
+  running job's files ([security.md](../security.md)); keep session access to each runner as
+  narrow as access to its project's job role.
+* **The runner runtime has no third-party Python.** The team AMI has python3 with the standard
+  library, the PostgreSQL clients and the SSM agent; no boto3 and no AWS CLI. The runtime's AWS
+  calls (S3, Secrets Manager, STS, the RDS IAM token) go through `orch_aws.py`, a SigV4 client
+  on the standard library whose signatures the tests compare with botocore's. Credentials stay
+  where they were: the job profile names the job role and the instance profile as its source,
+  and the client assumes the role (IMDSv2) and renews it before it expires. Moving the AWS calls
+  to the Lambda side instead was rejected: secrets would travel through SSM parameters (visible
+  in the command history), and multi-hour dumps need fresh credentials for every upload part.

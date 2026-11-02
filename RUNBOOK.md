@@ -338,35 +338,75 @@ console and start again. The e2e scenario `s1p` proves this path ([docs/testing.
 
 Long jobs — `pg-dump-s3`, `orch.py restore`, long DDL, bash or pwsh scripts — run with SSM Run
 Command on a runner instance built from the team AMI, not in Lambda (15 minutes) and without a
-container image. Turn it on with the module input `ssm`:
+container image. Every project has its own runner, never shared with another project (for
+example one dms-sql-bastion per project, README). Turn it on with the module input `ssm`:
 
 ```hcl
 ssm = {
-  enabled           = true
-  instance_ids      = ["i-0123456789abcdef0"]           # or target_tags = { Role = "dms-runner" }
-  instance_role_arn = "arn:aws:iam::<account>:role/<runner-role>"
-  runner_user       = "orch"                            # default; never root
+  enabled = true
+  runners = {                                           # one per project of `projects`
+    ledger = {
+      instance_ids      = ["i-0123456789abcdef0"]       # or target_tags = { Migration = "ledger" }
+      instance_role_arn = "arn:aws:iam::<account>:role/<ledger-runner-role>"
+    }
+  }
+  runner_user = "orch"                                  # default; never root
 }
 ```
+
+With one dms-sql-bastion per project as the runner:
+
+```hcl
+# One dms-sql-bastion per project: its instance role gets that project's runner policy only.
+module "sql_bastion" {
+  source   = "<modules registry>//modules/dms-sql-bastion?ref=<version>"
+  for_each = toset(["ledger"])                  # every project of dms_orchestration
+
+  name                       = "${var.migration_name}-${each.key}"
+  ami_id                     = var.team_ami_id  # SSM agent, psql/pg_dump/pg_restore, python3
+  vpc_id                     = var.vpc_id
+  subnet_id                  = var.db_tier_subnet_ids[0]
+  additional_iam_policy_json = module.dms_orchestration.ssm_runner_policy_json[each.key]
+  # scripts, targets, https_egress: see that module; the runner also needs the STS endpoint
+}
+
+# in module "dms_orchestration":
+ssm = {
+  enabled = true
+  runners = {
+    for p, b in module.sql_bastion : p => { instance_ids = [b.instance_id], instance_role_arn = b.role_arn }
+  }
+}
+```
+
+`ssm_runner_policy_json` does not depend on the `ssm` input, so passing it to the bastion and
+the bastion's instance and role back into `ssm.runners` is no dependency cycle.
+
+The module refuses a project without a runner, a runner of an unknown project, and two
+projects sharing an instance role, an instance or the same `target_tags`. The 0.2 form
+(`ssm.instance_ids`, `ssm.target_tags`, `ssm.instance_role_arn`) is refused with a pointer
+to `ssm.runners`.
 
 The runner instance needs:
 
 * the AMI's tools: `psql`, `pg_dump` and `pg_restore` (major version ≥ the target's), `bash`,
-  `python3` (3.9 or later) with `boto3`, `runuser`, `sha256sum`; `pwsh` only for pwsh jobs.
-  Nothing is downloaded from the internet at run time;
+  `python3` (3.9 or later; the standard library is enough, no boto3 and no AWS CLI), `runuser`,
+  `sha256sum`; `pwsh` only for pwsh jobs. Nothing is downloaded from the internet at run time;
 * the SSM agent online, with the `ssm`, `ec2messages` and `ssmmessages` endpoints
   (`network_contract`), STS, Secrets Manager, logs, KMS and the S3 gateway endpoint, and a
   security group that reaches the databases (the module's jobs security group fits);
-* an instance profile role (`ssm.instance_role_arn`) with SSM management
-  (`AmazonSSMManagedInstanceCore` or the platform's equivalent) plus the module output
-  `ssm_runner_policy_json`: read `runtime/*` of the artifacts bucket, assume the project job
-  roles, write command output to the jobs log group. Every project job role trusts this role.
+* an instance profile role of its own (`ssm.runners.<project>.instance_role_arn`) with SSM
+  management (`AmazonSSMManagedInstanceCore` or the platform's equivalent) plus the module
+  output `ssm_runner_policy_json["<project>"]`: read `runtime/*` of the artifacts bucket,
+  assume that project's job role only, write command output to the jobs log group. Only that
+  project's job role trusts this role.
 
-How a job runs: the job-runner picks an online runner among the configured ones (a retry takes
-the next one), sends the document `<name>-<environment>-orch-job` (or
+How a job runs: the job-runner picks an online runner of the job's project (a retry takes the
+next one), sends the document `<name>-<environment>-orch-job` (or
 `ssm.document_name_override`, registered from the output `ssm_document_content`) with the spec
 URI and the project's job role, and polls the invocation every 30 s. The document, as root,
-downloads `runtime/<sha256>/sql-runner.zip` (the module uploads it on apply), checks its SHA-256,
+writes `orch_aws.py` (the standard-library AWS client it carries), downloads with it
+`runtime/<sha256>/sql-runner.zip` (the module uploads it on apply), checks its SHA-256,
 unpacks it into a fresh `/var/tmp/orch-job.*` directory and starts `orch_job.py --assume-role
 <job role> --command-from-spec` as `runner_user` (created as a system user if missing). orch-job
 assumes the job role through a profile that renews it for jobs longer than an hour, reads the
@@ -377,17 +417,19 @@ Where to look when a job fails:
 
 | Message in the report | Meaning |
 |---|---|
-| `no SSM runner instance online` | no configured instance has `PingStatus = Online`: check the agent, the endpoints, `instance_ids` / `target_tags` |
+| `no SSM runner instance of the project online` | no instance of the project's runner has `PingStatus = Online`: check the agent, the endpoints, `ssm.runners.<project>` |
+| `SSM runner lookup failed: … no SSM runner for project …` | the job's project has no entry in `ssm.runners` (apply the module with one) |
 | `SSM sendCommand failed: …` | the document or the instance is refused (wrong name, instance not managed, IAM) |
-| `no result.json from SSM command <id> on <instance> (status …, exit code 96)` | a tool is missing on the AMI (`psql`, `python3` with `boto3`, …); the command output says which |
+| `no result.json from SSM command <id> on <instance> (status …, exit code 96)` | a tool is missing on the AMI (`psql`, `python3`, `runuser`, …); the command output says which |
+| `… exit code 98` | the instance profile cannot read the runtime zip (`ssm_runner_policy_json`, S3 gateway endpoint, KMS); the command output says why |
 | `… exit code 97` | the runtime zip does not match its SHA-256: apply the module again |
-| `… exit code 2` | orch-job could not use the job role (trust of `ssm.instance_role_arn`, STS endpoint) |
+| `… exit code 2` | orch-job could not use the job role (the job role trusts only its project's `ssm.runners.<project>.instance_role_arn`; STS endpoint) |
 | `SSM command <id> Failed, exit code N` | the job command failed: command output in the jobs log group, stream `<command id>/<instance id>/orchJob/stdout` |
 | `… (did not finish in time)` | no terminal status within the job timeout + 15 minutes: check the instance |
 
-Anyone who can open an SSM session on the runner or run commands on it sees the job files and the
-connections file while a job runs, and can use the instance profile (see
-[docs/security.md](docs/security.md)): keep session access to the runners as narrow as access to
-the job roles. The sandbox has a stand-in runner (`TF_VAR_ssm_runner=true`, Amazon Linux 2023
+Anyone who can open an SSM session on a project's runner or run commands on it sees the job
+files and the connections file while a job runs, and can use the instance profile and that
+project's job role (see [docs/security.md](docs/security.md)): keep session access to each
+runner as narrow as access to its project's job role. The sandbox has a stand-in runner (`TF_VAR_ssm_runner=true`, Amazon Linux 2023
 with the tools installed at boot, or `runner_ami_id` for the team AMI); e2e `s1ssm` runs the
 reset and post jobs on it, `s10` the dump and the restore.

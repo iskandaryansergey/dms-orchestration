@@ -631,16 +631,49 @@ run "iam_database_auth_for_fargate_jobs" {
   }
 }
 
-# SSM runtime: the job-runner sends only the module document, only to the configured runners;
-# the runner instance role may assume the project job roles and is never passed to ECS.
+# SSM runtime: one runner per project (ssm.runners), never shared. The job-runner sends only the
+# module document, only to the configured runners; each project's job role trusts only its own
+# runner role, and each runner policy assumes only its own project's job role.
 run "ssm_runtime_least_privilege" {
   command = apply
 
   variables {
+    projects = {
+      ledger = {
+        tasks = {
+          core = {
+            connections = {
+              target = {
+                engine               = "postgresql"
+                secret_arn           = "arn:aws:secretsmanager:eu-west-2:111122223333:secret:dms/ledger/target/runner-XyZ123"
+                data_api_cluster_arn = "arn:aws:rds:eu-west-2:111122223333:cluster:ledger-target"
+              }
+            }
+          }
+        }
+      }
+      cards = {
+        tasks = {
+          extra = {
+            connections = {
+              target = { engine = "postgresql", secret_arn = "arn:aws:secretsmanager:eu-west-2:111122223333:secret:dms/ledger/target/runner-XyZ123" }
+            }
+          }
+        }
+      }
+    }
     ssm = {
-      enabled           = true
-      instance_ids      = ["i-0123456789abcdef0"]
-      instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner"
+      enabled = true
+      runners = {
+        ledger = {
+          instance_ids      = ["i-0123456789abcdef0"]
+          instance_role_arn = "arn:aws:iam::111122223333:role/ledger-sql-bastion"
+        }
+        cards = {
+          target_tags       = { Migration = "cards" }
+          instance_role_arn = "arn:aws:iam::111122223333:role/cards-sql-bastion"
+        }
+      }
     }
   }
 
@@ -650,8 +683,31 @@ run "ssm_runtime_least_privilege" {
       ])) == toset([
       "arn:aws:ssm:eu-west-2:111122223333:document/dms-orch-dev-orch-job",
       "arn:aws:ec2:eu-west-2:111122223333:instance/i-0123456789abcdef0",
+      "arn:aws:ec2:eu-west-2:111122223333:instance/*",
     ])
     error_message = "ssm:SendCommand only on the module document and the configured runner instances"
+  }
+
+  assert {
+    condition = [
+      for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st
+      if contains(flatten([st.Action]), "ssm:SendCommand") && st.Sid != "SendJobDocument"
+      ] == [
+      {
+        Sid       = "SendToRunnersOfProject0"
+        Effect    = "Allow"
+        Action    = ["ssm:SendCommand"]
+        Resource  = ["arn:aws:ec2:eu-west-2:111122223333:instance/*"]
+        Condition = { StringEquals = { "ssm:resourceTag/Migration" = "cards" } }
+      },
+      {
+        Sid      = "SendToRunnersOfProject1"
+        Effect   = "Allow"
+        Action   = ["ssm:SendCommand"]
+        Resource = ["arn:aws:ec2:eu-west-2:111122223333:instance/i-0123456789abcdef0"]
+      },
+    ]
+    error_message = "one SendCommand statement per project (sorted keys): its instances or its tags"
   }
 
   assert {
@@ -681,34 +737,50 @@ run "ssm_runtime_least_privilege" {
   assert {
     condition = alltrue([
       for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement :
-      !contains(flatten([st.Resource]), var.ssm.instance_role_arn) if contains(flatten([st.Action]), "iam:PassRole")
+      length(setintersection(toset(flatten([st.Resource])), toset([for r in values(var.ssm.runners) : r.instance_role_arn]))) == 0 if contains(flatten([st.Action]), "iam:PassRole")
     ])
-    error_message = "the runner instance role is never passed (to ECS or anything else)"
+    error_message = "no runner instance role is ever passed (to ECS or anything else)"
   }
 
   assert {
-    condition = one([
-      for st in jsondecode(aws_iam_role.job["ledger"].assume_role_policy).Statement : st if st.Sid == "SsmRunnerInstances"
-    ]) == { Sid = "SsmRunnerInstances", Effect = "Allow", Principal = { AWS = "arn:aws:iam::111122223333:role/team-dms-runner" }, Action = "sts:AssumeRole" }
-    error_message = "every project job role trusts the runner instance role for sts:AssumeRole only"
+    condition = alltrue([
+      for p, r in var.ssm.runners : one([
+        for st in jsondecode(aws_iam_role.job[p].assume_role_policy).Statement : st if st.Sid == "SsmRunnerInstances"
+      ]) == { Sid = "SsmRunnerInstances", Effect = "Allow", Principal = { AWS = r.instance_role_arn }, Action = "sts:AssumeRole" }
+    ])
+    error_message = "each project job role trusts its own runner role for sts:AssumeRole only"
   }
 
   assert {
-    condition = toset(flatten([
-      for st in jsondecode(output.ssm_runner_policy_json).Statement : flatten([st.Resource]) if contains(flatten([st.Action]), "sts:AssumeRole")
-    ])) == toset(values(local.job_role_arns))
-    error_message = "the runner instance profile may assume the project job roles only"
+    condition     = !strcontains(aws_iam_role.job["ledger"].assume_role_policy, "cards-sql-bastion") && !strcontains(aws_iam_role.job["cards"].assume_role_policy, "ledger-sql-bastion")
+    error_message = "no job role trusts another project's runner"
   }
 
   assert {
-    condition = one([
-      for st in jsondecode(output.ssm_runner_policy_json).Statement : st.Resource if contains(flatten([st.Action]), "s3:GetObject")
-    ]) == ["arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runtime/*"]
+    condition     = toset(keys(output.ssm_runner_policy_json)) == toset(["ledger", "cards"])
+    error_message = "one runner policy per project"
+  }
+
+  assert {
+    condition = alltrue([
+      for p in ["ledger", "cards"] : toset(flatten([
+        for st in jsondecode(output.ssm_runner_policy_json[p]).Statement : flatten([st.Resource]) if contains(flatten([st.Action]), "sts:AssumeRole")
+      ])) == toset([local.job_role_arns[p]])
+    ])
+    error_message = "a project's runner may assume only that project's job role"
+  }
+
+  assert {
+    condition = alltrue([
+      for p in ["ledger", "cards"] : one([
+        for st in jsondecode(output.ssm_runner_policy_json[p]).Statement : st.Resource if contains(flatten([st.Action]), "s3:GetObject")
+      ]) == ["arn:aws:s3:::dms-orch-dev-artifacts-111122223333/runtime/*"]
+    ])
     error_message = "the runner instance profile reads the runtime zip only, nothing under runs/, jobs/ or dumps/"
   }
 
   assert {
-    condition     = !strcontains(output.ssm_runner_policy_json, "secretsmanager") && !strcontains(output.ssm_runner_policy_json, "rds-data")
+    condition     = alltrue([for p in values(output.ssm_runner_policy_json) : !strcontains(p, "secretsmanager") && !strcontains(p, "rds-data")])
     error_message = "the instance profile reads no secret: only the job role does"
   }
 
@@ -725,6 +797,20 @@ run "ssm_runtime_least_privilege" {
   assert {
     condition     = strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "sha256sum --check") && strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), aws_s3_object.ssm_runtime[0].key)
     error_message = "the document checks the sha256 of the runtime zip it downloads"
+  }
+
+  assert {
+    condition = alltrue([
+      !strcontains(aws_ssm_document.orch_job[0].content, "import boto3"),
+      strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "python3 -I \"$base/orch_aws.py\" s3-download"),
+      strcontains(join("\n", jsondecode(aws_ssm_document.orch_job[0].content).mainSteps[0].inputs.runCommand), "def generate_db_auth_token"),
+    ])
+    error_message = "the runner needs python3 with the standard library only: the document carries orch_aws.py and fetches the runtime zip with it"
+  }
+
+  assert {
+    condition     = length(aws_ssm_document.orch_job[0].content) < 64000
+    error_message = "an SSM Command document holds at most 64 KB"
   }
 
   assert {
@@ -751,34 +837,134 @@ run "ssm_runtime_least_privilege" {
     condition     = jsondecode(aws_ssm_parameter.task["ledger/core"].value).runtimes.ssm == true
     error_message = "orch.py restore reads from the registration that it runs on SSM by default"
   }
+
+  assert {
+    condition = jsondecode(aws_sfn_state_machine.job_runner[0].definition).States.Init.Assign.ssmRunnerFilters == {
+      cards = [
+        { Key = "tag:Migration", Values = ["cards"] },
+        { Key = "PingStatus", Values = ["Online"] },
+      ]
+      ledger = [
+        { Key = "InstanceIds", Values = ["i-0123456789abcdef0"] },
+        { Key = "PingStatus", Values = ["Online"] },
+      ]
+    }
+    error_message = "FindSsmRunner gets the filters of each project's own runner"
+  }
+
+  assert {
+    condition     = jsondecode(aws_sfn_state_machine.job_runner[0].definition).States.FindSsmRunner.Arguments.Filters == "{% $exists($lookup($ssmRunnerFilters, $spec.project)) ? $lookup($ssmRunnerFilters, $spec.project) : $error('no SSM runner for project ' & $string($spec.project) & ' (ssm.runners)') %}"
+    error_message = "FindSsmRunner looks the runner up by the job's project"
+  }
 }
 
-run "ssm_runtime_with_target_tags" {
-  command = apply
+# The runners are per project: every project is covered, none is shared.
+run "ssm_runners_cover_every_project" {
+  command = plan
+
+  variables {
+    projects = {
+      ledger = { tasks = { core = {} } }
+      cards  = { tasks = { extra = {} } }
+    }
+    ssm = {
+      enabled = true
+      runners = {
+        ledger = { instance_ids = ["i-0123456789abcdef0"], instance_role_arn = "arn:aws:iam::111122223333:role/ledger-sql-bastion" }
+      }
+    }
+  }
+
+  expect_failures = [var.ssm]
+}
+
+run "ssm_runners_belong_to_known_projects" {
+  command = plan
+
+  variables {
+    ssm = {
+      enabled = true
+      runners = {
+        ledger = { instance_ids = ["i-0123456789abcdef0"], instance_role_arn = "arn:aws:iam::111122223333:role/ledger-sql-bastion" }
+        cards  = { instance_ids = ["i-0123456789abcdef1"], instance_role_arn = "arn:aws:iam::111122223333:role/cards-sql-bastion" }
+      }
+    }
+  }
+
+  expect_failures = [var.ssm]
+}
+
+run "ssm_runner_role_is_never_shared" {
+  command = plan
+
+  variables {
+    projects = {
+      ledger = { tasks = { core = {} } }
+      cards  = { tasks = { extra = {} } }
+    }
+    ssm = {
+      enabled = true
+      runners = {
+        ledger = { instance_ids = ["i-0123456789abcdef0"], instance_role_arn = "arn:aws:iam::111122223333:role/shared-runner" }
+        cards  = { instance_ids = ["i-0123456789abcdef1"], instance_role_arn = "arn:aws:iam::111122223333:role/shared-runner" }
+      }
+    }
+  }
+
+  expect_failures = [var.ssm]
+}
+
+run "ssm_runner_instance_is_never_shared" {
+  command = plan
+
+  variables {
+    projects = {
+      ledger = { tasks = { core = {} } }
+      cards  = { tasks = { extra = {} } }
+    }
+    ssm = {
+      enabled = true
+      runners = {
+        ledger = { instance_ids = ["i-0123456789abcdef0"], instance_role_arn = "arn:aws:iam::111122223333:role/ledger-sql-bastion" }
+        cards  = { instance_ids = ["i-0123456789abcdef0"], instance_role_arn = "arn:aws:iam::111122223333:role/cards-sql-bastion" }
+      }
+    }
+  }
+
+  expect_failures = [var.ssm]
+}
+
+run "ssm_runner_needs_exactly_one_selector" {
+  command = plan
+
+  variables {
+    ssm = {
+      enabled = true
+      runners = {
+        ledger = {
+          instance_ids      = ["i-0123456789abcdef0"]
+          target_tags       = { Migration = "ledger" }
+          instance_role_arn = "arn:aws:iam::111122223333:role/ledger-sql-bastion"
+        }
+      }
+    }
+  }
+
+  expect_failures = [var.ssm]
+}
+
+# 0.2 had one runner for all projects (ssm.instance_ids, ssm.target_tags, ssm.instance_role_arn):
+# setting them now fails with a pointer to ssm.runners instead of being dropped silently.
+run "ssm_single_runner_form_is_refused" {
+  command = plan
 
   variables {
     ssm = {
       enabled           = true
-      target_tags       = { "dms-orch:runner" = "dev" }
+      instance_ids      = ["i-0123456789abcdef0"]
       instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner"
     }
   }
 
-  assert {
-    condition = one([
-      for st in jsondecode(aws_iam_role_policy.job_runner[0].policy).Statement : st if st.Sid == "SendToTaggedRunners"
-      ]) == {
-      Sid       = "SendToTaggedRunners"
-      Effect    = "Allow"
-      Action    = ["ssm:SendCommand"]
-      Resource  = ["arn:aws:ec2:eu-west-2:111122223333:instance/*"]
-      Condition = { StringEquals = { "ssm:resourceTag/dms-orch:runner" = "dev" } }
-    }
-    error_message = "with target_tags, SendCommand reaches only instances carrying every tag"
-  }
-
-  assert {
-    condition     = strcontains(aws_sfn_state_machine.job_runner[0].definition, "\"tag:dms-orch:runner\"")
-    error_message = "FindSsmRunner filters the runners by the same tags"
-  }
+  expect_failures = [var.ssm]
 }

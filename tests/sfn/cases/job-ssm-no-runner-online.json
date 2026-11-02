@@ -20,7 +20,7 @@
     "variables": {
       "result": {
         "status": "fail",
-        "message": "no SSM runner instance online (module variable ssm: instance_ids or target_tags)",
+        "message": "no SSM runner instance of the project online (module variable ssm.runners)",
         "summary": {}
       }
     }

@@ -18,15 +18,15 @@ locals {
     table_name                    = local.table_name
     # Without fargate.images RunFargateJob is unreachable (prepare_job refuses runtime fargate,
     # no ecs:RunTask): the name the module would give its cluster keeps the definition valid.
-    ecs_cluster_arn           = coalesce(local.cluster_arn, "arn:${local.partition}:ecs:${local.region}:${local.account_id}:cluster/${local.prefix}")
-    fargate_platform_version  = var.fargate.platform_version
-    subnets_json              = jsonencode(var.subnet_ids)
-    security_groups_json      = jsonencode(local.security_group_ids)
-    assign_public_ip          = var.fargate.assign_public_ip ? "ENABLED" : "DISABLED"
-    artifacts_bucket          = local.bucket_name
-    ssm_document_name         = local.ssm_document_name
-    ssm_instance_filters_json = jsonencode(local.ssm_instance_filters)
-    jobs_log_group_name       = aws_cloudwatch_log_group.jobs[0].name
+    ecs_cluster_arn          = coalesce(local.cluster_arn, "arn:${local.partition}:ecs:${local.region}:${local.account_id}:cluster/${local.prefix}")
+    fargate_platform_version = var.fargate.platform_version
+    subnets_json             = jsonencode(var.subnet_ids)
+    security_groups_json     = jsonencode(local.security_group_ids)
+    assign_public_ip         = var.fargate.assign_public_ip ? "ENABLED" : "DISABLED"
+    artifacts_bucket         = local.bucket_name
+    ssm_document_name        = local.ssm_document_name
+    ssm_runner_filters_json  = jsonencode(local.ssm_instance_filters)
+    jobs_log_group_name      = aws_cloudwatch_log_group.jobs[0].name
   })))
 
   # Both run machines (ADR 0005) get the same values; each uses the ones it needs.
