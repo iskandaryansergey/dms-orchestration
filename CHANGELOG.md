@@ -6,6 +6,20 @@ observed AWS behaviour behind the fixes is in [docs/dms-observations.md](docs/dm
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** `kms_key_policy_requirements` is a list, not a JSON string, in the shape the
+  shared `kms` module compiles (`consumers = { dms = module.dms_orchestration.kms_key_policy_requirements }`):
+  every item carries `key` (the CMK ARN), `conditions` is a list of `{test, variable, values}`
+  (`[]` when none) instead of a `{test = {variable = value}}` map, and the symbolic role
+  `module` is gone (the module and job role ARNs were already in `arns`; `deployer` is the only
+  role left). Without `kms_key_arn` the output is `[]`, not `"[]"`. Upgrading: drop
+  `jsondecode()` around the output; a tool that read `conditions.StringEquals[...]` reads the
+  list instead. `kms_key_policy_statements` stays a JSON string; its `Condition` values are now
+  lists (`"aws:SourceAccount" = ["<account>"]`), the same policy.
+- **Breaking:** the tag `ManagedBy` is `"Terraform"` (was `"terraform"`), the convention of the
+  shared modules; `Module` and the `dms-orch:*` tags are unchanged. Tag-based policies, cost
+  reports or queries that match the lower-case value need the new one.
+
 ### Fixed
 - `psql-run --truncate-scope` (PostgreSQL, SSM and Fargate runtimes) puts the skipped tables in
   the job result, not only in the NOTICE of the job log: the message names them and the summary

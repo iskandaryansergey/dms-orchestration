@@ -33,9 +33,9 @@ The architecture stays on one page ([`architecture.md`](architecture.md)); the s
 * Optional customer managed KMS key for DynamoDB, S3, SNS, SQS, logs, Lambda environment,
   Step Functions and the scheduler. The module does not manage the key policy; it publishes what
   the policy must allow in two shapes built from one list: `kms_key_policy_requirements` (KMS key
-  policy contract v2: per item the service principals, the module and job role ARNs, the
-  symbolic roles `deployer` and `module`, actions, conditions such as `aws:SourceAccount`, and
-  the purpose) and `kms_key_policy_statements` (the same as v1 key policy statements, concrete
+  policy contract v2, a list the shared `kms` module compiles as is: per item the key ARN, the
+  service principals, the module and job role ARNs listed explicitly, the one symbolic role
+  `deployer`, actions, conditions such as `aws:SourceAccount`, and the purpose) and `kms_key_policy_statements` (the same as v1 key policy statements, concrete
   principals only). The service items are limited to this account by `aws:SourceAccount`; the
   deployer item by `kms:CallerAccount`.
   Without a CMK the SNS topic is unencrypted on purpose: the AWS managed key `alias/aws/sns`
