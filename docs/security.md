@@ -148,8 +148,11 @@ rendered or written, `prepare_job` (`shared/job_trust.py`):
 * `dryRun` is the one recorded on `RUN#`: an input that says otherwise is refused, and the
   job-runner executes and records (`JOB#…`) with the flag `PrepareJob` returned, never the
   input's. A dry re-run of a job of a real run therefore cannot overwrite the run's `JOB#` record
-  with `ok` (a post retry with `--from-job` skips the post jobs before it that are `ok`, so it
-  could close a failed post check — run 11, finding 2), and a real re-run of a dry run's job cannot write.
+  with `ok`, and a real re-run of a dry run's job cannot write. Before 0.2.0 it could: a post
+  retry with `--from-job` skipped the post jobs before it whose record was `ok`, so a dry `ok`
+  could close a failed post check (run 11, finding 2). Now a post retry skips a post job only if
+  it comes before `--from-job` and its `JOB#` is `ok` with the run's own `dryRun`; without
+  `--from-job` every post job runs again (`resolve_context`, `post` phase).
 
 Anything else fails the job-runner with `JobNotInJobSet` (the execution's `JobFailed` cause).
 
