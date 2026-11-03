@@ -34,8 +34,6 @@ resource "aws_iam_instance_profile" "this" {
 }
 
 resource "aws_instance" "this" {
-  # checkov:skip=CKV_AWS_79:test fixture, never applied
-  # checkov:skip=CKV_AWS_8:test fixture, never applied
   # checkov:skip=CKV_AWS_126:test fixture, never applied
   # checkov:skip=CKV_AWS_135:test fixture, never applied
   # checkov:skip=CKV2_AWS_41:test fixture, never applied
@@ -43,6 +41,14 @@ resource "aws_instance" "this" {
   instance_type        = "t3.small"
   iam_instance_profile = aws_iam_instance_profile.this.name
   tags                 = { Migration = var.name }
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  root_block_device {
+    encrypted = true
+  }
 }
 
 output "instance_id" {
