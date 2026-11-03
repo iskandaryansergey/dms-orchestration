@@ -446,7 +446,7 @@ variable "ssm" {
 
   validation {
     condition     = length(var.ssm.instance_ids) == 0 && length(var.ssm.target_tags) == 0 && var.ssm.instance_role_arn == ""
-    error_message = "ssm.instance_ids, ssm.target_tags and ssm.instance_role_arn were replaced by ssm.runners: one runner per project, never shared (ssm.runners = { <project> = { instance_role_arn, instance_ids | target_tags } }; CHANGELOG, upgrade to 0.3)."
+    error_message = "ssm.instance_ids, ssm.target_tags and ssm.instance_role_arn were replaced by ssm.runners: one runner per project, never shared (ssm.runners = { <project> = { instance_role_arn, instance_ids | target_tags } }; CHANGELOG, upgrade to 0.3.0)."
   }
 
   validation {

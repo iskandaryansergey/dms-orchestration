@@ -92,7 +92,7 @@ command fails the job instead of hanging the run.
   dependencies follow the same rule (`modules/dms-orchestration/src/jobs/sql-runner/requirements.in` compiled with
   hashes).
 * The zip of every module Lambda carries the vendored driver (about 3 MB unpacked).
-* **SSM runners are per project, never shared (0.3).** 0.2 had one runner selection and one
+* **SSM runners are per project, never shared (0.3.0).** 0.2 had one runner selection and one
   instance role for all projects, so a job of one project on a runner could act as another
   project's job role. Now `ssm.runners` has one runner per project: its job role trusts only
   that runner's instance role, the runner's policy (`ssm_runner_policy_json`, key `<project>`)

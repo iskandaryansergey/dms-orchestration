@@ -35,7 +35,7 @@ Terraform 1.9.8, `hashicorp/aws >= 5.90, < 6`. In the migration workspace, next 
 
 ```hcl
 module "dms_orchestration" {
-  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.2.0"
+  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.3.0"
 
   environment = "dev"
   vpc_id      = var.vpc_id
@@ -145,10 +145,17 @@ make teststate-dry    # build the TestState requests (no AWS)
 The cycle, the commit rules and the denylist gate: [CONTRIBUTING.md](CONTRIBUTING.md); for coding
 agents: [AGENTS.md](AGENTS.md). Test levels and the e2e matrix: [docs/testing.md](docs/testing.md).
 
-## Release 0.2.0
+## Release 0.3.0
 
-Hardening and new job runtimes: run artifacts per project and a pinned run context, job sets
-pinned by hash, a transactional restore scoped to the dump's tables under the task lock, DMS
+One SSM runner per project (`ssm.runners`, never shared) with a runner runtime on the Python
+standard library (no boto3 on the runner), the KMS key policy requirements as a list in the
+shape the shared `kms` module compiles, and fixes to the runner's AWS client, `orch.py restore`
+and the `--truncate-scope` result. 0.3.0 has breaking changes for 0.2 configurations (`ssm`,
+`kms_key_policy_requirements`, `ssm_runner_policy_json`, the `ManagedBy` tag value); each is
+listed under *Changed*, with the upgrade steps, in [CHANGELOG.md](CHANGELOG.md).
+
+Release 0.2.0 brought hardening and new job runtimes: run artifacts per project and a pinned
+run context, job sets pinned by hash, a transactional restore scoped to the dump's tables under the task lock, DMS
 validation failing the run by default, SQL jobs in a Lambda and long jobs on SSM with Fargate
 optional, and the registry conventions (`create`, non-nullable inputs, KMS key policy contract
 v2). 0.2.0 has breaking changes for 0.1 deployments, runs and dumps; each is listed under

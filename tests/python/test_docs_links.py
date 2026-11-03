@@ -191,10 +191,10 @@ def test_getting_started_needs_no_image():
     assert "fargate" not in minimum, "the minimal wiring runs without the optional Fargate runtime"
 
 
-def test_readme_is_the_entry_point_of_release_0_2_0():
+def test_readme_is_the_entry_point_of_release_0_3_0():
     text = read("README.md")
     assert "## Status" not in text
-    assert "## Release 0.2.0" in text and "](CHANGELOG.md)" in text
+    assert "## Release 0.3.0" in text and "](CHANGELOG.md)" in text
     for target in ("docs/getting-started.md", "docs/architecture.md", "RUNBOOK.md", "docs/troubleshooting.md"):
         assert f"]({target})" in text, target
     sources = re.findall(r'^\s*source\s*=\s*"([^"]+)"', text, re.MULTILINE)
@@ -204,7 +204,7 @@ def test_readme_is_the_entry_point_of_release_0_2_0():
 @pytest.mark.parametrize("doc", ["README.md", "docs/getting-started.md"])
 def test_module_sources_name_the_current_release(doc):
     sources = re.findall(r'^\s*source\s*=\s*"([^"]+)"', read(doc), re.MULTILINE)
-    assert sources and all(s.endswith("?ref=v0.2.0") for s in sources), sources
+    assert sources and all(s.endswith("?ref=v0.3.0") for s in sources), sources
 
 
 OLD_RUN_PREFIX = re.compile(r"runs/<runId>/")
