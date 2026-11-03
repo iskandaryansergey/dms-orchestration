@@ -427,6 +427,54 @@ def test_redirects_are_not_followed(local_s3, tmp_path, capsys):
     assert "307" in capsys.readouterr().err
 
 
+def test_every_content_type_on_the_wire_is_signed(monkeypatch):
+    """urllib adds an unsigned ``Content-Type: application/x-www-form-urlencoded`` to a request
+    with a body unless one is set; S3 then rejects the signature of CompleteMultipartUpload."""
+    seen: list[dict[str, str]] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _answer(self, data: bytes, headers: dict[str, str] | None = None) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append({k.lower(): v for k, v in self.headers.items()})
+            self.send_response(200)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self) -> None:  # noqa: N802 - http.server API
+            if self.path.endswith("?uploads"):
+                self._answer(b"<R><UploadId>u1</UploadId></R>")
+            else:
+                self._answer(b"<CompleteMultipartUploadResult><ETag>x</ETag></CompleteMultipartUploadResult>")
+
+        def do_PUT(self) -> None:  # noqa: N802 - http.server API
+            self._answer(b"", {"ETag": '"e1"'})
+
+        def log_message(self, *_a: Any) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(orch_aws, "send", orch_aws.http_send)  # this test only: a local server
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", f"http://127.0.0.1:{server.server_address[1]}")
+    try:
+        s3 = orch_aws.S3("eu-west-2", lambda: CREDS)
+        up = s3.create_multipart_upload(Bucket="bkt", Key="d/t.dump")
+        etag = s3.upload_part(Bucket="bkt", Key="d/t.dump", UploadId=up["UploadId"], PartNumber=1, Body=b"data")
+        s3.complete_multipart_upload(
+            Bucket="bkt", Key="d/t.dump", UploadId="u1", MultipartUpload={"Parts": [{"PartNumber": 1, **etag}]}
+        )
+    finally:
+        server.shutdown()
+    assert len(seen) == 3
+    for headers in seen:
+        signed = re.search(r"SignedHeaders=([^,]+)", headers["authorization"])
+        assert signed and "content-type" in signed.group(1).split(";"), headers.get("content-type")
+    assert seen[2]["content-type"] == "application/xml"
+
+
 # --- the runner runtime needs no boto3 ------------------------------------------------------
 
 

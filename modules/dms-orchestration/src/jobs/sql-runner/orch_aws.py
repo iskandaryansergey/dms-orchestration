@@ -482,11 +482,15 @@ class Client:
         ``error_in_200``: a 200 whose body is an ``<Error>`` document is an error (S3
         CompleteMultipartUpload); the body is then read and returned as bytes."""
         payload = hashlib.sha256(body).hexdigest()
+        headers = dict(headers or {})
+        if method in ("PUT", "POST") and not any(k.lower() == "content-type" for k in headers):
+            # Otherwise urllib adds an unsigned form-urlencoded type that S3 counts against the signature.
+            headers["Content-Type"] = "application/octet-stream"
         attempts = RETRY_ATTEMPTS if isinstance(body, bytes) else 1
         for attempt in range(1, attempts + 1):
             last = attempt == attempts
             # Signed again each attempt: fresh X-Amz-Date, fresh credentials if they rotated.
-            signed = sign(method, url, headers or {}, payload, self._credentials(), self.region, self.service)
+            signed = sign(method, url, headers, payload, self._credentials(), self.region, self.service)
             try:
                 resp = (self._transport or send)(method, url, signed, body if method in ("PUT", "POST") else None)
             except OSError as err:
@@ -650,7 +654,8 @@ class S3(Client):
         body = f"<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>".encode()
         # S3 can answer 200 with an error document once the upload has started (error_in_200).
         url = self._url(Bucket, Key, {"uploadId": UploadId})
-        self.request("CompleteMultipartUpload", "POST", url, {}, body, error_in_200=True).body.read()
+        headers = {"Content-Type": "application/xml"}
+        self.request("CompleteMultipartUpload", "POST", url, headers, body, error_in_200=True).body.read()
         return {}
 
     def abort_multipart_upload(self, Bucket: str, Key: str, UploadId: str) -> dict[str, Any]:  # noqa: N803
