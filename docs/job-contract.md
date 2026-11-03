@@ -67,9 +67,11 @@ phases:
 * **Runtime.** `handler:` and `sql:` jobs run in Lambda (up to 840 s; pg8000 with TLS
   verify-full when the connection has a host, the Data API otherwise). A job with `command:`
   runs in a command runtime: `runtime: ssm` on an SSM runner instance from the team AMI
-  (psql, pg_dump, pg_restore, bash, python3; pwsh optional; module input `ssm`, RUNBOOK
-  section 16), or Fargate in the image named by `image` (psql, mysql, python, bash, pwsh),
-  optional ([ADR 0011](adr/0011-job-runtimes.md)). Both run the same wrapper (orch-job) with
+  (psql, pg_dump, pg_restore, bash, python3; mysql and pwsh only if the AMI ships them;
+  module input `ssm`, off by default, RUNBOOK section 16), or Fargate in the image named by
+  `image` (psql, mysql, python, bash; pwsh only when the image is built with
+  `INSTALL_POWERSHELL=true`, off by default), optional and off by default
+  ([ADR 0011](adr/0011-job-runtimes.md)). Both run the same wrapper (orch-job) with
   the project's job role, the same environment and the same result contract.
 * **Conditions.** Add `when: "<expression>"` to run a job only sometimes, for example
   `when: "ctx.startType == 'reload-target'"` ([Conditions and templates](#conditions-and-templates)).
@@ -298,9 +300,11 @@ Entry point `orch_job.py` runs your `command` in the bundle directory.
 | `ORCH_DRY_RUN` | `1` in dry runs: **change nothing**, print what you would do |
 | `ORCH_RUN_ID`, `ORCH_PHASE`, `ORCH_JOB_NAME`, `ORCH_ATTEMPT` | run info |
 
-Tools: `psql` 17, `mysql`, `python3` (+ boto3 in the Fargate image only; on an SSM runner the
-standard library), `bash`, `pwsh`, and
-`psql-run` / `mysql-run`:
+Tools: `psql` 17, `python3` (+ boto3 in the Fargate image only; on an SSM runner the standard
+library), `bash`, and `psql-run` on both command runtimes. Not there by default: `mysql-run`
+needs a `mysql` client, which only the Fargate image installs (that runtime is optional and off
+by default; on an SSM runner only if the AMI ships one), and `pwsh` exists only in an image
+built with `INSTALL_POWERSHELL=true` or on an AMI that ships it. The wrappers:
 
 ```
 psql-run --connection target --file ddl/020_indexes.sql [--file ...] [--single-transaction]

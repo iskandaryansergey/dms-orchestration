@@ -39,7 +39,7 @@ apply, a slow destroy): [docs/troubleshooting.md](docs/troubleshooting.md).
    run as `MANUAL` with the diff. Resetting it needs `--allow-reset`; nothing is reset silently.
 7. Before promoting to the next environment: `python scripts/orch.py gate <runId>` (exit 0 only
    for a `SUCCEEDED` run whose baseline is still the latest).
-8. Fargate jobs that log in with an IAM token instead of a secret: §13. Where the target check
+8. Jobs that log in with an IAM token instead of a secret: §13. Where the target check
    of pre-flight runs (Lambda or Fargate): §14. Aurora Serverless v2 with auto-pause: §15.
 
 ## 2. Start and watch
@@ -289,15 +289,16 @@ Auto-resume after a transient DMS failure needs nothing from the operator: post 
 a new `migrate <runId>-r<n>` (`attempt` + 1, at most `autoResume.maxAttempts`), which resumes the
 task from its checkpoint.
 
-## 13. IAM authentication for Fargate jobs (ADR 0009)
+## 13. IAM authentication for jobs (ADR 0009)
 
-A connection can log Fargate (`psql`) jobs in with a short-lived IAM database token instead of a
-secret: `auth = "iam"`, `iam_user`, `host` and
+A connection can log jobs in with a short-lived IAM database token instead of a secret, on every
+runtime (Lambda SQL, SSM, Fargate; PostgreSQL only): `auth = "iam"`, `iam_user`, `host` and
 `iam_policy_arn = module.<aurora>.iam_database_auth.users["<user>"].policy_arn` (an upstream
 aurora module with `iam_database_users`, `create_iam_database_auth_policies` and
-`create_iam_database_users`). The module attaches that policy to the project's job role; jobs
-name the connection in `--connection` and no secret is read. The token lives 15 minutes, is
-signed at each client start and reaches only psql's environment; TLS is required. DMS endpoints
+`create_iam_database_users`). The module attaches that policy to the project's job role; command
+jobs name the connection in `--connection`, SQL jobs in `sql.connection`, and no secret is read. The token lives 15 minutes, is
+signed at each client start and reaches only the client (psql's environment, or pg8000 in the
+Lambda); TLS is required. DMS endpoints
 and the Data API built-ins keep their secret connections.
 
 A failed login looks like `password authentication failed`. Check, in this order:

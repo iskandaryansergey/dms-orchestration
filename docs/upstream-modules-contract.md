@@ -114,7 +114,7 @@ same configuration.
 | `data_api_cluster_arn` on a connection | output `cluster_arn` | ✅ |
 | `host`, `port`, `database` on a connection | output `connection.host/port/database` or `cluster_endpoint` | ✅ |
 | secret for jobs | `connection.secret_arn` = RDS-managed master secret (username/password only) | Data API accepts it; jobs that need `host` (pg8000/Fargate) need their own secret |
-| IAM database authentication for Fargate jobs | `create_iam_database_users`, output `iam_database_auth.users[u].policy_arn` | only for `connections[*].auth = "iam"` |
+| IAM database authentication for jobs (Lambda SQL, SSM, Fargate) | `create_iam_database_users`, output `iam_database_auth.users[u].policy_arn` | only for `connections[*].auth = "iam"` |
 | Serverless v2, auto-pause | `instance_class = "db.serverless"`, `serverlessv2_scaling_configuration.min_capacity = 0`, `seconds_until_auto_pause` ≥ 300 | builtin jobs retry `DatabaseResumingException` |
 | our jobs/DMS SGs allowed in | `ingress_rules = { name = { referenced_security_group_id = ... } }` | ✅; SG id via output `security_group_id` → our `database_security_group_ids` |
 

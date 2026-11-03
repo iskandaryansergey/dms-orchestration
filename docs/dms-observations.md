@@ -157,8 +157,9 @@ S1p, S2, S3, S5, S6 green; 16/16 AWS TestState cases.
 
 ## 8. Fargate `sql-runner`
 
-* The image is built by CodeBuild in the sandbox (`examples/sandbox/sql_runner.tf`, base
-  image from the ECR Public mirror: Docker Hub rate-limits CodeBuild), gated by trivy as in
+* The image is built by CodeBuild in the sandbox (`examples/sandbox/sql_runner.tf`, optional
+  and off by default: `TF_VAR_sql_runner=true` turns it on; the module never builds an image;
+  base image from the ECR Public mirror: Docker Hub rate-limits CodeBuild), gated by trivy as in
   CI (`--severity HIGH,CRITICAL --ignore-unfixed`) before the push. The ECR basic scan cannot
   ignore unfixed CVEs: it reports 8 HIGH in Debian packages without a fix (util-linux,
   cyrus-sasl2, zlib), 0 CRITICAL; report only.

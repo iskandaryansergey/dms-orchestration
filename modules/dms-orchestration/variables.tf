@@ -100,9 +100,10 @@ variable "projects" {
         ssl_mode             = optional(string, "verify-full")
         data_api_cluster_arn = optional(string, "")
         cluster_arn          = optional(string, "") # dump.method = snapshot; default data_api_cluster_arn
-        # auth = "iam": Fargate jobs log in as iam_user with an IAM token (psql only, TLS); the
-        # policy with rds-db:connect (upstream aurora module, iam_database_auth.users[u].policy_arn)
-        # is attached to the project's job role. DMS and the Data API keep using secrets.
+        # auth = "iam": jobs on every runtime (Lambda SQL, SSM, Fargate) log in as iam_user with an
+        # IAM token (PostgreSQL, TLS only); the policy with rds-db:connect (upstream aurora module,
+        # iam_database_auth.users[u].policy_arn) is attached to the project's job role. DMS and the
+        # Data API keep using secrets.
         auth           = optional(string, "secret")
         iam_user       = optional(string, "")
         iam_policy_arn = optional(string, "")
