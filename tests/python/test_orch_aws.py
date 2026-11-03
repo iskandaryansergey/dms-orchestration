@@ -5,7 +5,9 @@ call runs against a fake transport, one against a local HTTP server. No AWS, no 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import http.server
+import io
 import json
 import re
 import subprocess
@@ -473,6 +475,129 @@ def test_every_content_type_on_the_wire_is_signed(monkeypatch):
         signed = re.search(r"SignedHeaders=([^,]+)", headers["authorization"])
         assert signed and "content-type" in signed.group(1).split(";"), headers.get("content-type")
     assert seen[2]["content-type"] == "application/xml"
+
+
+class S3Server(http.server.BaseHTTPRequestHandler):
+    """Enough of S3 for pg-dump-s3: CreateMultipartUpload, UploadPart, CompleteMultipartUpload
+    (assembles the object from the parts it names, in the order it names them), PutObject."""
+
+    seen: list[dict[str, Any]]
+    parts: dict[int, bytes]
+    objects: dict[str, bytes]
+
+    def _answer(self, data: bytes = b"", headers: dict[str, str] | None = None) -> None:
+        self.send_response(200)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _record(self) -> tuple[str, dict[str, list[str]], bytes]:
+        url = urllib.parse.urlsplit(self.path)
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        query = urllib.parse.parse_qs(url.query, keep_blank_values=True)
+        headers = {k.lower(): v for k, v in self.headers.items()}
+        self.seen.append({"method": self.command, "path": url.path, "query": query, "headers": headers, "body": body})
+        return url.path, query, body
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server API
+        path, query, body = self._record()
+        if "uploads" in query:
+            self._answer(b"<InitiateMultipartUploadResult><UploadId>up-1</UploadId></InitiateMultipartUploadResult>")
+            return
+        root = orch_aws._xml(body)
+        self.objects[path] = b"".join(self.parts[int(orch_aws._text(p, "PartNumber"))] for p in root)
+        self._answer(b"<CompleteMultipartUploadResult><ETag>x-3</ETag></CompleteMultipartUploadResult>")
+
+    def do_PUT(self) -> None:  # noqa: N802 - http.server API
+        path, query, body = self._record()
+        if "partNumber" in query:
+            self.parts[int(query["partNumber"][0])] = body
+            self._answer(headers={"ETag": f'"{hashlib.md5(body).hexdigest()}"'})  # noqa: S324 - S3 ETag
+        else:
+            self.objects[path] = body
+            self._answer(headers={"ETag": '"m"'})
+
+    def do_DELETE(self) -> None:  # noqa: N802 - http.server API
+        self._record()
+        self._answer()
+
+    def log_message(self, *_a: Any) -> None:
+        pass
+
+
+def test_a_dump_of_several_parts_is_assembled_in_order_on_the_wire(tmp_path, monkeypatch):
+    """Live, the sandbox dump (3.2 MB) fitted one part. Here pg-dump-s3 runs through the real
+    orch_aws S3 client against a local server with PART_SIZE made small: each part is uploaded
+    once, numbered 1..n; CompleteMultipartUpload names them in order with their own ETags; every
+    request with a body has a signed Content-Type."""
+    import orch_dump
+
+    handler = type("Handler", (S3Server,), {"seen": [], "parts": {}, "objects": {}})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(orch_aws, "send", orch_aws.http_send)  # this test only: a local server
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", f"http://127.0.0.1:{server.server_address[1]}")
+    monkeypatch.setattr(orch_dump, "_s3", lambda: orch_aws.S3("eu-west-2", lambda: CREDS))
+    monkeypatch.setattr(orch_dump, "PART_SIZE", 1024 * 1024)  # pg-dump-s3 reads pg_dump 1 MiB at a time
+    conn = {"engine": "postgresql", "host": "h", "port": 5432, "database": "d", "username": "u", "password": "p"}
+    spec = {"runId": "r1", "ctx": {"project": "ledger", "taskKey": "core", "selectionRules": []}}
+    (tmp_path / "conns.json").write_text(json.dumps({"target": conn}))
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    (tmp_path / "out").mkdir()
+    for name, value in {
+        "ORCH_CONNECTIONS_FILE": tmp_path / "conns.json",
+        "ORCH_JOB_SPEC_FILE": tmp_path / "spec.json",
+        "ORCH_OUT_DIR": tmp_path / "out",
+        "ORCH_WORK_DIR": tmp_path,
+        "ORCH_ARTIFACTS_BUCKET": "bkt",
+        "ORCH_DUMP_KMS_KEY": "arn:aws:kms:eu-west-2:1:key/k",
+    }.items():
+        monkeypatch.setenv(name, str(value))
+    monkeypatch.delenv("ORCH_DRY_RUN", raising=False)
+    data = b"PGDMP" + bytes(range(256)) * (10 * 1024 + 7)  # a little over 2.5 MiB: parts of 1, 1 and 0.5 MiB
+
+    class Proc:
+        stdout = io.BytesIO(data)
+
+        def wait(self, timeout: Any = None) -> int:
+            return 0
+
+    class Done:
+        returncode, stderr, stdout = 0, "", json.dumps([{"s": "app", "t": "accounts", "partitioned": False}])
+
+    try:
+        code = orch_dump.dump_main(
+            ["--connection", "target", "--schemas", "app"],
+            popen=lambda *a, **k: Proc(),
+            runner=lambda *a, **k: Done(),
+            now=NOW,
+        )
+    finally:
+        server.shutdown()
+    assert code == 0, (tmp_path / "out" / "result.json").read_text()
+    seen = handler.seen
+    assert [r["method"] for r in seen] == ["POST", "PUT", "PUT", "PUT", "POST", "PUT"]
+    uploads = [r for r in seen if "partNumber" in r["query"]]
+    assert [int(r["query"]["partNumber"][0]) for r in uploads] == [1, 2, 3]
+    assert [r["query"]["uploadId"] for r in uploads] == [["up-1"]] * 3
+    assert [len(r["body"]) for r in uploads] == [1024 * 1024, 1024 * 1024, len(data) - 2 * 1024 * 1024]
+    complete = orch_aws._xml(seen[4]["body"])
+    assert orch_aws._local(complete.tag) == "CompleteMultipartUpload" and seen[4]["query"]["uploadId"] == ["up-1"]
+    named = [(int(orch_aws._text(p, "PartNumber")), orch_aws._text(p, "ETag")) for p in complete]
+    etags = [f'"{hashlib.md5(r["body"]).hexdigest()}"' for r in uploads]  # noqa: S324 - S3 ETag
+    assert named == [(1, etags[0]), (2, etags[1]), (3, etags[2])]
+    key = "/bkt/dumps/ledger/core/20261102T103000Z-r1/target.dump"
+    assert handler.objects[key] == data
+    manifest = json.loads(handler.objects[key.replace("target.dump", "manifest.json")])
+    assert manifest["bytes"] == len(data) and manifest["sha256"] == hashlib.sha256(data).hexdigest()
+    assert seen[0]["headers"]["x-amz-server-side-encryption"] == "aws:kms"
+    for r in seen:
+        signed = re.search(r"SignedHeaders=([^,]+)", r["headers"]["authorization"])
+        assert signed and "content-type" in signed.group(1).split(";"), (r["method"], r["query"])
+    assert seen[4]["headers"]["content-type"] == "application/xml"
+    assert [r["headers"]["content-type"] for r in uploads] == ["application/octet-stream"] * 3
 
 
 # --- the runner runtime needs no boto3 ------------------------------------------------------
