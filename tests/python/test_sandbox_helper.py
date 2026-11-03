@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -429,3 +430,48 @@ def test_jobset_tool_build_adds_no_platform_newlines(tmp_path, monkeypatch):
     built = {p.relative_to(out).as_posix(): p.read_bytes() for p in out.rglob("*") if p.is_file()}
     assert {"jobset.yaml", "jobset.json", "bundle.sha256"} <= set(built)
     assert not [k for k, v in built.items() if b"\r" in v]
+
+
+# --- S10: no dump, no restore ---------------------------------------------
+
+
+def load_e2e(monkeypatch):
+    """e2e.py with a fake ``sandbox`` (no terraform outputs); boto3 clients under moto: no AWS."""
+    fake = type(sys)("sandbox")
+    fake.outputs = lambda: {
+        "region": "eu-west-2",
+        "table_name": "t",
+        "artifacts_bucket": "bkt",
+        "ssm_runner": True,
+        "state_machine_arn": "arn:aws:states:eu-west-2:000000000000:stateMachine:dms-orch-sbx-migrate",
+    }
+    fake.data_api = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "sandbox", fake)
+    monkeypatch.setattr(sys, "path", list(sys.path))  # e2e.py puts its directory first
+    spec = importlib.util.spec_from_file_location("e2e_script", E2E)
+    e2e = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(e2e)
+    return e2e
+
+
+def test_e2e_s10_skips_the_restore_with_a_message_when_the_dump_is_missing(aws, monkeypatch, capsys):
+    """Seen live: a failed dump left no prefix and s10 ran orch.py restore --dump "" (a traceback)."""
+    e2e = load_e2e(monkeypatch)
+    started, ran = [], []
+    monkeypatch.setattr(e2e, "counts", lambda: {"app.accounts": (10, 10)})
+    monkeypatch.setattr(e2e, "start", lambda **req: started.append(req) or {"runId": "r1"})
+    monkeypatch.setattr(e2e, "wait", lambda run, timeout=900: {"status": "FAILED"})
+    monkeypatch.setattr(e2e, "jobs", lambda run_id: {"dump-target": {"status": "fail", "runtime": "ssm"}})
+    monkeypatch.setattr(e2e.subprocess, "run", lambda *a, **k: ran.append(a))
+
+    class S3:
+        def list_objects_v2(self, **_kw):
+            return {}
+
+    monkeypatch.setattr(e2e.boto3, "client", lambda *a, **k: S3())
+    assert e2e.s10() is False
+    assert ran == []  # orch.py restore never ran with an empty --dump
+    assert [r["operation"] for r in started] == ["migrate"]  # no plan after a restore that did not happen
+    out = capsys.readouterr().out
+    assert "no dump of run r1" in out and "restore skipped" in out
+    assert '"restore succeeded": false' in out

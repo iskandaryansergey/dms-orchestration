@@ -765,6 +765,19 @@ def s10() -> bool:
     )
     latest = sorted(p["Prefix"] for p in listed.get("CommonPrefixes") or [] if run["runId"] in p["Prefix"])
     uri = f"s3://{OUT['artifacts_bucket']}/{latest[-1]}" if latest else ""
+    if not uri:
+        # Nothing to restore from (orch.py restore refuses an empty --dump): no restore, no plan.
+        print(f"S10: no dump of run {run['runId']} under s3://{OUT['artifacts_bucket']}/{prefix}: restore skipped")
+        return verdict(
+            "S10",
+            {
+                "dump ok before the reset": dumps.get("status") == "ok",
+                "run failed half-way": d["status"] == "FAILED",
+                "restore succeeded": False,
+            },
+            dump=None,
+            dumpJob={k: dumps.get(k) for k in ("status", "runtime", "message")},
+        )
     script = Path(__file__).resolve().parents[3] / "scripts" / "orch.py"
     env = {
         **os.environ,
