@@ -522,9 +522,22 @@ module "dms_orchestration" {
                 iam_policy_arn = try(module.aurora["target"].iam_database_auth.users[local.iam_user].policy_arn, "")
               }
           } : k => v if var.iam_auth })
-          # The e2e job sets are rebuilt per run (sandbox.py sync-jobs), so they are not pinned;
-          # runs still check every file against the bundle.sha256 uploaded with them.
-          jobs = { default_version = "e2e", allow_unpinned = true }
+          # The e2e job sets are pinned: totals of jobset_tool.py build over the templates as
+          # sandbox.py sync-jobs renders them (SQL Lambda ARN of the account; LF on every host).
+          # A template change needs new totals here; other versions are refused.
+          jobs = {
+            default_version = "e2e"
+            allow_unpinned  = false
+            bundles = {
+              "e2e"          = "6681afa75c72f9349febd9fe0e90a1933c38ac01f9e6338b7734b645681c941a"
+              "e2e-dms-only" = "6cfa9b95085bf21f25fc02c5ec6c28e3766d3dbe411678877b82d1e76a72b9df"
+              "e2e-postfail" = "2d91671a26ff18d81780126f72248191aa4dd0f71f291f502416950cfea313c4"
+              "e2e-sql"      = "797dcca80b9c1d758f3400a0761f6cbbc49445897326b9ea30780320c2a3bff1"
+              "e2e-recheck"  = "76bf87144d7ec8fc6f41ab5a11c6687e68fae20a4e427bfee3f58da3743eec5b"
+              "e2e-ssm"      = "dfa2b6e0d9926b07c873cb1e57385451a99a777b8ca8a9c9fb72983c71dd909b"
+              "e2e-fargate"  = "94c44b838e45fe27dbc566dd8b143c6dd741cdb15e216a927099e544c7f6869b"
+            }
+          }
           # snapshot_dumps (s10snap): dump.method = snapshot, the job role may snapshot the target cluster.
           # app.audit_notes has no primary key, so DMS cannot validate it ("No primary Key"):
           # with the module default (true) every load would end FAILED DmsValidationErrors.
@@ -551,11 +564,16 @@ module "dms_orchestration" {
     folder   = module.dms.premigration_assessment.folder
   } : null
 
-  # ssm_runner.tf: long jobs (pg-dump, restore, e2e-ssm) on the runner instance.
+  # ssm_runner.tf: long jobs (pg-dump, restore, e2e-ssm) on the runner instance of the one
+  # sandbox project (ssm.runners: one runner per project, never shared).
   ssm = {
-    enabled           = var.ssm_runner
-    instance_ids      = aws_instance.ssm_runner[*].id
-    instance_role_arn = one(aws_iam_role.ssm_runner[*].arn)
+    enabled = var.ssm_runner
+    runners = var.ssm_runner ? {
+      ledger = {
+        instance_ids      = aws_instance.ssm_runner[*].id
+        instance_role_arn = aws_iam_role.ssm_runner[0].arn
+      }
+    } : {}
   }
 
   # sql_runner.tf: the image built by CodeBuild, when its tag is given.

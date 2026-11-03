@@ -35,7 +35,7 @@ Terraform 1.9.8, `hashicorp/aws >= 5.90, < 6`. In the migration workspace, next 
 
 ```hcl
 module "dms_orchestration" {
-  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.2.0"
+  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.3.0"
 
   environment = "dev"
   vpc_id      = var.vpc_id
@@ -73,6 +73,15 @@ module "dms_orchestration" {
   job_secret_arns             = [var.source_runner_secret_arn, var.target_runner_secret_arn]
   kms_key_arn                 = var.kms_key_arn  # "" only in a sandbox
   database_security_group_ids = [var.target_db_security_group_id, var.source_db_security_group_id]
+
+  # Long jobs on SSM: one runner per project, never shared (one dms-sql-bastion per project,
+  # RUNBOOK §16).
+  ssm = {
+    enabled = true
+    runners = {
+      for p, b in module.sql_bastion : p => { instance_ids = [b.instance_id], instance_role_arn = b.role_arn }
+    }
+  }
 }
 ```
 
@@ -90,8 +99,8 @@ project), SSM parameters, alarms and, unless you bring them, a DynamoDB table, a
 an SNS topic; the module's tags include `ManagedBy` and `Module`. No ECS cluster, no ECR
 endpoints and no container image by default: SQL jobs run in a Lambda, long jobs
 (`pg_dump`/`pg_restore`, long DDL, scripts) on SSM-managed instances built from your AMI
-(`ssm`; one runner per project, since projects sharing a runner are not isolated from each
-other), and Fargate is an optional third runtime that appears only with `fargate.images`, a
+(`ssm.runners`: one runner per project, never shared; python3 with the standard library is
+enough), and Fargate is an optional third runtime that appears only with `fargate.images`, a
 pre-pushed image pinned by digest. The module never builds an image
 ([ADR 0011](docs/adr/0011-job-runtimes.md)).
 
@@ -136,10 +145,17 @@ make teststate-dry    # build the TestState requests (no AWS)
 The cycle, the commit rules and the denylist gate: [CONTRIBUTING.md](CONTRIBUTING.md); for coding
 agents: [AGENTS.md](AGENTS.md). Test levels and the e2e matrix: [docs/testing.md](docs/testing.md).
 
-## Release 0.2.0
+## Release 0.3.0
 
-Hardening and new job runtimes: run artifacts per project and a pinned run context, job sets
-pinned by hash, a transactional restore scoped to the dump's tables under the task lock, DMS
+One SSM runner per project (`ssm.runners`, never shared) with a runner runtime on the Python
+standard library (no boto3 on the runner), the KMS key policy requirements as a list in the
+shape the shared `kms` module compiles, and fixes to the runner's AWS client, `orch.py restore`
+and the `--truncate-scope` result. 0.3.0 has breaking changes for 0.2 configurations (`ssm`,
+`kms_key_policy_requirements`, `ssm_runner_policy_json`, the `ManagedBy` tag value); each is
+listed under *Changed*, with the upgrade steps, in [CHANGELOG.md](CHANGELOG.md).
+
+Release 0.2.0 brought hardening and new job runtimes: run artifacts per project and a pinned
+run context, job sets pinned by hash, a transactional restore scoped to the dump's tables under the task lock, DMS
 validation failing the run by default, SQL jobs in a Lambda and long jobs on SSM with Fargate
 optional, and the registry conventions (`create`, non-nullable inputs, KMS key policy contract
 v2). 0.2.0 has breaking changes for 0.1 deployments, runs and dumps; each is listed under

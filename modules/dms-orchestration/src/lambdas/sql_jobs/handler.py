@@ -10,7 +10,8 @@ in S3 only), then, with ``sql``:
 * ``inline``: the same, for one short statement list in the job set;
 * ``truncateScope``: ``TRUNCATE`` of the full ``ctx.resetTables`` in one statement
   (``cascade``: ``CASCADE``); tables missing on the target are skipped and named in the
-  message (``skippedMissing``); a dry run only counts.
+  message and the summary (``skippedMissing``, ``skippedTables``: at most 10 names), ``tables``
+  counts only the tables truncated; a dry run only counts.
 
 ``{{ expr }}`` in the SQL becomes a SQL literal and ``{{ ident:expr }}`` a quoted identifier,
 from ``ctx``, ``run``, ``failure``, ``var`` (``sql.vars``) and earlier results; nothing is spliced.
@@ -177,12 +178,15 @@ def truncate(spec: dict[str, Any], sql: dict[str, Any], name: str, dry: bool) ->
             cascade = " CASCADE" if sql.get("cascade") else ""
             db.execute("TRUNCATE TABLE " + ", ".join(present) + cascade)  # one statement: all tables or none
     message = f"truncated {len(present)} table(s)" if present else "nothing to truncate"
+    skipped: dict[str, Any] = {}
     if gone:
         names = sorted(quoted[q] for q in gone)
         more = len(names) - MISSING_LISTED
         listed = ", ".join(names[:MISSING_LISTED]) + (f" and {more} more" if more > 0 else "")
         message += f"; skipped {len(names)} table(s) missing on the target: {listed}"
-    return result("ok", message, **base, tables=len(present), **({"skippedMissing": len(gone)} if gone else {}))
+        skipped = {"skippedMissing": len(names), "skippedTables": names[:MISSING_LISTED]}
+    # `tables` counts the tables truncated, not the reset list.
+    return result("ok", message, **base, tables=len(present), **skipped)
 
 
 def run_sql(spec: dict[str, Any], sql: dict[str, Any], name: str, dry: bool) -> dict[str, Any]:

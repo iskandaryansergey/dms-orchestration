@@ -27,7 +27,7 @@ the minimum:
 
 ```hcl
 module "dms_orchestration" {
-  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.2.0"
+  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/dms-orchestration?ref=v0.3.0"
 
   environment = "dev"
   vpc_id      = var.vpc_id
@@ -67,7 +67,7 @@ encryption, TLS only, SSE-KMS only under `dumps/`, and the lifecycle of `runs/`,
 
 ```hcl
 module "artifacts_bucket" {
-  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/artifacts-bucket?ref=v0.2.0"
+  source = "git::ssh://git@github.com/<org>/dms-orchestration.git//modules/artifacts-bucket?ref=v0.3.0"
 
   name        = "dms-dev-artifacts-<account-id>"
   kms_key_arn = var.kms_key_arn

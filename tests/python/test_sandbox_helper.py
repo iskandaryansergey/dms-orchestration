@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -262,8 +263,9 @@ def test_the_sandbox_runner_instance_is_a_stand_in_for_the_team_ami():
     assert 'var.runner_ami_id != "" ? var.runner_ami_id' in tf
     assert 'http_tokens = "required"' in tf and "associate_public_ip_address = false" in tf
     assert "encrypted = true" in tf
-    assert "module.dms_orchestration.ssm_runner_policy_json" in tf
+    assert 'module.dms_orchestration.ssm_runner_policy_json["ledger"]' in tf  # its project's policy only
     assert "AmazonSSMManagedInstanceCore" in tf
+    assert "python3-boto3" not in tf  # the runtime needs python3 with the standard library only
     variables = (SANDBOX / "variables.tf").read_text(encoding="utf-8")
     for name in ("ssm_runner", "runner_ami_id"):
         assert f'variable "{name}"' in variables
@@ -272,6 +274,7 @@ def test_the_sandbox_runner_instance_is_a_stand_in_for_the_team_ami():
     )
     main = re.sub(r"\s+", " ", (SANDBOX / "main.tf").read_text(encoding="utf-8"))
     assert "enabled = var.ssm_runner" in main and "instance_ids = aws_instance.ssm_runner[*].id" in main
+    assert "runners = var.ssm_runner ? { ledger = {" in main  # one runner per project
     assert '"ec2messages", "ssmmessages"' in main  # agent endpoints from the network contract
 
 
@@ -374,3 +377,101 @@ def test_e2e_has_the_planned_scenarios_by_name_only(name):
     text = E2E.read_text(encoding="utf-8")
     assert f"e2e.py {name} " in text and f'scenarios["{name}"] = ' in text
     assert f'"{name}": ' not in text.split("names = argv or list(scenarios)")[0].split("def main")[-1]
+
+
+def crlf_platform(monkeypatch):
+    """Text-mode writes without an explicit newline get CRLF, as on Windows, on any host."""
+    real_open = Path.open
+
+    def open_like_windows(self, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
+        if "b" not in mode and any(m in mode for m in "wax+") and newline is None:
+            newline = "\r\n"
+        return real_open(self, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", open_like_windows)
+
+
+SYNCED_TEMPLATES = sorted(p.name for p in (SANDBOX / "jobs").glob("jobset*.yaml.tmpl"))
+
+
+@pytest.mark.parametrize("template", SYNCED_TEMPLATES)
+def test_sync_jobs_uploads_the_same_bytes_on_every_platform(template, monkeypatch):
+    # The bundle total covers every byte of jobset.yaml; CRLF on one host would make the pinned
+    # totals (main.tf jobs.bundles) host specific and every other host's runs JobSetTampered.
+    crlf_platform(monkeypatch)
+    uploaded: dict[str, bytes] = {}
+
+    class S3:
+        def upload_file(self, path, bucket, key):
+            assert bucket == "bkt"
+            uploaded[key.split("/", 3)[3]] = Path(path).read_bytes()
+
+    class Session:
+        def client(self, name):
+            assert name == "s3"
+            return S3()
+
+    monkeypatch.setattr(sandbox, "session", lambda out: Session())
+    arn = "arn:aws:lambda:us-east-1:000000000000:function:dms-orch-sbx-sql"
+    sandbox.cmd_sync_jobs({"sql_lambda_arn": arn, "artifacts_bucket": "bkt"}, template, "v")
+    source = (SANDBOX / "jobs" / template).read_bytes().replace(b"__SQL_LAMBDA_ARN__", arn.encode())
+    assert uploaded["jobset.yaml"] == source
+    assert {"jobset.yaml", "jobset.json", "bundle.sha256"} <= set(uploaded)
+    assert not [k for k, v in uploaded.items() if b"\r" in v]
+
+
+def test_jobset_tool_build_adds_no_platform_newlines(tmp_path, monkeypatch):
+    import jobset_tool
+
+    crlf_platform(monkeypatch)
+    bundle, out = SANDBOX.parent / "jobs" / "minimal", tmp_path / "built"
+    assert not [p for p in bundle.rglob("*") if p.is_file() and b"\r" in p.read_bytes()]
+    assert jobset_tool.build(bundle, out) == 0
+    built = {p.relative_to(out).as_posix(): p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    assert {"jobset.yaml", "jobset.json", "bundle.sha256"} <= set(built)
+    assert not [k for k, v in built.items() if b"\r" in v]
+
+
+# --- S10: no dump, no restore ---------------------------------------------
+
+
+def load_e2e(monkeypatch):
+    """e2e.py with a fake ``sandbox`` (no terraform outputs); boto3 clients under moto: no AWS."""
+    fake = type(sys)("sandbox")
+    fake.outputs = lambda: {
+        "region": "eu-west-2",
+        "table_name": "t",
+        "artifacts_bucket": "bkt",
+        "ssm_runner": True,
+        "state_machine_arn": "arn:aws:states:eu-west-2:000000000000:stateMachine:dms-orch-sbx-migrate",
+    }
+    fake.data_api = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "sandbox", fake)
+    monkeypatch.setattr(sys, "path", list(sys.path))  # e2e.py puts its directory first
+    spec = importlib.util.spec_from_file_location("e2e_script", E2E)
+    e2e = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(e2e)
+    return e2e
+
+
+def test_e2e_s10_skips_the_restore_with_a_message_when_the_dump_is_missing(aws, monkeypatch, capsys):
+    """Seen live: a failed dump left no prefix and s10 ran orch.py restore --dump "" (a traceback)."""
+    e2e = load_e2e(monkeypatch)
+    started, ran = [], []
+    monkeypatch.setattr(e2e, "counts", lambda: {"app.accounts": (10, 10)})
+    monkeypatch.setattr(e2e, "start", lambda **req: started.append(req) or {"runId": "r1"})
+    monkeypatch.setattr(e2e, "wait", lambda run, timeout=900: {"status": "FAILED"})
+    monkeypatch.setattr(e2e, "jobs", lambda run_id: {"dump-target": {"status": "fail", "runtime": "ssm"}})
+    monkeypatch.setattr(e2e.subprocess, "run", lambda *a, **k: ran.append(a))
+
+    class S3:
+        def list_objects_v2(self, **_kw):
+            return {}
+
+    monkeypatch.setattr(e2e.boto3, "client", lambda *a, **k: S3())
+    assert e2e.s10() is False
+    assert ran == []  # orch.py restore never ran with an empty --dump
+    assert [r["operation"] for r in started] == ["migrate"]  # no plan after a restore that did not happen
+    out = capsys.readouterr().out
+    assert "no dump of run r1" in out and "restore skipped" in out
+    assert '"restore succeeded": false' in out

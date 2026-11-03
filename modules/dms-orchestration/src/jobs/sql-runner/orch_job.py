@@ -5,9 +5,10 @@ Fargate: the job-runner state machine starts the container with the job's ``comm
 arguments. SSM (runtime ssm): the module document runs
 ``orch_job.py --assume-role <job role ARN> --command-from-spec`` as ``ssm.runner_user`` on a
 runner instance; the command comes from spec.json, never from a document parameter, and every
-AWS call (and the command's) uses the project's job role through a profile that assumes it
-from the instance profile (refreshed by botocore for jobs longer than an hour). Both get these
-environment variables:
+AWS call (and the command's tools') uses the project's job role through a profile that assumes
+it from the instance profile (assumed again before it expires, for jobs longer than an hour).
+AWS calls go through ``orch_aws`` (Python standard library: the AMI has no boto3). Both get
+these environment variables:
 
 * ``ORCH_JOB_SPEC_S3`` — s3://<bucket>/runs/<project>/<runId>/jobs/<phase>/<nn>-<name>/spec.json
 * ``ORCH_RUN_ID``, ``ORCH_DRY_RUN`` (1/0), ``ORCH_ATTEMPT``
@@ -38,8 +39,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+import orch_aws
 
 from shared import bundle  # image layout: /opt/orch/shared/bundle.py
 from shared.errors import JobSetTampered
@@ -73,14 +73,15 @@ def session_name(spec_uri: str) -> str:
     return re.sub(r"[^A-Za-z0-9+=,.@_-]", "-", name)[:64]
 
 
-def assume_role_session(role_arn: str, name: str, tmp_dir: Path, session_factory: Any = boto3.Session) -> Any:
+def assume_role_session(role_arn: str, name: str, tmp_dir: Path, session_factory: Any = orch_aws.Session) -> Any:
     """A session with the project's job role, assumed from the instance profile.
 
     Writes an AWS config profile (0600, ``<tmp>/aws-config``) with ``credential_source =
-    Ec2InstanceMetadata``: botocore assumes the role and assumes it again before the credentials
-    expire, so jobs longer than the one-hour limit of a role chain keep working. The process
-    environment then points every AWS client (also the job command's) at that profile and holds
-    no static keys. Refuses a session whose identity is not the job role."""
+    Ec2InstanceMetadata``: ``orch_aws`` (in this process and in the job's tools, which inherit
+    the environment) assumes the role and assumes it again before the credentials expire, so
+    jobs longer than the one-hour limit of a role chain keep working. The process environment
+    then points every AWS client at that profile and holds no static keys. Refuses a session
+    whose identity is not the job role."""
     if not ROLE_ARN.match(role_arn):
         raise ValueError(f"{role_arn!r} is not an IAM role ARN")
     config = tmp_dir / "aws-config"
@@ -126,8 +127,9 @@ def dirs() -> tuple[Path, Path, Path]:
 def _manifest(s3: Any, bucket: str, prefix: str) -> bytes | None:
     try:
         return s3.get_object(Bucket=bucket, Key=f"{prefix.rstrip('/')}/{bundle.MANIFEST}")["Body"].read()
-    except ClientError as err:
-        if err.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+    except Exception as err:
+        # orch_aws.ClientError and botocore's ClientError carry the same response shape.
+        if (getattr(err, "response", None) or {}).get("Error", {}).get("Code") in ("NoSuchKey", "404"):
             return None
         raise
 
@@ -171,7 +173,7 @@ def download_bundle(s3: Any, prefix_uri: str | None, dest: Path, expected: str |
 
 
 def _rds_client() -> Any:
-    return boto3.client("rds", region_name=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"))
+    return orch_aws.client("rds")
 
 
 def iam_auth_token(conn: dict[str, Any]) -> str:
@@ -335,7 +337,7 @@ def _fail_early(s3: Any, bucket: str, spec: dict[str, Any], message: str) -> Non
 
 
 def main(
-    argv: list[str] | None = None, s3: Any = None, secrets: Any = None, session_factory: Any = boto3.Session
+    argv: list[str] | None = None, s3: Any = None, secrets: Any = None, session_factory: Any = orch_aws.Session
 ) -> int:
     started = time.monotonic()
     out_dir, work_dir, tmp_dir = dirs()
@@ -343,7 +345,7 @@ def main(
     try:
         role_arn, from_spec, command = parse_options(list(sys.argv[1:] if argv is None else argv))
         session = assume_role_session(role_arn, session_name(spec_uri), tmp_dir, session_factory) if role_arn else None
-    except (ValueError, KeyError, BotoCoreError, ClientError) as err:
+    except (ValueError, KeyError, OSError, orch_aws.ClientError, orch_aws.CredentialError) as err:
         # Without the job role there is nowhere to write a result: the exit code and this
         # line (command output in CloudWatch) are all the job-runner gets.
         (tmp_dir / "aws-config").unlink(missing_ok=True)
@@ -368,9 +370,10 @@ def _run(
     secrets: Any,
     session: Any,
 ) -> int:
-    clients = session or boto3
-    s3 = s3 or clients.client("s3")
-    secrets = secrets or clients.client("secretsmanager")
+    if s3 is None or secrets is None:
+        clients = session or orch_aws.Session()
+        s3 = s3 or clients.client("s3")
+        secrets = secrets or clients.client("secretsmanager")
 
     bucket, key = split_s3(spec_uri)
     spec = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())

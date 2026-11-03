@@ -71,30 +71,40 @@ def truncate_sql(tables: list[str], engine: str, cascade: bool = False) -> str:
     return f"TRUNCATE TABLE {', '.join(quoted)}{' CASCADE' if cascade else ''};\n"
 
 
-def truncate_existing_sql(tables: list[str], cascade: bool = False) -> str:
+TRUNCATE_RESULT_SETTING = "orch.truncate_result"
+MISSING_LISTED = 10
+
+
+def truncate_existing_sql(tables: list[str], cascade: bool = False, result_path: Path | None = None) -> str:
     """PostgreSQL: one ``TRUNCATE`` of the listed tables that exist, decided on the server.
 
     The reset scope comes from DMS table statistics, which keep tables dropped since the run
     they describe; a missing table has no rows to reset. The check and the ``TRUNCATE`` are one
     statement; the skipped tables are named in a NOTICE (psql output), none present is no error.
+    After the ``TRUNCATE`` the block records what it did (``truncated``: count, ``missing``: the
+    skipped names) in a session setting; with ``result_path`` psql writes that record to the file
+    (``\\o``), so the job result carries it, not only the log (``truncate_result``).
     Names are checked identifiers (``quote_table``), so the dynamic statement holds no free text.
     """
     if not tables:
         return ""
     listed = ", ".join(sql_literal(quote_table(t, "postgresql"), "postgresql") for t in tables)
     tail = " CASCADE" if cascade else ""
-    return (
-        "DO $orch$\n"  # noqa: S608 - names checked by quote_table, passed as literals
-        "DECLARE\n"
+    body = (
+        "DECLARE\n"  # noqa: S608 - names checked by quote_table, passed as literals
         f"  listed text[] := ARRAY[{listed}];\n"
         "  present text;\n"
+        "  present_count int;\n"
         "  missing text;\n"
+        "  missing_list text[];\n"
         "  missing_count int;\n"
         "BEGIN\n"
         "  SELECT string_agg(t, ', ' ORDER BY o) FILTER (WHERE to_regclass(t) IS NOT NULL),\n"
+        "         count(*) FILTER (WHERE to_regclass(t) IS NOT NULL),\n"
         "         string_agg(t, ', ' ORDER BY o) FILTER (WHERE to_regclass(t) IS NULL),\n"
+        "         array_agg(t ORDER BY o) FILTER (WHERE to_regclass(t) IS NULL),\n"
         "         count(*) FILTER (WHERE to_regclass(t) IS NULL)\n"
-        "    INTO present, missing, missing_count\n"
+        "    INTO present, present_count, missing, missing_list, missing_count\n"
         "    FROM unnest(listed) WITH ORDINALITY AS u(t, o);\n"
         "  IF missing IS NOT NULL THEN\n"
         "    RAISE NOTICE 'psql-run: skipped % table(s) missing on the target: %', missing_count, missing;\n"
@@ -102,9 +112,57 @@ def truncate_existing_sql(tables: list[str], cascade: bool = False) -> str:
         "  IF present IS NOT NULL THEN\n"
         f"    EXECUTE 'TRUNCATE TABLE ' || present || '{tail}';\n"
         "  END IF;\n"
-        "END\n"
-        "$orch$;\n"
+        f"  PERFORM set_config('{TRUNCATE_RESULT_SETTING}',\n"
+        "    json_build_object('truncated', present_count, 'missing', missing_list)::text, false);\n"
+        "END"
     )
+    # `$` is valid in an identifier: pick a dollar-quote tag the body does not hold.
+    tag, n = "$orch$", 0
+    while tag in body:
+        n += 1
+        tag = f"$orch_{n}$"
+    sql = f"DO {tag}\n{body}\n{tag};\n"
+    if result_path is None:
+        return sql
+    target = result_path.as_posix()
+    if any(c in target for c in "'\\\n\r"):
+        raise SqlRunError(f"unusable result path {target!r}")
+    return (
+        sql + "\\set QUIET on\n\\pset tuples_only on\n\\pset format unaligned\n"
+        f"\\o '{target}'\n"
+        f"SELECT current_setting('{TRUNCATE_RESULT_SETTING}', true);\n"
+        "\\o\n\\pset format aligned\n\\pset tuples_only off\n\\set QUIET off\n"
+    )
+
+
+def truncate_result(path: Path, tables: list[str]) -> tuple[str, str, dict[str, Any]]:
+    """(status, message, summary) from the record ``truncate_existing_sql`` had psql write.
+
+    ``tables`` counts the tables truncated, ``skippedMissing``/``skippedTables`` (at most
+    MISSING_LISTED names) the skipped ones. No record (the block did not finish, e.g. past an
+    error with ``--on-error continue``) is a warning: what was truncated is unknown."""
+    try:
+        text = path.read_text().strip() if path.exists() else ""
+        record = json.loads(text) if text else None
+    except (OSError, ValueError):
+        record = None
+    if (
+        not isinstance(record, dict)
+        or not isinstance(record.get("truncated"), int)
+        or isinstance(record["truncated"], bool)
+    ):
+        return "warn", "no truncate result from the server (see the job log)", {}
+    by_quoted = {quote_table(t, "postgresql"): t for t in tables}
+    names = [by_quoted.get(str(q), str(q)) for q in record.get("missing") or []]
+    count = record["truncated"]
+    message = f"truncated {count} table(s)" if count else "nothing to truncate"
+    summary: dict[str, Any] = {"tables": count}
+    if names:
+        more = len(names) - MISSING_LISTED
+        listed = ", ".join(names[:MISSING_LISTED]) + (f" and {more} more" if more > 0 else "")
+        message += f"; skipped {len(names)} table(s) missing on the target: {listed}"
+        summary |= {"skippedMissing": len(names), "skippedTables": names[:MISSING_LISTED]}
+    return "ok", message, summary
 
 
 def sql_literal(value: Any, engine: str) -> str:
@@ -211,8 +269,16 @@ def scope_tables(spec: dict[str, Any]) -> list[str]:
     return tables
 
 
-def build_plan(args: argparse.Namespace, spec: dict[str, Any], engine: str, tmp: Path) -> list[tuple[str, Path]]:
-    """List of (label, sql file) to run, rendering templates and generated SQL into tmp."""
+def build_plan(
+    args: argparse.Namespace,
+    spec: dict[str, Any],
+    engine: str,
+    tmp: Path,
+    scope_result: list[tuple[Path, list[str]]] | None = None,
+) -> list[tuple[str, Path]]:
+    """List of (label, sql file) to run, rendering templates and generated SQL into tmp.
+    A PostgreSQL ``--truncate-scope`` step adds (result file, tables) to ``scope_result``."""
+    scope_result = [] if scope_result is None else scope_result
     scope = {
         "ctx": spec.get("ctx") or {},
         "run": {"runId": spec.get("runId"), "phase": spec.get("phase"), "dryRun": spec.get("dryRun")},
@@ -242,7 +308,11 @@ def build_plan(args: argparse.Namespace, spec: dict[str, Any], engine: str, tmp:
             scope_tables(spec) if args.truncate_scope else [t.strip() for t in args.truncate.split(",") if t.strip()]
         )
         if args.truncate_scope and engine == "postgresql":
-            sql = truncate_existing_sql(tables, args.cascade)
+            result_path = tmp / "truncate-result.json"
+            result_path.unlink(missing_ok=True)
+            sql = truncate_existing_sql(tables, args.cascade, result_path)
+            if sql:
+                scope_result.append((result_path, tables))
         else:
             sql = truncate_sql(tables, engine, args.cascade)
         if sql:
@@ -291,7 +361,8 @@ def main(argv: list[str] | None = None, runner: Any = subprocess.run) -> int:
         spec = load_json("ORCH_JOB_SPEC_FILE")
         tmp = Path(os.environ.get("ORCH_TMP_DIR", "/tmp/orch"))  # noqa: S108
         tmp.mkdir(parents=True, exist_ok=True)
-        plan = build_plan(args, spec, engine, tmp)
+        scope_result: list[tuple[Path, list[str]]] = []
+        plan = build_plan(args, spec, engine, tmp, scope_result)
     except (SqlRunError, expr.ExprError, OSError, ValueError) as err:
         print(f"psql-run: {err}", file=sys.stderr)
         write_result("fail", str(err), {})
@@ -322,7 +393,11 @@ def main(argv: list[str] | None = None, runner: Any = subprocess.run) -> int:
     if proc.returncode != 0:
         write_result("fail", f"{engine} client exit code {proc.returncode}", {"steps": labels})
         return proc.returncode
-    write_result("ok", f"{len(plan)} step(s) executed", {"steps": labels})
+    status, message, summary = "ok", f"{len(plan)} step(s) executed", {"steps": labels}
+    for result_path, tables in scope_result:
+        status, detail, counts = truncate_result(result_path, tables)
+        message, summary = f"{message}; {detail}", {**summary, **counts}
+    write_result(status, message, summary)
     return 0
 
 

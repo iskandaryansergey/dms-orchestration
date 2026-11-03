@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| 0.2.x | yes |
+| 0.3.x | yes |
+| 0.2.x | no: 0.3.0 removes the shared SSM runner risk of 0.2; upgrade |
 | 0.1.x | no: 0.2.0 fixes security findings in it; upgrade |
 
 ## Reporting a vulnerability

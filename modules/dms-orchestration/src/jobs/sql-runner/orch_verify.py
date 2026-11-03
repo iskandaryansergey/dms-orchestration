@@ -91,9 +91,9 @@ def verify_main(argv: list[str] | None = None, runner: Any = subprocess.run, s3:
     bucket, _, prefix = spec["artifactsS3Prefix"].removeprefix("s3://").partition("/")
     key = f"{prefix}target-fingerprint.json"
     if s3 is None:
-        import boto3
+        import orch_aws  # standard library only: the runner AMI has no boto3
 
-        s3 = boto3.client("s3")
+        s3 = orch_aws.client("s3")
     s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(fp, indent=2).encode(), ContentType="application/json")
     uri = f"s3://{bucket}/{key}"
     summary = fingerprint.summary(fp, uri, size)

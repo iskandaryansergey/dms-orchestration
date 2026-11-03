@@ -63,8 +63,8 @@ output "jobset_publisher_policy_json" {
 }
 
 output "ssm_runner_policy_json" {
-  description = "IAM policy for the instance profile role of the SSM runners (ssm.instance_role_arn), besides SSM management: read the runtime zip, assume the project job roles, write command output to the jobs log group. Not attached by the module. null when ssm.enabled is false."
-  value       = local.ssm_enabled ? jsonencode(local.ssm_runner_policy) : null
+  description = "IAM policy per project for the instance profile role of that project's SSM runner (ssm.runners.<project>.instance_role_arn; e.g. the additional_iam_policy_json of that project's dms-sql-bastion), besides SSM management: read the runtime zip, assume that project's job role only, write command output to the jobs log group. Not attached by the module. Present whatever ssm.enabled says (it does not depend on ssm, so a runner module can take it as an input without a dependency cycle); empty when create is false."
+  value       = { for p, pol in local.ssm_runner_policies : p => jsonencode(pol) }
 }
 
 output "ssm_document_content" {
@@ -78,45 +78,52 @@ output "ssm_document_name" {
 }
 
 locals {
-  # KMS key policy contract v2 (one item per need): principals by kind; roles are symbolic
-  # and resolved by the key module (deployer = the identity that applies this module,
-  # module = the module's roles, listed in arns). The v1 statements are built from it.
+  # KMS key policy contract v2, the shape the shared kms module compiles (its variable
+  # consumers): one item per need, key = the CMK the item applies to, principals by kind,
+  # conditions = [{test, variable, values}]. The only symbolic role is the built-in deployer
+  # (the identity that applies this module); every other principal is an explicit ARN.
+  kms_source_account = [{ test = "StringEquals", variable = "aws:SourceAccount", values = [local.account_id] }]
   kms_requirements = !(local.create && local.use_cmk) ? [] : [
     {
+      key        = var.kms_key_arn
       sid        = "StepFunctionsAndLogs"
       principals = { services = ["states.amazonaws.com", "logs.${local.region}.amazonaws.com", "delivery.logs.amazonaws.com"], arns = [], roles = [] }
       actions    = ["kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"]
-      conditions = { StringEquals = { "aws:SourceAccount" = local.account_id } }
+      conditions = local.kms_source_account
       purpose    = "Step Functions state and execution data, CloudWatch Logs groups and vended log delivery"
     },
     {
+      key        = var.kms_key_arn
       sid        = "EventsToEncryptedQueueAndScheduler"
       principals = { services = ["events.amazonaws.com", "scheduler.amazonaws.com", "sns.amazonaws.com", "cloudwatch.amazonaws.com"], arns = [], roles = [] }
       actions    = ["kms:Decrypt", "kms:GenerateDataKey*"]
-      conditions = { StringEquals = { "aws:SourceAccount" = local.account_id } }
+      conditions = local.kms_source_account
       purpose    = "EventBridge dead letters to the encrypted queue, the watchdog schedule, CloudWatch alarms to the encrypted topic"
     },
     {
+      key = var.kms_key_arn
       sid = "ModuleRoles"
       principals = {
         services = []
         arns     = concat([aws_iam_role.migrate[0].arn, aws_iam_role.post[0].arn, aws_iam_role.job_runner[0].arn, aws_iam_role.lambda_core[0].arn, aws_iam_role.lambda_waiter[0].arn, aws_iam_role.lambda_jobs[0].arn, aws_iam_role.scheduler[0].arn], aws_iam_role.ecs_execution[*].arn, aws_iam_role.ecs_task[*].arn, values(local.job_role_arns))
-        roles    = ["module"]
+        roles    = []
       }
       actions    = ["kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"]
-      conditions = {}
+      conditions = []
       purpose    = "The module's roles and the project job roles read and write encrypted state, artifacts, dumps and messages"
     },
     {
+      key        = var.kms_key_arn
       sid        = "Deployer"
       principals = { services = [], arns = [], roles = ["deployer"] }
       actions    = ["kms:DescribeKey", "kms:CreateGrant", "kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*"]
-      conditions = { StringEquals = { "kms:CallerAccount" = local.account_id } }
+      conditions = [{ test = "StringEquals", variable = "kms:CallerAccount", values = [local.account_id] }]
       purpose    = "Terraform creates the encrypted resources (DynamoDB, Lambda environment, Step Functions, SQS, SNS, log groups, the SSM runtime zip)"
     },
   ]
 
-  # v1: key policy statements with concrete principals only (no symbolic-only items).
+  # v1: key policy statements with concrete principals only (the deployer item is left out).
+  # Condition is one block per test, as the kms module compiles it.
   kms_statements_v1 = [
     for i in local.kms_requirements : merge(
       {
@@ -127,18 +134,20 @@ locals {
         )
         Action = i.actions
       },
-      length(i.conditions) > 0 ? { Condition = i.conditions } : {},
+      length(i.conditions) > 0 ? {
+        Condition = { for t in distinct([for c in i.conditions : c.test]) : t => { for c in i.conditions : c.variable => c.values if c.test == t } }
+      } : {},
     ) if length(i.principals.services) + length(i.principals.arns) > 0
   ]
 }
 
 output "kms_key_policy_requirements" {
-  description = "KMS key policy contract v2 (JSON list) when kms_key_arn is set: one item per need with sid, principals {services, arns, roles}, actions, conditions and purpose; roles are symbolic (deployer, module). The module does not manage the key policy."
-  value       = jsonencode(local.kms_requirements)
+  description = "KMS key policy contract v2 as a list (pass it whole to the kms module: consumers = { dms = module.<name>.kms_key_policy_requirements }); [] without kms_key_arn. One item per need: key (the CMK ARN), sid, principals {services, arns, roles}, actions, conditions [{test, variable, values}] and purpose. The only role is deployer (the identity that applies this module); the module's roles are listed in arns. The module does not manage the key policy."
+  value       = local.kms_requirements
 }
 
 output "kms_key_policy_statements" {
-  description = "The same requirements as key policy statements (v1: Sid, Principal, Action, Condition) with concrete principals only; the deployer item of the v2 contract is left out."
+  description = "The same requirements as key policy statements (v1 JSON: Sid, Principal, Action, Condition) with concrete principals only; the deployer item of the v2 contract is left out."
   value       = jsonencode(local.kms_statements_v1)
 }
 

@@ -100,9 +100,10 @@ variable "projects" {
         ssl_mode             = optional(string, "verify-full")
         data_api_cluster_arn = optional(string, "")
         cluster_arn          = optional(string, "") # dump.method = snapshot; default data_api_cluster_arn
-        # auth = "iam": Fargate jobs log in as iam_user with an IAM token (psql only, TLS); the
-        # policy with rds-db:connect (upstream aurora module, iam_database_auth.users[u].policy_arn)
-        # is attached to the project's job role. DMS and the Data API keep using secrets.
+        # auth = "iam": jobs on every runtime (Lambda SQL, SSM, Fargate) log in as iam_user with an
+        # IAM token (PostgreSQL, TLS only); the policy with rds-db:connect (upstream aurora module,
+        # iam_database_auth.users[u].policy_arn) is attached to the project's job role. DMS and the
+        # Data API keep using secrets.
         auth           = optional(string, "secret")
         iam_user       = optional(string, "")
         iam_policy_arn = optional(string, "")
@@ -413,43 +414,95 @@ variable "fargate" {
 variable "ssm" {
   description = <<-EOT
     SSM Run Command runtime (runtime ssm) for long jobs: pg-dump, orch.py restore, long DDL, bash
-    or pwsh scripts. Runner instances come from the team AMI (psql, pg_dump, pg_restore, bash,
-    python3 with boto3; pwsh optional) and are managed by SSM. Select them with instance_ids or
-    target_tags (one of the two). instance_role_arn is the role of their instance profile: every
-    project job role trusts it (output ssm_runner_policy_json lists what it needs).
-    document_name_override names an existing document (content in output ssm_document_content)
-    instead of the module's <name>-<environment>-orch-job. runner_user runs the job, never root.
-    When enabled, pg-dump dumps and orch.py restore run on SSM by default.
+    or pwsh scripts. Runner instances come from the team AMI (SSM agent, psql, pg_dump,
+    pg_restore, bash, python3 with the standard library only: no boto3, no AWS CLI; pwsh
+    optional). runners has one runner per project, never shared (e.g. one dms-sql-bastion per
+    project): every project needs one when enabled, and no two projects share an instance role
+    or an instance. Select a runner's instances with instance_ids or target_tags (one of the
+    two); instance_role_arn is the role of its instance profile: only that project's job role
+    trusts it (output ssm_runner_policy_json, key <project>, lists what it needs). The 0.2 single
+    runner (instance_ids, target_tags, instance_role_arn at the top level) is refused: move it
+    under runners. document_name_override names an existing document (content in output
+    ssm_document_content) instead of the module's <name>-<environment>-orch-job. runner_user
+    runs the job, never root. When enabled, pg-dump dumps and orch.py restore run on SSM by
+    default.
   EOT
   type = object({
-    enabled                = optional(bool, false)
-    instance_ids           = optional(list(string), [])
-    target_tags            = optional(map(string), {})
-    instance_role_arn      = optional(string, "")
+    enabled = optional(bool, false)
+    runners = optional(map(object({
+      instance_role_arn = string
+      instance_ids      = optional(list(string), [])
+      target_tags       = optional(map(string), {})
+    })), {})
     document_name_override = optional(string, "")
     runner_user            = optional(string, "orch")
+    # removed (one runner per project): only to refuse them with a clear error
+    instance_ids      = optional(list(string), [])
+    target_tags       = optional(map(string), {})
+    instance_role_arn = optional(string, "")
   })
   default  = {}
   nullable = false
 
   validation {
-    condition     = !var.ssm.enabled || ((length(var.ssm.instance_ids) > 0) != (length(var.ssm.target_tags) > 0))
-    error_message = "ssm.enabled needs exactly one of ssm.instance_ids or ssm.target_tags."
+    condition     = length(var.ssm.instance_ids) == 0 && length(var.ssm.target_tags) == 0 && var.ssm.instance_role_arn == ""
+    error_message = "ssm.instance_ids, ssm.target_tags and ssm.instance_role_arn were replaced by ssm.runners: one runner per project, never shared (ssm.runners = { <project> = { instance_role_arn, instance_ids | target_tags } }; CHANGELOG, upgrade to 0.3.0)."
   }
 
   validation {
-    condition     = alltrue([for id in var.ssm.instance_ids : can(regex("^i-[0-9a-f]{8,17}$", id))])
-    error_message = "ssm.instance_ids must be EC2 instance ids (i-...)."
+    condition     = !var.ssm.enabled || alltrue([for p in keys(var.projects) : contains(keys(var.ssm.runners), p)])
+    error_message = "ssm.enabled needs a runner for every project in ssm.runners (one per project, never shared)."
   }
 
   validation {
-    condition     = alltrue([for k, v in var.ssm.target_tags : can(regex("^[A-Za-z0-9 _.:/=+@-]{1,128}$", k)) && can(regex("^[A-Za-z0-9 _.:/=+@-]{1,256}$", v))])
-    error_message = "ssm.target_tags keys and values must be plain EC2 tag keys and values."
+    condition     = alltrue([for p in keys(var.ssm.runners) : contains(keys(var.projects), p)])
+    error_message = "ssm.runners keys must be projects of var.projects."
   }
 
   validation {
-    condition     = !var.ssm.enabled || can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$", coalesce(var.ssm.instance_role_arn, "-")))
-    error_message = "ssm.enabled needs ssm.instance_role_arn, the IAM role ARN of the runner instance profile."
+    condition     = alltrue([for r in values(var.ssm.runners) : (length(r.instance_ids) > 0) != (length(r.target_tags) > 0)])
+    error_message = "every ssm.runners entry needs exactly one of instance_ids or target_tags."
+  }
+
+  validation {
+    condition     = alltrue(flatten([for r in values(var.ssm.runners) : [for id in r.instance_ids : can(regex("^i-[0-9a-f]{8,17}$", id))]]))
+    error_message = "ssm.runners[*].instance_ids must be EC2 instance ids (i-...)."
+  }
+
+  validation {
+    condition     = alltrue(flatten([for r in values(var.ssm.runners) : [for k, v in r.target_tags : can(regex("^[A-Za-z0-9 _.:/=+@-]{1,128}$", k)) && can(regex("^[A-Za-z0-9 _.:/=+@-]{1,256}$", v))]]))
+    error_message = "ssm.runners[*].target_tags keys and values must be plain EC2 tag keys and values."
+  }
+
+  validation {
+    condition     = alltrue([for r in values(var.ssm.runners) : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$", r.instance_role_arn))])
+    error_message = "ssm.runners[*].instance_role_arn must be the IAM role ARN of the runner's instance profile."
+  }
+
+  validation {
+    condition     = length(distinct([for r in values(var.ssm.runners) : r.instance_role_arn])) == length(var.ssm.runners)
+    error_message = "ssm.runners: no two projects may share an instance role (a shared runner could assume every project's job role)."
+  }
+
+  validation {
+    condition = (
+      length(distinct(flatten([for r in values(var.ssm.runners) : r.instance_ids]))) == length(flatten([for r in values(var.ssm.runners) : r.instance_ids]))
+      && length(distinct([for r in values(var.ssm.runners) : jsonencode(r.target_tags) if length(r.target_tags) > 0])) == length([for r in values(var.ssm.runners) : 1 if length(r.target_tags) > 0])
+    )
+    error_message = "ssm.runners: no two projects may select the same instance (instance_ids) or the same target_tags."
+  }
+
+  # Tag filters are ANDed: a project whose target_tags are a subset of another's would also
+  # select that project's instances. instance_ids against another project's tags cannot be
+  # checked here (docs/security.md).
+  validation {
+    condition = alltrue(flatten([
+      for a, ra in var.ssm.runners : [
+        for b, rb in var.ssm.runners : a == b || length(ra.target_tags) == 0 || length(rb.target_tags) == 0
+        || !alltrue([for k, v in ra.target_tags : try(rb.target_tags[k], null) == v])
+      ]
+    ]))
+    error_message = "ssm.runners: one project's target_tags must not be a subset of another project's (its tag filters would also match that project's runners)."
   }
 
   validation {

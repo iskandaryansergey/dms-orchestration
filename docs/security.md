@@ -33,9 +33,9 @@ The architecture stays on one page ([`architecture.md`](architecture.md)); the s
 * Optional customer managed KMS key for DynamoDB, S3, SNS, SQS, logs, Lambda environment,
   Step Functions and the scheduler. The module does not manage the key policy; it publishes what
   the policy must allow in two shapes built from one list: `kms_key_policy_requirements` (KMS key
-  policy contract v2: per item the service principals, the module and job role ARNs, the
-  symbolic roles `deployer` and `module`, actions, conditions such as `aws:SourceAccount`, and
-  the purpose) and `kms_key_policy_statements` (the same as v1 key policy statements, concrete
+  policy contract v2, a list the shared `kms` module compiles as is: per item the key ARN, the
+  service principals, the module and job role ARNs listed explicitly, the one symbolic role
+  `deployer`, actions, conditions such as `aws:SourceAccount`, and the purpose) and `kms_key_policy_statements` (the same as v1 key policy statements, concrete
   principals only). The service items are limited to this account by `aws:SourceAccount`; the
   deployer item by `kms:CallerAccount`.
   Without a CMK the SNS topic is unencrypted on purpose: the AWS managed key `alias/aws/sns`
@@ -86,8 +86,8 @@ runs the `.tftest.hcl` files with a mock provider; the Python tests run with mot
 | a job runs and is recorded with the run's own `dryRun` (`RUN#`): an input with another flag is refused before anything is written, and the job-runner never takes the flag from its input; migrate and post pass the run's flag to every job | `test_job_trust.py::test_a_job_is_not_rerun_with_another_dry_run_flag_than_its_run`, `test_job_trust.py::test_the_dry_run_flag_is_the_one_recorded_on_the_run`, `test_asl.py::test_the_job_runs_and_is_recorded_with_the_dry_run_flag_prepare_job_decided`, `test_asl.py::test_a_refused_job_records_nothing`, `test_asl.py::test_migrate_and_post_pass_the_dry_run_flag_of_the_run_to_every_job` |
 | Restore baseline: written only in the `restore` phase, through `dynamodb:LeadingKeys` on `TARGET#` | `iam.tftest.hcl::least_privilege`, `test_jobs_lambdas.py::test_only_the_restore_phase_may_record_a_baseline` |
 | Job container: uid 10001, read-only root, the init container gets no input or secrets | `defaults.tftest.hcl::lambda_and_events` |
-| SSM runtime: `SendCommand` only of the module document to the configured runners; the runner role trusted by the job roles, never passed; instance profile reads `runtime/*` only; document parameters pattern-checked; runtime zip checked by SHA-256; jobs as `runner_user`, never root; off by default | `iam.tftest.hcl::ssm_runtime_least_privilege`, `iam.tftest.hcl::ssm_runtime_with_target_tags`, `options.tftest.hcl::ssm_runtime_with_a_platform_document`, `options.tftest.hcl::ssm_runtime_never_runs_jobs_as_root`, `defaults.tftest.hcl::no_ssm_runtime_by_default` |
-| orch-job on SSM: the job role session is checked, no static keys reach the command, the connections and profile files are removed on every exit | `test_sql_runner.py::test_assume_role_session_refuses_another_identity`, `test_sql_runner.py::test_orch_job_on_ssm_runs_the_spec_command_with_the_job_role`, `test_sql_runner.py::test_connections_file_is_removed_when_the_job_wrapper_fails` |
+| SSM runtime: one runner per project (`ssm.runners`), never shared: every project needs one, no two share an instance role or an instance, and no project's `target_tags` are a subset of another's; `SendCommand` only of the module document, one statement per project to that project's runners; FindSsmRunner looks only for the job's project's runner; each job role trusts only its own project's runner role, which may assume only that job role and is never passed; instance profile reads `runtime/*` only; document parameters pattern-checked; runtime zip checked by SHA-256; jobs as `runner_user`, never root; off by default | `iam.tftest.hcl::ssm_runtime_least_privilege`, `iam.tftest.hcl::ssm_runners_cover_every_project`, `iam.tftest.hcl::ssm_runner_role_is_never_shared`, `iam.tftest.hcl::ssm_runner_instance_is_never_shared`, `iam.tftest.hcl::ssm_runner_tags_that_are_a_subset_of_another_projects_are_refused`, `iam.tftest.hcl::ssm_single_runner_form_is_refused`, `test_asl.py::test_ssm_job_looks_only_for_its_own_projects_runner`, `test_asl.py::test_ssm_job_of_a_project_without_a_runner_fails_without_sending`, `options.tftest.hcl::ssm_runtime_with_a_platform_document`, `options.tftest.hcl::ssm_runtime_never_runs_jobs_as_root`, `defaults.tftest.hcl::no_ssm_runtime_by_default` |
+| orch-job on SSM: the job role session is checked, no static keys reach the command, the connections and profile files are removed on every exit; the runner needs python3 with the standard library only (no boto3): requests are signed by `orch_aws.py` (SigV4, checked against botocore), over verified TLS, without redirects; the instance profile credentials come over IMDSv2 only | `test_orch_aws.py::test_sigv4_matches_botocore`, `test_orch_aws.py::test_the_job_profile_assumes_the_job_role_with_the_instance_profile`, `test_orch_aws.py::test_instance_profile_credentials_come_over_imdsv2`, `test_orch_aws.py::test_redirects_are_not_followed`, `test_orch_aws.py::test_the_runtime_imports_without_boto3`, `test_sql_runner.py::test_assume_role_session_refuses_another_identity`, `test_sql_runner.py::test_orch_job_on_ssm_runs_the_spec_command_with_the_job_role`, `test_sql_runner.py::test_connections_file_is_removed_when_the_job_wrapper_fails` |
 
 ## Trust model: who can read what
 
@@ -101,8 +101,8 @@ Projects trust the orchestrator, not each other.
 | Orchestration roles (migrate, post, job-runner, core and handoff Lambdas) | DMS describe; DMS start only for migrate on registered tasks; DynamoDB, run artifacts (`runs/`); StartExecution of post (handoff) or migrate (auto-resume) | read any database secret |
 | Job role `<name>-<env>-job-<project>` (one per project, `job_roles.tf`) | that project's secrets (`connections[*].secret_arn`), its Data API clusters, its job sets (`jobs/<project>/`), its runs' job specs, results and artifacts (`runs/<project>/*/jobs/*`) | read another project's secrets, job sets or run artifacts; write `context.json` or reports |
 | Shared `ecs-job` and `lambda-jobs` roles | DMS describe; `ecs-job` (default task role, always overridden by the job role) reads job sets; `lambda-jobs` may assume project job roles and write `TARGET#` items (`dynamodb:LeadingKeys`, the restore baseline) | read secrets or run artifacts themselves; write any other DynamoDB item |
-| SSM runner instance profile (`ssm.instance_role_arn`, caller-owned; `ssm_runner_policy_json`) | read the runtime zip (`runtime/*`); assume **every** project's job role (each job role trusts it); write command output to the jobs log group | read secrets, job sets or run artifacts itself; be passed to ECS or anything else (no `iam:PassRole` names it) |
-| job-runner, SSM runtime | describe SSM instances; `ssm:SendCommand` only of the module's document (or `ssm.document_name_override`) and only to `ssm.instance_ids` or instances with every `ssm.target_tags` tag; read invocations | cancel commands, open sessions, change documents; send the command text (orch-job reads it from `spec.json`) |
+| SSM runner instance profile of one project (`ssm.runners.<project>.instance_role_arn`, caller-owned, e.g. that project's dms-sql-bastion; `ssm_runner_policy_json`, key `<project>`) | read the runtime zip (`runtime/*`); assume **its own project's** job role only (only that job role trusts it); write command output to the jobs log group | assume another project's job role; read secrets, job sets or run artifacts itself; be passed to ECS or anything else (no `iam:PassRole` names it) |
+| job-runner, SSM runtime | describe SSM instances; `ssm:SendCommand` only of the module's document (or `ssm.document_name_override`) and only to the runners in `ssm.runners` (their `instance_ids`, or instances with every one of their `target_tags`), a job only to its own project's runner; read invocations | cancel commands, open sessions, change documents; send the command text (orch-job reads it from `spec.json`) |
 
 How a job gets its project role:
 
@@ -148,8 +148,11 @@ rendered or written, `prepare_job` (`shared/job_trust.py`):
 * `dryRun` is the one recorded on `RUN#`: an input that says otherwise is refused, and the
   job-runner executes and records (`JOB#…`) with the flag `PrepareJob` returned, never the
   input's. A dry re-run of a job of a real run therefore cannot overwrite the run's `JOB#` record
-  with `ok` (a post retry with `--from-job` skips the post jobs before it that are `ok`, so it
-  could close a failed post check — run 11, finding 2), and a real re-run of a dry run's job cannot write.
+  with `ok`, and a real re-run of a dry run's job cannot write. Before 0.2.0 it could: a post
+  retry with `--from-job` skipped the post jobs before it whose record was `ok`, so a dry `ok`
+  could close a failed post check (run 11, finding 2). Now a post retry skips a post job only if
+  it comes before `--from-job` and its `JOB#` is `ok` with the run's own `dryRun`; without
+  `--from-job` every post job runs again (`resolve_context`, `post` phase).
 
 Anything else fails the job-runner with `JobNotInJobSet` (the execution's `JobFailed` cause).
 
@@ -195,15 +198,22 @@ Residual risk, stated plainly:
   output is not in results or execution causes (a failed job names its exit code and log stream
   only), but a job set that puts a secret into its `summary` hands it to the operator; it should
   not.
-* SSM runtime: the runner instance profile may assume every project's job role, and jobs run
-  under one local user (`ssm.runner_user`) that can reach the instance metadata service. A job of
-  one project running on a runner can therefore act as another project's job role; anyone with
-  an SSM session or `SendCommand` on a runner can do the same and, while a job runs, read its
-  files and its connections file (0600, removed at the end). Projects sharing runners share
-  this trust boundary. One module instance has one runner selection and one instance role, so
-  this is not configurable per project today: a project that needs its own boundary needs its
-  own module instance (and runners), and session access to the runners should be as narrow as
-  access to the job roles.
+* SSM runtime: each project has its own runner (`ssm.runners`): its instance profile may assume
+  only that project's job role, and only that job role trusts it, so a job on one project's
+  runner cannot act as another project's job role (the shared-runner risk of 0.2 is gone). On
+  its own runner, jobs run under one local user (`ssm.runner_user`) that can reach the instance
+  metadata service: anyone with an SSM session or `SendCommand` on a project's runner can use its
+  instance profile and that project's job role and, while a job runs, read its files and its
+  connections file (0600, removed at the end). Keep session access to each runner as narrow as
+  access to its project's job role. The jobs log group is shared: a runner can write log streams
+  of another project's commands (integrity of command output, not access to its data). Runner
+  selection by `target_tags` relies on the tags: whoever can tag an instance with another
+  project's runner tags can receive that project's commands, but not use its job role (the
+  trust names the runner role). Plan-time validation refuses equal `target_tags` and one
+  project's `target_tags` that are a subset of another's (its filters would match the other's
+  runners too); it cannot check one project's `instance_ids` against another project's
+  `target_tags` (the instances' tags are not known at plan time): keep a project's listed
+  instances free of other projects' runner tags.
 * A project's job can overwrite its own run's job results and artifacts (`runs/<project>/*/jobs/*`),
   so results of one project's jobs are only as trustworthy as that project's job sets. It cannot
   reach `context.json` or reports, and post reads `context.json` by its pinned version.

@@ -481,8 +481,8 @@ run "no_ssm_runtime_by_default" {
   }
 
   assert {
-    condition     = output.ssm_runner_policy_json == null && output.ssm_document_content == null && !contains(output.network_contract.required_vpc_endpoints, "ec2messages")
-    error_message = "no SSM outputs and no SSM agent endpoints by default"
+    condition     = output.ssm_document_content == null && !contains(output.network_contract.required_vpc_endpoints, "ec2messages")
+    error_message = "no SSM document and no SSM agent endpoints by default"
   }
 
   assert {

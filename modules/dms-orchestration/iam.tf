@@ -282,19 +282,24 @@ locals {
           Action   = ["ssm:GetCommandInvocation"]
           Resource = "*"
         },
-        ] : st if local.ssm_enabled], local.ssm_enabled && length(var.ssm.instance_ids) > 0 ? [{
-        Sid      = "SendToRunnerInstances"
-        Effect   = "Allow"
-        Action   = ["ssm:SendCommand"]
-        Resource = [for id in var.ssm.instance_ids : "arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/${id}"]
-        }] : [], local.ssm_enabled && length(var.ssm.target_tags) > 0 ? [{
-        # Only instances that carry every configured tag (the same tags FindSsmRunner filters on).
-        Sid       = "SendToTaggedRunners"
-        Effect    = "Allow"
-        Action    = ["ssm:SendCommand"]
-        Resource  = ["arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*"]
-        Condition = { StringEquals = { for k, v in var.ssm.target_tags : "ssm:resourceTag/${k}" => v } }
-        }] : [], [{
+      ] : st if local.ssm_enabled], [
+      # One statement per project: only that project's runner instances (its instance_ids, or
+      # instances carrying every one of its target_tags, the tags FindSsmRunner filters on).
+      # The document is allowed apart (SendJobDocument): a tag condition would not match it.
+      for i, p in sort(keys(local.ssm_instance_filters)) : merge(
+        {
+          Sid    = "SendToRunnersOfProject${i}"
+          Effect = "Allow"
+          Action = ["ssm:SendCommand"]
+          Resource = length(var.ssm.runners[p].instance_ids) > 0 ? [
+            for id in var.ssm.runners[p].instance_ids : "arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/${id}"
+          ] : ["arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*"]
+        },
+        length(var.ssm.runners[p].target_tags) > 0 ? {
+          Condition = { StringEquals = { for k, v in var.ssm.runners[p].target_tags : "ssm:resourceTag/${k}" => v } }
+        } : {},
+      )
+      ], [{
         # Always: CreateStateMachine checks the managed rule of the ecs:runTask.sync
         # state, which is in the definition whether or not images are configured.
         Sid      = "SyncIntegrationRule"

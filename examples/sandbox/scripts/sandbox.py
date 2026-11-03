@@ -179,11 +179,11 @@ def cmd_counts(out: dict[str, Any]) -> dict[str, Any]:
 
 
 def cmd_sync_jobs(out: dict[str, Any], template: str = "jobset.yaml.tmpl", version: str = "e2e") -> None:
-    text = (HERE / "jobs" / template).read_text().replace("__SQL_LAMBDA_ARN__", out["sql_lambda_arn"])
+    text = (HERE / "jobs" / template).read_text(encoding="utf-8").replace("__SQL_LAMBDA_ARN__", out["sql_lambda_arn"])
     with tempfile.TemporaryDirectory() as tmp:
         bundle, built = Path(tmp) / "bundle", Path(tmp) / "built"
         bundle.mkdir()
-        (bundle / "jobset.yaml").write_text(text)
+        (bundle / "jobset.yaml").write_bytes(text.encode())  # same bytes on every host: the bundle total
         subprocess.run(
             [sys.executable, str(REPO / "scripts" / "jobset_tool.py"), "build", str(bundle), str(built)], check=True
         )

@@ -119,7 +119,7 @@ run "customer_managed_key" {
   }
 
   assert {
-    condition     = length(jsondecode(output.kms_key_policy_statements)) == 3 && length(jsondecode(output.kms_key_policy_requirements)) == 4
+    condition     = length(jsondecode(output.kms_key_policy_statements)) == 3 && length(output.kms_key_policy_requirements) == 4
     error_message = "key policy requirements are published"
   }
 
@@ -234,8 +234,7 @@ run "ssm_runtime_with_a_platform_document" {
     kms_key_arn = "arn:aws:kms:eu-west-2:111122223333:key/11111111-2222-3333-4444-555555555555"
     ssm = {
       enabled                = true
-      target_tags            = { Role = "dms-runner" }
-      instance_role_arn      = "arn:aws:iam::111122223333:role/team-dms-runner"
+      runners                = { ledger = { target_tags = { Role = "dms-runner" }, instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner" } }
       document_name_override = "platform-dms-orch-job"
       runner_user            = "dmsjob"
     }
@@ -256,13 +255,20 @@ run "ssm_runtime_with_a_platform_document" {
     error_message = "the content to register names the uploaded runtime zip and the runner user"
   }
 
+  # An SSM Command document holds at most 64 KB; the content embeds orch_aws.py, so keep a margin
+  # (bytes of the UTF-8 content: base64 length * 3 / 4).
+  assert {
+    condition     = length(base64encode(output.ssm_document_content)) * 3 / 4 <= 56 * 1024
+    error_message = "the SSM document content must stay under 56 KiB (limit 64 KB): trim orch_aws.py or the script"
+  }
+
   assert {
     condition     = aws_s3_object.ssm_runtime[0].server_side_encryption == "aws:kms" && aws_s3_object.ssm_runtime[0].kms_key_id == var.kms_key_arn
     error_message = "the runtime zip is encrypted with the CMK"
   }
 
   assert {
-    condition     = length([for st in jsondecode(output.ssm_runner_policy_json).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
+    condition     = length([for st in jsondecode(output.ssm_runner_policy_json["ledger"]).Statement : st if st.Sid == "UseOrchestratorKey"]) == 1
     error_message = "the runner instance profile can decrypt the runtime zip and the job objects"
   }
 }
@@ -282,10 +288,9 @@ run "ssm_runtime_never_runs_jobs_as_root" {
 
   variables {
     ssm = {
-      enabled           = true
-      instance_ids      = ["i-0123456789abcdef0"]
-      instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner"
-      runner_user       = "root"
+      enabled     = true
+      runners     = { ledger = { instance_ids = ["i-0123456789abcdef0"], instance_role_arn = "arn:aws:iam::111122223333:role/team-dms-runner" } }
+      runner_user = "root"
     }
   }
 

@@ -67,9 +67,11 @@ phases:
 * **Runtime.** `handler:` and `sql:` jobs run in Lambda (up to 840 s; pg8000 with TLS
   verify-full when the connection has a host, the Data API otherwise). A job with `command:`
   runs in a command runtime: `runtime: ssm` on an SSM runner instance from the team AMI
-  (psql, pg_dump, pg_restore, bash, python3; pwsh optional; module input `ssm`, RUNBOOK
-  section 16), or Fargate in the image named by `image` (psql, mysql, python, bash, pwsh),
-  optional ([ADR 0011](adr/0011-job-runtimes.md)). Both run the same wrapper (orch-job) with
+  (psql, pg_dump, pg_restore, bash, python3; mysql and pwsh only if the AMI ships them;
+  module input `ssm`, off by default, RUNBOOK section 16), or Fargate in the image named by
+  `image` (psql, mysql, python, bash; pwsh only when the image is built with
+  `INSTALL_POWERSHELL=true`, off by default), optional and off by default
+  ([ADR 0011](adr/0011-job-runtimes.md)). Both run the same wrapper (orch-job) with
   the project's job role, the same environment and the same result contract.
 * **Conditions.** Add `when: "<expression>"` to run a job only sometimes, for example
   `when: "ctx.startType == 'reload-target'"` ([Conditions and templates](#conditions-and-templates)).
@@ -223,7 +225,7 @@ token for `auth = iam`) and needs a connection with `host`; PostgreSQL only.
 | `connection` | registered connection (default `target`) |
 | `file` | one bundle file or a list (up to 20), checked against `bundle.sha256` |
 | `inline` | SQL in the job set itself (up to 16 KB) |
-| `truncateScope: true` | `TRUNCATE` of `ctx.resetTables` in one statement, the full list also above the payload cap; `cascade: true` adds `CASCADE`. Tables missing on the target (dropped since the run the DMS statistics come from) are skipped and named in the message (`summary.skippedMissing`) |
+| `truncateScope: true` | `TRUNCATE` of `ctx.resetTables` in one statement, the full list also above the payload cap; `cascade: true` adds `CASCADE`. Tables missing on the target (dropped since the run the DMS statistics come from) are skipped and named in the message and the summary (`summary.skippedMissing`: the count, `summary.skippedTables`: up to 10 names); `summary.tables` counts only the tables truncated |
 | `vars` | values for `{{ var.<name> }}`; they may use `{{ }}` templates themselves |
 | `singleTransaction` | all files in one transaction (`BEGIN` … `COMMIT`, `ROLLBACK` on the first error) |
 
@@ -298,8 +300,11 @@ Entry point `orch_job.py` runs your `command` in the bundle directory.
 | `ORCH_DRY_RUN` | `1` in dry runs: **change nothing**, print what you would do |
 | `ORCH_RUN_ID`, `ORCH_PHASE`, `ORCH_JOB_NAME`, `ORCH_ATTEMPT` | run info |
 
-Tools: `psql` 17, `mysql`, `python3` (+ boto3), `bash`, `pwsh`, and
-`psql-run` / `mysql-run`:
+Tools: `psql` 17, `python3` (+ boto3 in the Fargate image only; on an SSM runner the standard
+library), `bash`, and `psql-run` on both command runtimes. Not there by default: `mysql-run`
+needs a `mysql` client, which only the Fargate image installs (that runtime is optional and off
+by default; on an SSM runner only if the AMI ships one), and `pwsh` exists only in an image
+built with `INSTALL_POWERSHELL=true` or on an AMI that ships it. The wrappers:
 
 ```
 psql-run --connection target --file ddl/020_indexes.sql [--file ...] [--single-transaction]
@@ -311,8 +316,13 @@ psql-run --connection target --sql "ANALYZE app.accounts"
 
 On PostgreSQL `--truncate-scope` truncates, in one statement, only the listed tables that exist
 on the target: tables dropped since the run the DMS statistics come from are skipped and named
-in a `NOTICE` in the job output (`psql-run: skipped N table(s) missing on the target: …`); none
-present is no error. `--truncate` keeps its list as given (a missing table fails the job).
+in a `NOTICE` in the job output (`psql-run: skipped N table(s) missing on the target: …`) and,
+as with the Lambda runtime, in the job result: the message and `summary.skippedMissing` /
+`summary.skippedTables` (up to 10 names), with `summary.tables` counting only the tables the server
+truncated (the step label still gives the size of the reset list). The server records this after
+the `TRUNCATE`; when it has no record (the block did not finish, possible only with
+`--on-error continue`) the job ends `warn`. None present is no error. `--truncate` keeps its list
+as given (a missing table fails the job).
 
 ### SQL templates (`--template`)
 

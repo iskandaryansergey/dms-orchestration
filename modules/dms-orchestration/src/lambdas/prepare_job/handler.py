@@ -121,6 +121,8 @@ def prepare(event: dict[str, Any], store: Store) -> dict[str, Any]:
         "index": index,
         "runtime": job["runtime"],
         "runId": run_id,
+        # SSM runtime: the job-runner sends the job only to this project's runner (ssm.runners).
+        "project": ctx.get("project"),
         "dryRun": dry_run,
         "timeoutSeconds": int(job.get("timeoutSeconds", 3600)),
         "maxAttempts": int(retry.get("maxAttempts", 1)),

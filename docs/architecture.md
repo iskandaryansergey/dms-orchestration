@@ -85,7 +85,7 @@ What happens when a run, an execution or an event fails, and what the operator d
 * [ADR 0006](adr/0006-preflight-verdicts.md) — pre-flight verdicts and the target baseline.
 * [ADR 0007](adr/0007-dump-by-cluster-snapshot.md) — dump by `pg_dump` to S3 or by cluster snapshot.
 * [ADR 0008](adr/0008-target-check-runtime.md) — the target check in a Lambda or in psql on Fargate, one fingerprint.
-* [ADR 0009](adr/0009-iam-database-auth-for-fargate-jobs.md) — IAM token login for Fargate jobs; DMS and the Data API keep secrets.
+* [ADR 0009](adr/0009-iam-database-auth-for-fargate-jobs.md) — IAM token login for jobs (Lambda SQL, SSM, Fargate); DMS and the Data API keep secrets.
 * [ADR 0010](adr/0010-upstream-modules-dependency.md) — the upstream modules as a configurable dependency of the sandbox.
 * [ADR 0011](adr/0011-job-runtimes.md) — job runtimes: SQL in Lambda by default, long jobs on SSM, Fargate optional; the module never builds an image.
 

@@ -383,6 +383,25 @@ def _selection_rules(table_mappings: str | None) -> list[dict[str, str]]:
     return rules
 
 
+DUMP_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]*")
+
+
+def check_dump(dump: str, project: str, task: str) -> None:
+    """A usage error before any AWS call: ``--dump`` names a dump of this task (as pg-restore-s3
+    checks it on the runner), never an empty or foreign location."""
+    usage = f"--dump must be s3://<bucket>/dumps/{project}/{task}/<ts>-<runId>/ (see orch.py dumps)"
+    bucket, _, prefix = dump.removeprefix("s3://").partition("/")
+    base = f"dumps/{project}/{task}/"
+    if (
+        not dump.startswith("s3://")
+        or not DUMP_BUCKET.fullmatch(bucket)
+        or not prefix.startswith(base)
+        or not prefix.removeprefix(base).strip("/")
+        or ".." in prefix
+    ):
+        raise SystemExit(f"restore: {usage}, got {dump!r}")
+
+
 def _dump_run_id(c: Clients, dump: str) -> str | None:
     """runId of the run that took the dump, from its manifest."""
     bucket, _, prefix = dump.removeprefix("s3://").partition("/")
@@ -456,6 +475,7 @@ def cmd_restore(args: argparse.Namespace, c: Clients, out: Any) -> int:
         raise SystemExit("restore drops and recreates the objects of the dump: add --confirm")
     if not (args.table and args.ssm_prefix and args.state_machine_arn):
         raise SystemExit("restore needs --table, --ssm-prefix and --state-machine-arn (or the ORCH_* variables)")
+    check_dump(args.dump, args.project, args.task)
     name = f"{args.ssm_prefix.rstrip('/')}/{args.project}/{args.task}"
     reg = json.loads(c.get("ssm").get_parameter(Name=name)["Parameter"]["Value"])
     runtime = restore_runtime(args.runtime, reg)

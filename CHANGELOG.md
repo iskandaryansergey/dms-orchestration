@@ -4,6 +4,104 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions: SemV
 first production run). Commit references name the commit that made or fixed the item; the
 observed AWS behaviour behind the fixes is in [docs/dms-observations.md](docs/dms-observations.md).
 
+## [0.3.0] — 2026-11-03
+
+One SSM runner per project and a runner runtime on the Python standard library, the KMS key
+policy requirements in the shape of the shared `kms` module, and fixes found since 0.2.0.
+Upgrading needs care: every breaking change is marked under *Changed*, the steps are under
+*Upgrade from 0.2.0*.
+
+### Security
+- SSM runners are per project, never shared. Each project's job role trusts only its own
+  runner's instance role; `ssm_runner_policy_json` is a map per project whose policy assumes
+  only that project's job role; the job-runner's `ssm:SendCommand` has one statement per
+  project and `FindSsmRunner` looks only for the job's project's runner (`prepare_job` puts
+  `project` into the spec). A job on one project's runner can no longer act as another
+  project's job role (the residual risk of 0.2 in `docs/security.md` and ADR 0011).
+- The module refuses `ssm.enabled` without a runner for every project, a runner of an unknown
+  project, two projects sharing an instance role, an instance or the same `target_tags`, and one
+  project's `target_tags` that are a subset of another's (its filters would also match the other
+  project's runners). One project's `instance_ids` cannot be checked against another project's
+  `target_tags` at plan time; `docs/security.md` states the limit.
+- The runner's AWS client (`orch_aws.py`) checks bucket and region names before they go into an
+  endpoint host, and sends plain http only to the exact instance metadata and loopback
+  hostnames, never with userinfo in the URL; everything else is https with a verified
+  certificate and no redirects.
+
+### Changed
+- **Breaking:** `kms_key_policy_requirements` is a list, not a JSON string, in the shape the
+  shared `kms` module compiles (`consumers = { dms = module.dms_orchestration.kms_key_policy_requirements }`):
+  every item carries `key` (the CMK ARN), `conditions` is a list of `{test, variable, values}`
+  (`[]` when none) instead of a `{test = {variable = value}}` map, and the symbolic role
+  `module` is gone (the module and job role ARNs were already in `arns`; `deployer` is the only
+  role left). Without `kms_key_arn` the output is `[]`, not `"[]"`. Upgrading: drop
+  `jsondecode()` around the output; a tool that read `conditions.StringEquals[...]` reads the
+  list instead. `kms_key_policy_statements` stays a JSON string; its `Condition` values are now
+  lists (`"aws:SourceAccount" = ["<account>"]`), the same policy.
+- **Breaking:** the tag `ManagedBy` is `"Terraform"` (was `"terraform"`), the convention of the
+  shared modules; `Module` and the `dms-orch:*` tags are unchanged. Tag-based policies, cost
+  reports or queries that match the lower-case value need the new one.
+- **Breaking:** `ssm.instance_ids`, `ssm.target_tags` and `ssm.instance_role_arn` are replaced
+  by `ssm.runners = { <project> = { instance_role_arn, instance_ids | target_tags } }`; the old
+  fields fail validation with a pointer to `ssm.runners`.
+- **Breaking:** `ssm_runner_policy_json` is a map `{ <project> = policy JSON }`, like
+  `jobset_publisher_policy_json`; it was one policy (`null` when off). It no longer depends on
+  the `ssm` input (present whenever the module creates resources), so a runner module can take
+  its project's policy as an input while `ssm.runners` takes the runner's instance and role.
+- The SSM runner needs python3 with the standard library only: no boto3, no AWS CLI. The
+  runtime's AWS calls (S3, Secrets Manager, STS, the RDS IAM token) go through `orch_aws.py`,
+  a SigV4 client on the standard library (signatures tested against botocore); the document
+  carries it to fetch the runtime zip. The Fargate image runs the same code (it keeps boto3 for
+  job scripts). New exit code 98: the instance profile cannot read the runtime zip.
+- `orch_aws.py` retries network errors, 5xx and the throttling codes (`SlowDown`, `Throttling`,
+  `ThrottlingException`, `RequestTimeout`, `RequestLimitExceeded`) up to 5 attempts with
+  jittered backoff, as the SDKs' standard mode does; every attempt is signed again. A failed
+  certificate check is not retried.
+- Sandbox: the stand-in runner installs no boto3; it is the runner of its one project
+  (`ssm.runners.ledger`).
+
+### Upgrade from 0.2.0
+- Give every project its own runner (for example one dms-sql-bastion per project, README) and
+  replace the `ssm` input:
+  `ssm = { enabled = true, runners = { <project> = { instance_ids = [...], instance_role_arn = "..." } } }`
+  (or `target_tags` per runner). A 0.2 configuration fails validation until then.
+- Attach `module.<name>.ssm_runner_policy_json["<project>"]` to that project's runner role
+  instead of the one shared policy, then remove the shared runner role from the old runner.
+- Let running SSM jobs finish before the apply: the job roles' trust changes with it.
+- Drop `jsondecode()` around `kms_key_policy_requirements` and pass the list to the shared `kms`
+  module; a tool that read `conditions.StringEquals[...]` reads the list of conditions instead.
+- Update tag-based policies, cost reports and queries that match `ManagedBy = "terraform"`.
+
+### Fixed
+- `orch_aws.py` signs the `Content-Type` of every request with a body
+  (`application/octet-stream`, `application/xml` for `CompleteMultipartUpload`): urllib added an
+  unsigned one, S3 refused the signature, and a dump upload failed on its last call. A test
+  uploads a dump of several parts through the real client to a local server and checks the
+  part order, the ETags, the manifest and that every `Content-Type` is signed.
+- `orch.py restore` refuses an empty or foreign `--dump` (not
+  `s3://<bucket>/dumps/<project>/<task>/<dump>/`) with one usage line before any AWS call; an
+  empty one crashed with a traceback from S3.
+- `psql-run --truncate-scope` chooses its dollar-quote tag so that no table name can end the DO
+  block, and a boolean in place of the truncated count is no result.
+- `psql-run --truncate-scope` (PostgreSQL, SSM and Fargate runtimes) puts the skipped tables in
+  the job result, not only in the NOTICE of the job log: the message names them and the summary
+  carries `skippedMissing` and `skippedTables` (up to 10 names). The summary now also has
+  `summary.tables` (new, absent before): the number of tables the server truncated. Without the server's record (only possible with
+  `--on-error continue`) the job ends `warn`.
+- `truncateScope` (Lambda) also carries `skippedTables` in the summary next to `skippedMissing`.
+- Sandbox: e2e `s10` skips the restore and its plan with a message, and fails the scenario,
+  when the run left no dump; it passed an empty `--dump` before.
+- Sandbox: the e2e job set bundles are pinned by hash, no unpinned versions.
+- Sandbox: `sandbox.py sync-jobs` writes the rendered `jobset.yaml` as bytes (LF on every
+  host); on Windows it got CRLF, so the bundle totals pinned in `examples/sandbox/main.tf` held
+  only for the host that pinned them. The seven e2e totals are re-pinned over LF output.
+- Tests: the rendered SSM Command document stays under a 56 KiB budget (the SSM limit is 64 KB).
+- Documentation: `auth = "iam"` works on every runtime (Lambda SQL, SSM, Fargate), not only
+  Fargate (ADR 0009, `docs/configuration.md`, RUNBOOK §13); `pwsh`, `mysql` and the sandbox
+  CodeBuild are stated as off by default.
+- Documentation: the 0.1.0 entry and `docs/security.md` no longer say that every post retry skips
+  the post jobs already `ok`; only the ones before `--from-job` are skipped.
+
 ## [0.2.0] — 2026-10-30
 
 Hardening of 0.1.0 and new job runtimes. Upgrading needs care: every breaking change is marked
@@ -237,7 +335,8 @@ The first release.
   attached to the project's job role; a token per psql start, only in `PGPASSWORD`, TLS required.
   DMS and the Data API keep their secrets.
 - Repeat of post: `orch.py post <runId> [--from-job] [--jobs-version]` asks DMS for the outcome
-  again, takes the lock and skips the post jobs already `ok`.
+  again, takes the lock and skips the post jobs before `--from-job` that are already `ok`;
+  without `--from-job` every post job runs again.
 - SNS message attributes `environment, project, taskKey, status, phase, severity` on every
   notification, so subscriptions of the platform topic filter without parsing; `table_name` and
   `artifacts_bucket_name` bring state from a long-lived workspace; checks
