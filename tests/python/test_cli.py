@@ -511,6 +511,37 @@ def test_restore_refuses_without_confirm_and_while_a_run_holds_the_lock():
         _restore("--confirm", lock=True)
 
 
+class NoCalls:
+    """Any AWS call fails the test: a bad --dump is refused before the first one."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"AWS call {name} before --dump was checked")
+
+
+@pytest.mark.parametrize(
+    "dump",
+    [
+        "",
+        "s3://",
+        "s3:///dumps/ledger/core/20261028T103000Z-r1/",
+        "b/dumps/ledger/core/20261028T103000Z-r1/",
+        "s3://b/dumps/other/core/20261028T103000Z-r1/",
+        "s3://b/dumps/ledger/core/",
+        "s3://b/dumps/ledger/core/../x/",
+    ],
+)
+def test_restore_refuses_an_empty_or_foreign_dump_before_any_aws_call(dump):
+    """Seen live: --dump "" (an e2e run whose dump failed) crashed with a ParamValidationError
+    traceback from S3. A bad location is a usage error: one clear line, no AWS call."""
+    argv = ["--state-machine-arn", SM, "--table", "t", "--ssm-prefix", "/dms-orch/dev"]
+    argv += ["restore", "--project", "ledger", "--task", "core", "--dump", dump, "--confirm"]
+    fakes = {name: NoCalls() for name in ("stepfunctions", "ssm", "dynamodb", "s3", "dms")}
+    with pytest.raises(SystemExit) as err:
+        run(argv, **fakes)
+    assert isinstance(err.value.code, str) and "--dump" in err.value.code
+    assert "s3://<bucket>/dumps/ledger/core/" in err.value.code
+
+
 def test_restore_holds_the_task_lock_from_before_the_start_to_the_end():
     """A run starting during a restore would migrate into a target being dropped and recreated."""
     ddb = LockDdb({})
